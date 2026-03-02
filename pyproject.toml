@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "justreadit"
+version = "0.1.0"
+description = "Hover-translation tool for Light.VN-based RPG games"
+license = { text = "MPL-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+    "manga-ocr",
+    "frida",
+    "winsdk",
+    "imagehash",
+    "rapidfuzz",
+    "pywin32",
+    "Pillow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pip-licenses",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src", "plugins"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
