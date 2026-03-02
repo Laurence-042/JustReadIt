@@ -1,0 +1,190 @@
+# JustReadIt — 项目 Story
+
+## 背景
+
+目标游戏为某基于 Light.VN 引擎制作的 RPG 视觉小说，作者未对国际化作任何处理。Light.VN 并非为复杂 RPG 场景设计，主流翻译工具均存在明显缺陷：
+
+| 工具 | 问题 |
+|---|---|
+| MTool / RenpyThief | 无法正常嵌入翻译 |
+| LunaTranslator / Textractor | 基于 hook 文本 API，无法定位文字在屏幕上的位置 |
+| WindowTranslator | OCR 精度不足，日语假名误识一字即可导致语义完全偏转；翻译选项冗杂，LLM 翻译模式无上下文 |
+
+本项目目标：结合本地 OCR 与可插拔翻译后端，实现准确、低延迟、有上下文的悬停翻译。
+
+---
+
+## 核心思路
+
+- 用 **Frida hook** 游戏文本 API，获取界面所有文本的原始内容（注意：hook 结果是各翻译区的文本集合，区间顺序不稳定，但单个翻译区内部文本顺序可信）
+- 用 **两层 OCR** 定位并高质量识别屏幕文字
+- 将 OCR 结果与 hook 结果做 **Levenshtein Distance 交叉校正**：manga-ocr 主要错误为形近假名（如シ→ツ），字数偏差不大，编辑距离匹配足以修复；匹配失败时直接用 OCR 结果送翻译
+- 翻译结果以 **翻译区域截图 phash** 为 key 进行缓存，避免重复翻译同一内容
+
+---
+
+## 两层 OCR 分工
+
+| 层 | 实现 | 职责 |
+|---|---|---|
+| 快速层 | Windows OCR（系统内置） | 全屏扫描，返回 bounding box；用于文字定位、范围判断，识别质量不作要求 |
+| 精确层 | manga-ocr（本地模型） | 对裁出的文字区域做高精度日文识别；优先 GPU，无 GPU 时降级到纯 Windows OCR（不走 CPU manga-ocr，延迟不可接受） |
+
+---
+
+## 工作循环
+
+### 普通悬停模式
+
+```
+等待鼠标大幅移动后悬停
+  → 用 Windows OCR 对鼠标附近小范围快速检测
+    → 无文字：结束，返回等待
+    → 有文字：
+        → 对翻译区域截图计算 phash
+          → 命中缓存：直接显示翻译遮罩
+          → 未命中：
+              → Windows OCR 全屏扫描，获取所有 bounding box
+              → 根据空间分布确定翻译范围（可扩展规则链，见下文）
+              → manga-ocr 对裁出区域识别，得到 OCR 文本
+              → 与 hook 结果做 Levenshtein 匹配
+                  - 匹配成功：用 hook 结果（更干净）送翻译
+                  - 匹配失败：直接用 OCR 结果送翻译
+              → 调用翻译插件（见下文）
+              → 以 phash 缓存翻译结果
+        → 在触发位置显示翻译遮罩
+```
+
+### Freeze 模式
+
+用于自动播放、对话快速切换、鼠标固定按钮等悬停模式无法触发的场景：
+
+```
+用户按下 Freeze 快捷键
+  → 通过 DXGI Desktop Duplication 捕获当前画面（与普通 OCR 同一路径，避免 D3D 窗口黑帧）
+  → 移除 hook 进程窗口的焦点
+  → 将截图作为置顶遮罩显示（遮罩持有焦点，拦截所有鼠标事件）
+  → 用户正常悬停在遮罩上触发翻译（流程同普通模式）
+  → 用户右键点击遮罩关闭 Freeze
+      → 调用 AllowSetForegroundWindow(pid) 授权，将焦点还给 hook 进程窗口
+```
+
+> **注意**：焦点归还必须使用 `AllowSetForegroundWindow` 或 `AttachThreadInput` + `SetFocus`，直接调用跨进程 `SetForegroundWindow` 在 Windows 限制下通常无效。
+
+---
+
+## 翻译插件
+
+翻译后端设计为可插拔，按场景选用：
+
+| 插件 | 计费 / 模型 | 适用场景 |
+|---|---|---|
+| Cloud Translation API | 按字符计费，成本低 | UI、菜单、短文本 |
+| OpenAI 接入点 | 按 token 计费 | 对话、剧情长文本 |
+
+OpenAI 插件行为：
+- 用户可在界面上配置全局 system prompt（如角色设定、翻译风格）
+- 每次翻译时附带**前文摘要**，避免多轮对话中因上下文缺失导致理解偏差
+- 摘要由插件内置 Agent 维护，可复用工具层提供的缓存能力
+
+---
+
+## 翻译范围检测
+
+根据 bounding box 的空间分布，通过**可扩展规则链**（如 `List[RangeDetector]`）确定最终翻译范围，便于后续针对特定游戏布局添加适配。
+
+内置规则优先级从高到低：
+
+1. **段落**：行宽一致、行高一致、紧密间距 → 扩展到整个段落
+2. **表格行**：行高一致，同横轴存在 2-3 个底边基本对齐的 box → 扩展到整行
+3. **单 box（默认）**：鼠标最近的单个 bounding box
+
+规则链按顺序检测，首个匹配项生效；未匹配任何规则时回退到默认单 box。
+
+---
+
+## Hook 文本清洗
+
+hook 抓取结果含控制符、重复内容，送 Levenshtein 匹配前必须清洗。
+
+- 清洗逻辑通过**可扩展规则链**实现（如 `List[Cleaner]`），便于后续针对具体游戏添加适配
+- 基础规则至少包含：去除控制字符、去除重复行、trim 空白
+
+---
+
+## 技术栈
+
+**主语言：Python**
+
+- manga-ocr、Windows OCR、Frida Python 绑定生态完整
+- 操作 Windows API 能力足够（`ctypes` / `pywin32`）
+- 性能瓶颈可通过 GPU 推理和缓存策略缓解
+
+**不选 C# / Rust 的原因**
+
+- C#：NuGet 包管理在此场景下配置成本高；manga-ocr 无官方 .NET 绑定
+- Rust：hook 注入全为 `unsafe`，维护成本过高；暂无实际性能瓶颈证据
+
+---
+
+## 屏幕捕获
+
+必须走 **DXGI Desktop Duplication API**（或 DWM shared surface），不能使用 `BitBlt` / `PrintWindow`。Light.VN 使用 DirectX 渲染，后者在硬件加速窗口上只能抓到黑帧。
+
+---
+
+## 协议
+
+项目本身：**MPL-2.0**
+
+主要依赖协议确认：
+
+| 依赖 | 协议 | 与 MPL-2.0 的关系 |
+|---|---|---|
+| manga-ocr | Apache-2.0 | 兼容，无问题 |
+| PyTorch | BSD-3-Clause | 兼容，无问题 |
+| Transformers | Apache-2.0 | 兼容，无问题 |
+| Frida | wxWindows Library Licence 3.1 | 与 MPL 不冲突；**分发二进制时需提供源码或编译工具链**，发布安装包时须留意 |
+
+> MPL-2.0 为文件级弱 copyleft，对第三方依赖无传染性，只要求被修改的 MPL 文件本身继续以 MPL 发布。
+
+---
+
+## TODO
+
+### 基础设施
+- [ ] 初始化项目结构（`src/`、`plugins/`、`tests/`、配置文件）
+- [ ] 配置 Python 环境与依赖管理（`pyproject.toml`）
+- [ ] 确认 manga-ocr 完整依赖链的 License（自动化扫描 `pip-licenses`）
+
+### 屏幕捕获
+- [ ] 实现基于 DXGI Desktop Duplication 的屏幕捕获模块
+- [ ] 验证在 Light.VN 窗口上無黑帧
+
+### OCR
+- [ ] 集成 Windows OCR（`WinRT` / `winsdk`），实现 bounding box 返回
+- [ ] 集成 manga-ocr，实现 GPU/CPU 自动检测与降级（无 GPU → 跳过 manga-ocr，直接用 Windows OCR 结果）
+- [ ] 实现翻译范围检测可扩展规则链（内置规则：段落 / 表格行 / 单 box）
+
+### Hook
+- [ ] 用 Frida 实现 Light.VN 文本 API hook
+- [ ] 实现可扩展清洗规则链（基础规则：去控制符、去重复、trim）
+
+### 校正与缓存
+- [ ] 实现 OCR 结果与 hook 结果的 Levenshtein Distance 匹配
+- [ ] 实现翻译区域截图 phash 计算与缓存层
+
+### 翻译插件
+- [ ] 定义翻译插件接口（`Translator` ABC）
+- [ ] 实现 Cloud Translation API 插件
+- [ ] 实现 OpenAI 接入点插件（含前文摘要 Agent、全局 prompt 配置）
+
+### 遮罩与交互
+- [ ] 实现翻译结果置顶遮罩窗口（透明背景，文字叠加）
+- [ ] 实现悬停触发逻辑（鼠标大幅移动后悬停检测）
+- [ ] 实现 Freeze 模式：快捷键触发、截图遮罩、右键关闭
+- [ ] 实现焦点归还逻辑（`AllowSetForegroundWindow` + `SetForegroundWindow`）
+
+### 发布
+- [ ] 整理 Frida wxWindows Licence 3.1 的分发合规要求
+- [ ] 编写用户文档（安装、GPU 配置、翻译插件选择）
