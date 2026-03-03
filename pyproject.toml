@@ -11,7 +11,14 @@ requires-python = ">=3.11"
 dependencies = [
     "manga-ocr",
     "frida",
-    "winsdk",
+    # Windows OCR – split packages from winrt (Microsoft-maintained)
+    "winrt-runtime",
+    "winrt-Windows.Media.Ocr",
+    "winrt-Windows.Graphics.Imaging",
+    "winrt-Windows.Storage.Streams",
+    "winrt-Windows.Foundation",
+    "winrt-Windows.Foundation.Collections",
+    "winrt-Windows.Globalization",
     "imagehash",
     "rapidfuzz",
     "pywin32",
@@ -30,3 +37,8 @@ packages = ["src", "plugins"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# test_manga_ocr.py imports torch before WinRT is initialised.
+# Running it in the same process as test_ocr.py (which calls init_apartment)
+# causes c10.dll init failure (WinError 1114).  Run it in isolation:
+#   pytest tests/test_manga_ocr.py
+addopts = "--ignore=tests/test_manga_ocr.py"
