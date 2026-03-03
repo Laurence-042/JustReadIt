@@ -31,9 +31,12 @@ dev = [
     "pytest",
     "pip-licenses",
 ]
+ui = [
+    "PySide6",
+]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src", "plugins"]
+packages = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

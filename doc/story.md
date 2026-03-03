@@ -240,6 +240,11 @@ Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"
 - [x] 集成 manga-ocr，实现 GPU/CPU 自动检测与降级（无 GPU → 跳过 manga-ocr，直接用 Windows OCR 结果）
 - [x] 实现翻译范围检测可扩展规则链（内置规则：段落 / 表格行 / 单 box）
 
+### 调试界面
+- [x] 实现 `src/ui/debug_window.py`：PySide6 调试窗口，含窗口选择、截图预览 + bbox 叠加、Windows OCR / manga-ocr / Hook / 翻译面板
+- [x] 实现 `src/ui/window_picker.py`：鼠标点击选择目标进程（Win32 GetAsyncKeyState 轮询）
+- [x] 实现 `main.py --debug` 入口
+
 ### Hook
 - [ ] 用 Frida 实现 Light.VN 文本 API hook
 - [ ] 实现可扩展清洗规则链（基础规则：去控制符、去重复、trim）

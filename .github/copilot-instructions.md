@@ -25,6 +25,7 @@ Key components and their locations (to be created under `src/`):
 | Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results |
 | Cache | `src/cache.py` | phash of translated-region screenshot as key |
 | Translation | `src/translators/` | `Translator` ABC; two built-in plugins |
+| Debug UI | `src/ui/` | PySide6 debug window; `main.py --debug` to launch |
 | Overlay | `src/overlay.py` | Topmost transparent window, handles Freeze mode |
 
 ## Code Conventions

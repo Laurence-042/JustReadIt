@@ -1,0 +1,64 @@
+# Python
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Distribution / packaging
+*.whl
+*.tar.gz
+MANIFEST
+
+# IDE
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# dxcam / PyTorch cache
+*.onnx
+*.pt
+*.pth
+huggingface/
+.cache/
+
+# manga-ocr model cache (downloaded at runtime by HuggingFace)
+~/.cache/huggingface/
+
+# Frida gadgets / agent builds
+*.js.map
+_frida_agent/
+
+# Debug captures / screenshots saved during testing
+*.png
+*.jpg
+*.jpeg
+!doc/**/*.png
+!doc/**/*.jpg
+
+# Secrets / API keys
+*.env
+.env
+secrets.toml
