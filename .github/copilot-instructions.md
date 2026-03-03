@@ -24,13 +24,13 @@ Key components and their locations (to be created under `src/`):
 | Hook + cleaner | `src/hook/` | Frida-based text hook + `List[Cleaner]` rule chain |
 | Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results |
 | Cache | `src/cache.py` | phash of translated-region screenshot as key |
-| Translation | `plugins/` | `Translator` ABC; two built-in plugins |
+| Translation | `src/translators/` | `Translator` ABC; two built-in plugins |
 | Overlay | `src/overlay.py` | Topmost transparent window, handles Freeze mode |
 
 ## Code Conventions
 
 - **Extensibility via rule chains**: range detectors and hook cleaners implement a common ABC and are composed as `List[RangeDetector]` / `List[Cleaner]`. Built-in rules: paragraph, table-row, single-box (range); strip control chars, deduplicate, trim (cleaner). New rules are appended to the list.
-- **Translation plugin interface**: `Translator` ABC in `plugins/base.py`. Cloud Translation and OpenAI are the two built-ins. OpenAI plugin maintains a rolling summary agent for context.
+- **Translation plugin interface**: `Translator` ABC in `src/translators/base.py`. Cloud Translation and OpenAI are the two built-ins. OpenAI plugin maintains a rolling summary agent for context.
 - **GPU/CPU degradation**: manga-ocr runs on GPU when available; if no GPU, skip manga-ocr entirely and fall back to Windows OCR result only — CPU manga-ocr latency is unacceptable.
 - **Freeze mode focus handoff**: use `AllowSetForegroundWindow(pid)` to return focus to the game process — direct cross-process `SetForegroundWindow` is blocked by Windows.
 - **phash caching**: always key on the perceptual hash of the *translated region screenshot*, not the full screen.

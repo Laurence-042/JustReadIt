@@ -8,8 +8,8 @@ class Translator(ABC):
     """ABC for translation backends.
 
     Implementations live in this package, e.g.:
-      - plugins/cloud_translation.py  (Google Cloud Translation API)
-      - plugins/openai_translator.py  (OpenAI with rolling summary agent)
+      - src/translators/cloud_translation.py  (Google Cloud Translation API)
+      - src/translators/openai_translator.py  (OpenAI with rolling summary agent)
     """
 
     @abstractmethod

@@ -226,7 +226,7 @@ Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"
 ## TODO
 
 ### 基础设施
-- [x] 初始化项目结构（`src/`、`plugins/`、`tests/`、配置文件）
+- [x] 初始化项目结构（`src/`、`tests/`、配置文件）
 - [x] 配置 Python 环境与依赖管理（`pyproject.toml`）
 - [x] 确认 manga-ocr 完整依赖链的 License（自动化扫描 `pip-licenses`）
 - [x] 实现 `GameTarget`：接受 PID 或进程名，推导主窗口 HWND 与 `window_rect`（`src/target.py`）
@@ -249,7 +249,7 @@ Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"
 - [ ] 实现翻译区域截图 phash 计算与缓存层
 
 ### 翻译插件
-- [ ] 定义翻译插件接口（`Translator` ABC）
+- [ ] 定义翻译插件接口（`Translator` ABC，`src/translators/base.py`）
 - [ ] 实现 Cloud Translation API 插件
 - [ ] 实现 OpenAI 接入点插件（含前文摘要 Agent、全局 prompt 配置）
 
