@@ -16,6 +16,7 @@ dependencies = [
     "rapidfuzz",
     "pywin32",
     "Pillow",
+    "dxcam",        # DXGI Desktop Duplication capture
 ]
 
 [project.optional-dependencies]
