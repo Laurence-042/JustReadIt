@@ -36,18 +36,6 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"
             }
-        },
-        {
-            "name": "pytest (manga-ocr, isolated)",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "pytest",
-            "args": ["tests/test_manga_ocr.py", "-v"],
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
         }
     ]
 }

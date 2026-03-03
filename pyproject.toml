@@ -9,7 +9,6 @@ description = "Hover-translation tool for Light.VN-based RPG games"
 license = { text = "MPL-2.0" }
 requires-python = ">=3.11"
 dependencies = [
-    "manga-ocr",
     "frida",
     # Windows OCR – split packages from winrt (Microsoft-maintained)
     "winrt-runtime",
@@ -40,8 +39,4 @@ packages = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# test_manga_ocr.py imports torch before WinRT is initialised.
-# Running it in the same process as test_ocr.py (which calls init_apartment)
-# causes c10.dll init failure (WinError 1114).  Run it in isolation:
-#   pytest tests/test_manga_ocr.py
-addopts = "--ignore=tests/test_manga_ocr.py"
+addopts = ""

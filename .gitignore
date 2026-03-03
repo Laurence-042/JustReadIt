@@ -41,11 +41,6 @@ $RECYCLE.BIN/
 *.onnx
 *.pt
 *.pth
-huggingface/
-.cache/
-
-# manga-ocr model cache (downloaded at runtime by HuggingFace)
-~/.cache/huggingface/
 
 # Frida gadgets / agent builds
 *.js.map

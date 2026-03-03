@@ -8,10 +8,10 @@ A hover-translation tool for a Light.VN-based RPG game. Combines local OCR with 
 
 ```
 DXGI screen capture
-  → Windows OCR (fast, bounding box only)
+  → Windows OCR (bounding box + text)
     → phash cache lookup
       → hit: show overlay
-      → miss: full-screen Windows OCR → range detection → manga-ocr → Levenshtein match with Frida hook → translate → cache → show overlay
+      → miss: full-screen Windows OCR → range detection → Levenshtein match with Frida hook → translate → cache → show overlay
 ```
 
 Key components and their locations (to be created under `src/`):
@@ -19,7 +19,7 @@ Key components and their locations (to be created under `src/`):
 | Component | Path | Role |
 |---|---|---|
 | Screen capture | `src/capture.py` | DXGI Desktop Duplication only — never `BitBlt`/`PrintWindow` (black frames on DirectX) |
-| OCR layer | `src/ocr/` | Windows OCR for bbox, manga-ocr for quality recognition |
+| OCR layer | `src/ocr/` | Windows OCR only — bounding box + text recognition |
 | Range detection | `src/ocr/range_detectors.py` | Extensible rule chain: `List[RangeDetector]` |
 | Hook + cleaner | `src/hook/` | Frida-based text hook + `List[Cleaner]` rule chain |
 | Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results |
@@ -32,7 +32,7 @@ Key components and their locations (to be created under `src/`):
 
 - **Extensibility via rule chains**: range detectors and hook cleaners implement a common ABC and are composed as `List[RangeDetector]` / `List[Cleaner]`. Built-in rules: paragraph, table-row, single-box (range); strip control chars, deduplicate, trim (cleaner). New rules are appended to the list.
 - **Translation plugin interface**: `Translator` ABC in `src/translators/base.py`. Cloud Translation and OpenAI are the two built-ins. OpenAI plugin maintains a rolling summary agent for context.
-- **GPU/CPU degradation**: manga-ocr runs on GPU when available; if no GPU, skip manga-ocr entirely and fall back to Windows OCR result only — CPU manga-ocr latency is unacceptable.
+- **GPU/CPU degradation**: Windows OCR is the sole OCR engine — no GPU dependency.
 - **Freeze mode focus handoff**: use `AllowSetForegroundWindow(pid)` to return focus to the game process — direct cross-process `SetForegroundWindow` is blocked by Windows.
 - **phash caching**: always key on the perceptual hash of the *translated region screenshot*, not the full screen.
 
@@ -45,7 +45,7 @@ Project not yet initialised. When scaffolding:
 uv init   # or: python -m venv .venv && pip install -e ".[dev]"
 
 # install deps
-pip install manga-ocr frida winsdk imagehash rapidfuzz pywin32 Pillow
+pip install frida winsdk imagehash rapidfuzz pywin32 Pillow
 
 # run tests
 pytest tests/

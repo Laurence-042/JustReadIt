@@ -1,7 +1,7 @@
-"""Tests for src/ocr/ – range detectors, Windows OCR, and manga-ocr engine.
+"""Tests for src/ocr/ – range detectors and Windows OCR.
 
 Range detector tests are pure unit tests (no hardware needed).
-Windows OCR and manga-ocr tests require hardware and are marked accordingly.
+Windows OCR tests require hardware and are marked accordingly.
 """
 from __future__ import annotations
 
@@ -408,13 +408,3 @@ class TestWindowsOcrRecognise:
         text = ocr.recognise_text(img)
         assert isinstance(text, str)
 
-
-# ==========================================================================
-# MangaOcrEngine
-# ==========================================================================
-
-# ---------------------------------------------------------------------------
-# MangaOcrEngine tests live in tests/test_manga_ocr.py (separate process).
-# torch DLL loading conflicts with WinRT STA initialization when run in the
-# same pytest process – see tests/test_manga_ocr.py for those tests.
-# ---------------------------------------------------------------------------
