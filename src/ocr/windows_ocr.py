@@ -130,14 +130,18 @@ class WindowsOcr:
             print(box.text, box.x, box.y, box.w, box.h)
     """
 
-    def __init__(self, language_tag: str = "ja") -> None:
+    def __init__(self, language_tag: str = "ja", upscale_factor: float = 2.0) -> None:
         try:
             self._engine: wocr.OcrEngine = _create_engine(language_tag)
         except MissingOcrLanguageError:
             raise
+        # Windows OCR maximum image dimension is 4096 px.  Clamp the factor so
+        # we don't exceed it even on large captures.
+        self._upscale_factor = upscale_factor
         _log.info(
-            "Windows OCR engine ready (language: %s)",
+            "Windows OCR engine ready (language: %s, upscale: %.1f×)",
             self._engine.recognizer_language.language_tag,
+            self._upscale_factor,
         )
 
     @property
@@ -147,6 +151,12 @@ class WindowsOcr:
 
     def recognise(self, image: Image.Image) -> list[BoundingBox]:
         """Run OCR on *image* and return word-level bounding boxes.
+
+        The image is optionally upscaled by ``upscale_factor`` (set at
+        construction) before recognition and coordinates are scaled back so
+        callers always receive boxes in the original image's pixel space.
+        Upscaling improves accuracy for small text (game dialog fonts are
+        typically 24-32 px at 1080p, below the OCR optimum of 40 px).
 
         Coordinates are in the pixel space of *image* (origin = top-left corner
         of the image, i.e. the captured region).
@@ -162,7 +172,18 @@ class WindowsOcr:
         list[BoundingBox]
             One entry per recognised word, in reading order.
         """
-        bmp = _pil_to_software_bitmap(image)
+        # Compute effective scale — clamp so neither dimension exceeds 4096 px.
+        max_dim = max(image.width, image.height)
+        scale = min(self._upscale_factor, 4096 / max_dim) if max_dim > 0 else 1.0
+
+        if scale != 1.0:
+            new_w = max(1, int(image.width  * scale))
+            new_h = max(1, int(image.height * scale))
+            ocr_img = image.resize((new_w, new_h), Image.LANCZOS)
+        else:
+            ocr_img = image
+
+        bmp = _pil_to_software_bitmap(ocr_img)
         result: wocr.OcrResult = asyncio.run(self._engine.recognize_async(bmp))
         boxes: list[BoundingBox] = []
         for line in result.lines:
@@ -170,10 +191,10 @@ class WindowsOcr:
                 r = word.bounding_rect  # windows_foundation.Rect (floats)
                 boxes.append(
                     BoundingBox(
-                        x=int(r.x),
-                        y=int(r.y),
-                        w=int(r.width),
-                        h=int(r.height),
+                        x=int(r.x       / scale),
+                        y=int(r.y       / scale),
+                        w=int(r.width   / scale),
+                        h=int(r.height  / scale),
                         text=word.text,
                     )
                 )
@@ -181,6 +202,13 @@ class WindowsOcr:
 
     def recognise_text(self, image: Image.Image) -> str:
         """Return the full recognised text string (no bounding boxes)."""
+        max_dim = max(image.width, image.height)
+        scale = min(self._upscale_factor, 4096 / max_dim) if max_dim > 0 else 1.0
+        if scale != 1.0:
+            image = image.resize(
+                (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                Image.LANCZOS,
+            )
         bmp = _pil_to_software_bitmap(image)
         result: wocr.OcrResult = asyncio.run(self._engine.recognize_async(bmp))
         return result.text

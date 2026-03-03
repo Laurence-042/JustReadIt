@@ -16,16 +16,16 @@ import io
 import time
 
 from PySide6.QtCore import (
-    QObject, QSize, QThread, QTimer,
+    QObject, QSettings, QSize, QThread, QTimer,
     Signal, Slot, Qt,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QImage, QPainter, QPen, QPixmap,
+    QAction, QColor, QCursor, QFont, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QAction, QApplication, QComboBox, QGroupBox, QLabel,
-    QMainWindow, QSizePolicy, QSpinBox, QSplitter,
-    QStatusBar, QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QGroupBox, QHBoxLayout, QLabel,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+    QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 from PIL import Image
 
@@ -33,8 +33,47 @@ from src.capture import Capturer
 from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
 from src.ocr.manga_ocr_engine import GPU_AVAILABLE
-from src.ocr.range_detectors import BoundingBox
+from src.ocr.range_detectors import BoundingBox, run_detectors
 from .window_picker import WindowPicker
+
+
+# ---------------------------------------------------------------------------
+# Language capability mapping  (BCP-47 tag → DISM capability name)
+# ---------------------------------------------------------------------------
+
+_LANG_CAPABILITIES: dict[str, str] = {
+    "ja": "Language.OCR~~~ja-JP~0.0.1.0",
+}
+
+# Win32 ShellExecuteEx — used to launch an elevated PowerShell and get its
+# process handle so we can poll for completion without blocking the UI thread.
+class _SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize",         ctypes.c_ulong),
+        ("fMask",          ctypes.c_ulong),
+        ("hwnd",           ctypes.c_void_p),
+        ("lpVerb",         ctypes.c_wchar_p),
+        ("lpFile",         ctypes.c_wchar_p),
+        ("lpParameters",   ctypes.c_wchar_p),
+        ("lpDirectory",    ctypes.c_wchar_p),
+        ("nShow",          ctypes.c_int),
+        ("hInstApp",       ctypes.c_void_p),
+        ("lpIDList",       ctypes.c_void_p),
+        ("lpClass",        ctypes.c_wchar_p),
+        ("hkeyClass",      ctypes.c_void_p),
+        ("dwHotKey",       ctypes.c_ulong),
+        ("hIconOrMonitor", ctypes.c_void_p),
+        ("hProcess",       ctypes.c_void_p),
+    ]
+
+_SEE_MASK_NOCLOSEPROCESS = 0x00000040
+_WAIT_TIMEOUT            = 0x00000102
+_kernel32_ui = ctypes.WinDLL("kernel32", use_last_error=True)
+_user32_ui   = ctypes.WinDLL("user32",   use_last_error=True)
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +89,9 @@ class _PipelineWorker(QObject):
     error(message)
     """
 
-    result_ready = Signal(bytes, list, str, str, float)
+    result_ready = Signal(bytes, list, object, str, str, float)  # img, boxes, crop_rect|None, win_ocr, manga, ms
     error = Signal(str)
+    ready = Signal()  # emitted once setup() completes — used to defer timer start
 
     def __init__(self, target: GameTarget, language_tag: str) -> None:
         super().__init__()
@@ -69,7 +109,7 @@ class _PipelineWorker(QObject):
     def setup(self) -> None:
         """Initialise resources on the worker thread."""
         try:
-            self._capturer = Capturer(output_idx=self._target.dxcam_output_idx)
+            self._capturer = Capturer(hmonitor=self._target.hmonitor)
             self._capturer.open()
         except Exception as exc:
             self.error.emit(f"Capturer init failed: {exc}")
@@ -89,6 +129,8 @@ class _PipelineWorker(QObject):
             except Exception as exc:
                 self.error.emit(f"manga-ocr init warning: {exc}")
 
+        self.ready.emit()  # signal that all resources are initialised
+
     @Slot()
     def teardown(self) -> None:
         """Release resources when the thread is stopping."""
@@ -106,9 +148,28 @@ class _PipelineWorker(QObject):
         if self._capturer is None or self._ocr is None:
             return
 
+        # Refresh window rect every tick so we always capture the current
+        # window position / size (handles window moves, resizes, DPI changes).
+        try:
+            self._target = self._target.refresh()
+        except Exception:
+            pass  # use last known position on transient failure
+
         t0 = time.monotonic()
         try:
             img: Image.Image = self._capturer.grab_target(self._target)
+        except ValueError:
+            # Target moved to a different monitor.  _target already has the
+            # correct hmonitor/capture_rect from the refresh above — just
+            # recreate the Capturer for the new output and retry once.
+            try:
+                self._capturer.close()
+                self._capturer = Capturer(hmonitor=self._target.hmonitor)
+                self._capturer.open()
+                img = self._capturer.grab_target(self._target)
+            except Exception as exc:
+                self.error.emit(f"Capture failed (monitor switch): {exc}")
+                return
         except Exception as exc:
             self.error.emit(f"Capture failed: {exc}")
             return
@@ -123,15 +184,41 @@ class _PipelineWorker(QObject):
             f"[{b.x:4},{b.y:4}  {b.w:3}×{b.h:3}]  {b.text}"
             for b in boxes
         ]
-        win_ocr_text = "\n".join(win_ocr_lines)
+        lang_info = f"lang={self._ocr.language_tag}" if self._ocr else "lang=?"
+        win_ocr_text = f"[ {lang_info} ]\n" + "\n".join(win_ocr_lines)
 
         manga_text = ""
+        crop_rect: tuple[int, int, int, int] | None = None
         if self._manga and boxes:
-            xs  = [b.x       for b in boxes]
-            ys  = [b.y       for b in boxes]
-            x2s = [b.x + b.w for b in boxes]
-            y2s = [b.y + b.h for b in boxes]
-            crop = img.crop((min(xs), min(ys), max(x2s), max(y2s)))
+            # Convert the current OS cursor position into the coordinate space
+            # of the captured image, then let the detector chain decide which
+            # range to translate (paragraph → table-row → nearest single box).
+            _pt = _POINT()
+            _user32_ui.GetCursorPos(ctypes.byref(_pt))
+            cr = self._target.capture_rect
+            cursor_x = _pt.x - cr.left
+            cursor_y = _pt.y - cr.top
+            # When the cursor is outside the captured frame (e.g. user is
+            # hovering over the debug window) fall back to the bottom-centre
+            # of the image — where VN dialog boxes typically sit.
+            if not (0 <= cursor_x < img.width and 0 <= cursor_y < img.height):
+                cursor_x = img.width // 2
+                cursor_y = int(img.height * 0.75)
+
+            dialog_boxes = run_detectors(boxes, cursor_x, cursor_y)
+            xs  = [b.x       for b in dialog_boxes]
+            ys  = [b.y       for b in dialog_boxes]
+            x2s = [b.x + b.w for b in dialog_boxes]
+            y2s = [b.y + b.h for b in dialog_boxes]
+            # Add a small margin so characters at box edges aren't clipped.
+            margin = 8
+            crop_rect = (
+                max(0, min(xs)  - margin),
+                max(0, min(ys)  - margin),
+                min(img.width,  max(x2s) + margin),
+                min(img.height, max(y2s) + margin),
+            )
+            crop = img.crop(crop_rect)
             try:
                 manga_text = self._manga.recognize(crop)
             except Exception as exc:
@@ -142,7 +229,7 @@ class _PipelineWorker(QObject):
         # Encode frame as JPEG bytes so the PIL object doesn't cross thread boundary.
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=75)
-        self.result_ready.emit(buf.getvalue(), boxes, win_ocr_text, manga_text, elapsed_ms)
+        self.result_ready.emit(buf.getvalue(), boxes, crop_rect, win_ocr_text, manga_text, elapsed_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -170,15 +257,22 @@ class _PreviewLabel(QLabel):
         self.setText("No capture yet.\nPick a window and press ▶ Run.")
         self._raw: QPixmap | None = None
         self._boxes: list[BoundingBox] = []
+        self._crop_rect: tuple[int, int, int, int] | None = None
         self._orig_w = 1
         self._orig_h = 1
 
-    def update_frame(self, img_bytes: bytes, boxes: list[BoundingBox]) -> None:
+    def update_frame(
+        self,
+        img_bytes: bytes,
+        boxes: list[BoundingBox],
+        crop_rect: tuple[int, int, int, int] | None = None,
+    ) -> None:
         qimg = QImage.fromData(img_bytes)
         self._raw = QPixmap.fromImage(qimg)
         self._orig_w = qimg.width()
         self._orig_h = qimg.height()
         self._boxes = boxes
+        self._crop_rect = crop_rect
         self._render()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
@@ -221,6 +315,19 @@ class _PreviewLabel(QLabel):
                 painter.setPen(QColor(255, 255, 255))
                 painter.drawText(rx + 1, max(9, ry - 1), box.text[:24])
             painter.end()
+
+        # Draw the manga-ocr crop region as a dashed white rectangle.
+        if self._crop_rect is not None:
+            cl, ct, cr, cb = self._crop_rect
+            painter2 = QPainter(scaled)
+            pen = QPen(QColor(255, 255, 100), 2, Qt.PenStyle.DashLine)
+            painter2.setPen(pen)
+            painter2.drawRect(
+                int(cl * sx), int(ct * sy),
+                max(1, int((cr - cl) * sx)),
+                max(1, int((cb - ct) * sy)),
+            )
+            painter2.end()
 
         # Compose onto a dark canvas (letter-box background).
         canvas = QPixmap(lw, lh)
@@ -278,6 +385,12 @@ class DebugWindow(QMainWindow):
         self.setWindowTitle("JustReadIt — Debug")
         self.resize(1400, 820)
 
+        # Centre on the primary screen, regardless of which screen Qt picks
+        # as the default window position.
+        primary = QApplication.primaryScreen()
+        if primary is not None:
+            self.move(primary.availableGeometry().center() - self.rect().center())
+
         self._target: GameTarget | None = None
         self._worker: _PipelineWorker | None = None
         self._worker_thread: QThread | None = None
@@ -287,6 +400,11 @@ class DebugWindow(QMainWindow):
 
         self._picker: WindowPicker | None = None
 
+        self._install_proc_handle: int | None = None
+        self._install_timer = QTimer(self)
+        self._install_timer.setInterval(500)
+        self._install_timer.timeout.connect(self._poll_install)
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -295,7 +413,6 @@ class DebugWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         # ── Toolbar ────────────────────────────────────────────────────
-        from PySide6.QtWidgets import QPushButton
         tb = QToolBar("Main", self)
         tb.setMovable(False)
         self.addToolBar(tb)
@@ -336,9 +453,37 @@ class DebugWindow(QMainWindow):
         act_stop.triggered.connect(self._stop)
         tb.addAction(act_stop)
 
-        # ── Central splitter ───────────────────────────────────────────
-        splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        self.setCentralWidget(splitter)
+        # ── Restore persisted settings ───────────────────────────────────────────────
+        _s = QSettings("JustReadIt", "DebugWindow")
+        saved_lang = _s.value("ocr_language", "ja")
+        saved_interval = int(_s.value("interval_ms", 1500))
+        self._spn_interval.setValue(saved_interval)
+        for i in range(self._cmb_lang.count()):
+            if self._cmb_lang.itemData(i) == saved_lang:
+                self._cmb_lang.setCurrentIndex(i)
+                break
+
+        # ── Install progress bar (hidden until a capability install runs) ──────
+        self._install_bar = QWidget()
+        _ibl = QHBoxLayout(self._install_bar)
+        _ibl.setContentsMargins(6, 3, 6, 3)
+        self._install_lbl = QLabel("Installing …")
+        self._install_prog = QProgressBar()
+        self._install_prog.setRange(0, 0)   # indeterminate spinner
+        self._install_prog.setFixedHeight(16)
+        _ibl.addWidget(self._install_lbl)
+        _ibl.addWidget(self._install_prog, 1)
+        self._install_bar.setVisible(False)
+
+        # ── Central splitter ────────────────────────────────────────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        central = QWidget(self)
+        central_lay = QVBoxLayout(central)
+        central_lay.setContentsMargins(0, 0, 0, 0)
+        central_lay.setSpacing(0)
+        central_lay.addWidget(self._install_bar)
+        central_lay.addWidget(splitter)
+        self.setCentralWidget(central)
 
         self._preview = _PreviewLabel(self)
         splitter.addWidget(self._preview)
@@ -372,25 +517,164 @@ class DebugWindow(QMainWindow):
         # ── Status bar ─────────────────────────────────────────────────
         self.setStatusBar(QStatusBar(self))
 
+        # Connect AFTER populating to avoid a spurious install prompt on startup.
+        self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
+
     def _populate_languages(self) -> None:
-        """Fill lang combo with available Windows OCR languages."""
+        """Fill lang combo with available Windows OCR languages.
+
+        Installed languages appear normally.  Languages in ``_LANG_CAPABILITIES``
+        that are not yet installed are appended with a "⬇ select to install" marker.
+        Default selection is en-US.
+        """
         try:
             import winrt.windows.media.ocr as wocr
+            import winrt.windows.globalization as glob
             _ensure_apartment()
+
+            installed_tags: set[str] = set()
             for lang in wocr.OcrEngine.available_recognizer_languages:
                 tag = lang.language_tag
+                installed_tags.add(tag)
                 self._cmb_lang.addItem(f"{tag}  ({lang.display_name})", userData=tag)
-            # Prefer ja if installed; otherwise leave at index 0.
+
+            # Append auto-installable languages that are not yet present.
+            for tag, capability in _LANG_CAPABILITIES.items():
+                if tag in installed_tags:
+                    continue
+                try:
+                    display = glob.Language(tag).display_name
+                except Exception:
+                    display = tag
+                self._cmb_lang.addItem(
+                    f"{tag}  ({display})  ⬇ select to install via DISM (~6 MB)",
+                    userData=tag,
+                )
+
+            # Default to en-US.
             for i in range(self._cmb_lang.count()):
-                if self._cmb_lang.itemData(i) == "ja":
+                if self._cmb_lang.itemData(i) == "en-US":
                     self._cmb_lang.setCurrentIndex(i)
                     break
         except Exception as exc:
-            self._cmb_lang.addItem(f"(error: {exc})", userData="en")
+            self._cmb_lang.addItem(f"(error: {exc})", userData="en-US")
 
     @property
     def _selected_language(self) -> str:
-        return self._cmb_lang.currentData() or "en"
+        return self._cmb_lang.currentData() or "en-US"
+
+    # ------------------------------------------------------------------
+    # Language auto-install
+    # ------------------------------------------------------------------
+
+    @Slot(int)
+    def _on_lang_changed(self, index: int) -> None:
+        """Handle language combo change.
+
+        - If the selected language is not yet installed, offer to install it.
+        - If the pipeline is currently running, restart it with the new language.
+        """
+        tag = self._cmb_lang.itemData(index)
+        if not tag:
+            return
+
+        # Check whether the language needs installation.
+        if tag in _LANG_CAPABILITIES:
+            try:
+                import winrt.windows.media.ocr as wocr
+                import winrt.windows.globalization as glob
+                _ensure_apartment()
+                if not wocr.OcrEngine.is_language_supported(glob.Language(tag)):
+                    self._start_install(tag)
+                    return
+            except Exception:
+                pass
+
+        # Restart the pipeline if it is running so the new language takes effect.
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            self.statusBar().showMessage(f"Restarting pipeline with lang={tag} …")
+            self._run()
+
+        # Persist the selection.
+        QSettings("JustReadIt", "DebugWindow").setValue("ocr_language", tag)
+
+    def _start_install(self, lang_tag: str) -> None:
+        """Ask for confirmation, then launch an elevated PowerShell to install
+        the DISM capability for *lang_tag*, and track progress via a timer."""
+        capability = _LANG_CAPABILITIES[lang_tag]
+        reply = QMessageBox.question(
+            self,
+            "Install Windows OCR Language Pack",
+            f"The OCR language pack for ‘{lang_tag}’ is not installed.\n\n"
+            f"Capability:  {capability}\n\n"
+            "Install now?  (~6 MB, OCR data only — does not change system language)\n"
+            "An administrator (UAC) elevation prompt will appear.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        args = (
+            f"-NoProfile -ExecutionPolicy Bypass "
+            f"-Command \"Add-WindowsCapability -Online -Name '{capability}'\""
+        )
+        sei = _SHELLEXECUTEINFOW()
+        sei.cbSize     = ctypes.sizeof(sei)
+        sei.fMask      = _SEE_MASK_NOCLOSEPROCESS
+        sei.lpVerb     = "runas"
+        sei.lpFile     = "powershell.exe"
+        sei.lpParameters = args
+        sei.nShow      = 1  # SW_SHOWNORMAL
+        ok = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
+        if not ok or not sei.hProcess:
+            self.statusBar().showMessage(
+                "Could not launch installer — UAC denied or PowerShell not found.", 8000
+            )
+            return
+
+        self._install_proc_handle = sei.hProcess
+        self._install_lbl.setText(
+            f"Installing {capability} …  "
+            "(this may take a minute — do not close this window)"
+        )
+        self._install_bar.setVisible(True)
+        self._install_timer.start()
+        self.statusBar().showMessage(f"Installing {capability} …")
+
+    @Slot()
+    def _poll_install(self) -> None:
+        """Check every 500 ms whether the installer process has exited."""
+        if self._install_proc_handle is None:
+            self._install_timer.stop()
+            return
+        result = _kernel32_ui.WaitForSingleObject(
+            ctypes.c_void_p(self._install_proc_handle), 0
+        )
+        if result != _WAIT_TIMEOUT:
+            self._finish_install()
+
+    def _finish_install(self) -> None:
+        """Called when the installer process exits; hide bar and refresh combo."""
+        self._install_timer.stop()
+        if self._install_proc_handle is not None:
+            _kernel32_ui.CloseHandle(ctypes.c_void_p(self._install_proc_handle))
+            self._install_proc_handle = None
+        self._install_bar.setVisible(False)
+
+        # Refresh combo to reflect the newly installed capability.
+        current_tag = self._cmb_lang.currentData()
+        self._cmb_lang.currentIndexChanged.disconnect(self._on_lang_changed)
+        self._cmb_lang.clear()
+        self._populate_languages()
+        self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
+        for i in range(self._cmb_lang.count()):
+            if self._cmb_lang.itemData(i) == current_tag:
+                self._cmb_lang.setCurrentIndex(i)
+                break
+        self.statusBar().showMessage(
+            "Language pack installation complete — press ▶ Run to start.", 8000
+        )
 
     # ------------------------------------------------------------------
     # Window picking
@@ -399,7 +683,6 @@ class DebugWindow(QMainWindow):
     def _start_picking(self) -> None:
         self.statusBar().showMessage("Click the game window to select it …  (right-click to cancel)")
         self._btn_pick.setEnabled(False)
-        from PySide6.QtGui import QCursor
         QApplication.setOverrideCursor(Qt.CursorShape.CrossCursor)
         self.showMinimized()
         self._picker = WindowPicker(self)
@@ -411,7 +694,6 @@ class DebugWindow(QMainWindow):
 
     @Slot(int)
     def _on_window_picked(self, pid: int) -> None:
-        from PySide6.QtGui import QCursor  # noqa: F401 (restoreOverrideCursor is QApplication)
         QApplication.restoreOverrideCursor()
         self.showNormal()
         self._btn_pick.setEnabled(True)
@@ -460,18 +742,16 @@ class DebugWindow(QMainWindow):
 
         self._worker.result_ready.connect(self._on_result)
         self._worker.error.connect(self._on_error)
+        self._worker.ready.connect(self._on_worker_ready)
         self._trigger_tick.connect(self._worker.run_tick)
         self._worker_thread.started.connect(self._worker.setup)
         # teardown is connected to aboutToQuit / thread finished
         self._worker_thread.finished.connect(self._worker.teardown)
 
         self._worker_thread.start()
-
-        interval = self._spn_interval.value()
-        self._run_timer.setInterval(interval)
-        self._run_timer.start()
+        # Timer is started by _on_worker_ready once setup() completes.
         self.statusBar().showMessage(
-            f"Running — lang={lang}  interval={interval} ms  GPU={GPU_AVAILABLE}"
+            f"Starting — lang={lang}  interval={self._spn_interval.value()} ms  GPU={GPU_AVAILABLE}"
         )
 
     def _stop(self) -> None:
@@ -486,6 +766,17 @@ class DebugWindow(QMainWindow):
             self._worker_thread = None
             self._worker = None
 
+    @Slot()
+    def _on_worker_ready(self) -> None:
+        """Called (cross-thread) once the worker has finished setup."""
+        interval = self._spn_interval.value()
+        self._run_timer.setInterval(interval)
+        self._run_timer.start()
+        lang = self._selected_language
+        self.statusBar().showMessage(
+            f"Running — lang={lang}  interval={interval} ms  GPU={GPU_AVAILABLE}"
+        )
+
     def _request_tick(self) -> None:
         if self._worker_thread is not None and self._worker_thread.isRunning():
             self._trigger_tick.emit()
@@ -494,16 +785,17 @@ class DebugWindow(QMainWindow):
     # Result / error handlers
     # ------------------------------------------------------------------
 
-    @Slot(bytes, list, str, str, float)
+    @Slot(bytes, list, object, str, str, float)
     def _on_result(
         self,
         img_bytes: bytes,
         boxes: list,
+        crop_rect: object,  # tuple[int,int,int,int] | None
         win_ocr_text: str,
         manga_text: str,
         elapsed_ms: float,
     ) -> None:
-        self._preview.update_frame(img_bytes, boxes)
+        self._preview.update_frame(img_bytes, boxes, crop_rect)
         header = f"[ {len(boxes)} boxes  —  {elapsed_ms:.0f} ms ]\n\n"
         self._te_wocr.setPlainText(header + win_ocr_text)
         if manga_text:
@@ -523,4 +815,8 @@ class DebugWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._stop()
+        # Persist interval so it survives restarts.
+        QSettings("JustReadIt", "DebugWindow").setValue(
+            "interval_ms", self._spn_interval.value()
+        )
         super().closeEvent(event)

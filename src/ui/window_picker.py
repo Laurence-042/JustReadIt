@@ -20,7 +20,114 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QCursor
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _GA_ROOT = 2  # GetAncestor flag: return root (non-child) ancestor
+
+# Shell / system process names to skip when picking a window.
+# These processes own transparent overlay windows that sit on top of everything
+# and are commonly returned by WindowFromPoint even when clicking a game.
+_SHELL_PROCESS_NAMES = frozenset({
+    "explorer.exe",
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "searchhost.exe",
+    "dwm.exe",
+    "textinputhost.exe",
+    "applicationframehost.exe",
+})
+
+_TH32CS_SNAPPROCESS = 0x00000002
+_MAX_PATH = 260
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize",              wt.DWORD),
+        ("cntUsage",            wt.DWORD),
+        ("th32ProcessID",       wt.DWORD),
+        ("th32DefaultHeapID",   ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID",        wt.DWORD),
+        ("cntThreads",          wt.DWORD),
+        ("th32ParentProcessID", wt.DWORD),
+        ("pcPriClassBase",      ctypes.c_long),
+        ("dwFlags",             wt.DWORD),
+        ("szExeFile",           ctypes.c_wchar * _MAX_PATH),
+    ]
+
+
+def _pid_to_exe(pid: int) -> str:
+    """Return the lowercase exe basename for *pid*, or ``""``."""
+    snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snap == _INVALID_HANDLE_VALUE:
+        return ""
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.th32ProcessID == pid:
+                return entry.szExeFile.lower()
+            ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+        return ""
+    finally:
+        _kernel32.CloseHandle(snap)
+
+
+def _window_at(x: int, y: int) -> int:
+    """Return the PID of the topmost non-shell visible window that contains (x, y).
+
+    Strategy (in order):
+    1. Read ``GetForegroundWindow()`` — after a real click the target window
+       becomes foreground.  This is the most reliable signal for DirectX /
+       hardware-composited game windows where ``WindowFromPoint`` and Z-order
+       walks are intercepted by transparent UWP shell overlays.
+    2. If the foreground window's process is a known shell process (e.g. the
+       desktop or taskbar was clicked), fall back to a Z-order walk that skips
+       shell processes and windows with WS_EX_TRANSPARENT / WS_EX_NOACTIVATE
+       extended styles.
+
+    Returns 0 if no suitable window is found.
+    """
+    # Extended-style flags that indicate "not a real interactive window".
+    WS_EX_TRANSPARENT  = 0x00000020
+    WS_EX_NOACTIVATE   = 0x08000000
+    GWL_EXSTYLE        = -20
+
+    def _is_shell_or_overlay(hwnd: int) -> bool:
+        pid = wt.DWORD(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe = _pid_to_exe(pid.value)
+        if exe in _SHELL_PROCESS_NAMES:
+            return True
+        ex_style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if ex_style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE):
+            return True
+        return False
+
+    # ── Strategy 1: foreground window after click ──────────────────────
+    fg = _user32.GetForegroundWindow()
+    if fg and not _is_shell_or_overlay(fg):
+        pid = wt.DWORD(0)
+        _user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+        if pid.value:
+            return pid.value
+
+    # ── Strategy 2: Z-order walk, skip shell / transparent windows ─────
+    hwnd = _user32.GetTopWindow(None)
+    while hwnd:
+        if _user32.IsWindowVisible(hwnd):
+            raw = wt.RECT()
+            _user32.GetWindowRect(hwnd, ctypes.byref(raw))
+            if raw.left <= x < raw.right and raw.top <= y < raw.bottom:
+                if not _is_shell_or_overlay(hwnd):
+                    pid = wt.DWORD(0)
+                    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value:
+                        return pid.value
+        hwnd = _user32.GetWindow(hwnd, 2)  # GW_HWNDNEXT = 2
+
+    return 0
 
 
 class _POINT(ctypes.Structure):
@@ -80,11 +187,8 @@ class WindowPicker(QObject):
         if lbutton_down:
             self._timer.stop()
             pos = QCursor.pos()
-            hwnd = _user32.WindowFromPoint(_POINT(pos.x(), pos.y()))
-            root = _user32.GetAncestor(hwnd, _GA_ROOT) or hwnd
-            pid = wt.DWORD(0)
-            _user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
-            if pid.value:
-                self.picked.emit(pid.value)
+            pid = _window_at(pos.x(), pos.y())
+            if pid:
+                self.picked.emit(pid)
             else:
                 self.cancelled.emit()

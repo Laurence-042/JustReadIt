@@ -104,7 +104,17 @@ class MangaOcrEngine:
         # Import deferred: avoids several-second model-load cost at module import.
         from manga_ocr import MangaOcr  # noqa: PLC0415
 
-        self._model: _MangaOcrType = MangaOcr()
+        # transformers emits a harmless "Can't load image processor" warning
+        # because manga-ocr uses a ViTFeatureExtractor which has been renamed;
+        # the model still loads correctly.  Silence it to avoid confusing users.
+        import logging as _logging
+        _tf_logger = _logging.getLogger("transformers")
+        _prev_level = _tf_logger.level
+        _tf_logger.setLevel(_logging.ERROR)
+        try:
+            self._model: _MangaOcrType = MangaOcr()
+        finally:
+            _tf_logger.setLevel(_prev_level)
         _log.info("manga-ocr model ready.")
 
     def recognize(self, image: "Image.Image") -> str:

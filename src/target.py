@@ -52,15 +52,39 @@ import ctypes.wintypes as wt
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
-# One-time DPI awareness setup
+# DPI awareness helpers
 # ---------------------------------------------------------------------------
 
-_PROCESS_SYSTEM_DPI_AWARE = 1
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(_PROCESS_SYSTEM_DPI_AWARE)
-except OSError:
-    # Already set or not supported (Windows < 8.1)
-    pass
+# DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 — matches what Qt 6 sets.
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+_dpi_aware = False
+
+
+def _ensure_dpi_aware() -> None:
+    """Set DPI awareness to PER_MONITOR_AWARE_V2 if not already configured.
+
+    Called lazily from :meth:`GameTarget.from_pid` / :meth:`from_name` rather
+    than at module import time.  This prevents a conflict with Qt 6 which sets
+    the same level via ``SetProcessDpiAwarenessContext`` on ``QApplication``
+    construction — setting it earlier with the older API causes Qt to receive
+    ERROR_ACCESS_DENIED and print a console warning.  Deferring ensures Qt can
+    set it first when present.
+    """
+    global _dpi_aware
+    if _dpi_aware:
+        return
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        )
+    except (OSError, AttributeError):
+        # Already set (e.g. by Qt), or Windows < 10 1703.  Fall back to the
+        # older shcore API — safe to call when V2 is already active (no-op).
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+        except OSError:
+            pass
+    _dpi_aware = True
 
 # ---------------------------------------------------------------------------
 # Win32 API bindings
@@ -68,6 +92,12 @@ except OSError:
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+
+# DWMWA_EXTENDED_FRAME_BOUNDS (attribute 9) returns the visible window rect
+# without the invisible DWM drop-shadow / resize-border that GetWindowRect
+# includes.  Available on Vista+; always prefer it over GetWindowRect.
+_DWMWA_EXTENDED_FRAME_BOUNDS: int = 9
 
 # BOOL WINAPI EnumWindows(WNDENUMPROC, LPARAM)
 _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
@@ -223,23 +253,57 @@ def _name_to_pids(name: str) -> list[int]:
     return pids
 
 
+def _window_title(hwnd: int) -> str:
+    """Return the window title for *hwnd*, or ``""`` if none."""
+    length = _user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    _user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def _window_rect_visible(hwnd: int) -> Rect:
+    """Return the *visible* bounding rect of *hwnd*.
+
+    Prefers ``DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`` which
+    excludes the invisible DWM drop-shadow / transparent resize border that
+    ``GetWindowRect`` includes.  Falls back to ``GetWindowRect`` when DWM
+    composition is off (Windows 7 basic theme, remote desktop, etc.).
+    """
+    raw = wt.RECT()
+    if _dwmapi.DwmGetWindowAttribute(
+        hwnd,
+        _DWMWA_EXTENDED_FRAME_BOUNDS,
+        ctypes.byref(raw),
+        ctypes.sizeof(raw),
+    ) != 0:  # S_OK == 0; non-zero → DWM composition off
+        _user32.GetWindowRect(hwnd, ctypes.byref(raw))
+    return Rect(raw.left, raw.top, raw.right, raw.bottom)
+
+
 def _main_window_for_pid(pid: int) -> tuple[int, Rect]:
-    """Return ``(hwnd, Rect)`` for the largest visible top-level window of *pid*.
+    """Return ``(hwnd, Rect)`` for the best visible top-level window of *pid*.
+
+    Selection rules (in priority order):
+    1. Windows **with a non-empty title** — the real game window always has a
+       title; DirectX render-surface windows and message-only windows do not.
+       Among titled windows, pick the one with the largest area.
+    2. If no titled window is found, fall back to the largest visible window
+       regardless of title.
 
     Raises :exc:`WindowNotFoundError` if no qualifying window is found.
     """
-    best_hwnd: int = 0
-    best_rect: Rect | None = None
+    # Collect all candidate (hwnd, rect, has_title) tuples.
+    candidates: list[tuple[int, Rect, bool]] = []
 
     def _callback(hwnd: int, _: int) -> bool:
-        nonlocal best_hwnd, best_rect
-
         # Must be visible
         if not _user32.IsWindowVisible(hwnd):
             return True
 
-        # Must be top-level (no owner/parent)
-        if _user32.GetAncestor(hwnd, 2) != hwnd:  # GA_ROOTOWNER = 3, GA_ROOT = 2
+        # Must be a root window (no parent in the parent chain)
+        if _user32.GetAncestor(hwnd, 2) != hwnd:  # GA_ROOT = 2
             return True
 
         # Must belong to our target PID
@@ -248,28 +312,31 @@ def _main_window_for_pid(pid: int) -> tuple[int, Rect]:
         if proc_id.value != pid:
             return True
 
-        raw = wt.RECT()
-        _user32.GetWindowRect(hwnd, ctypes.byref(raw))
-        rect = Rect(raw.left, raw.top, raw.right, raw.bottom)
+        rect = _window_rect_visible(hwnd)
+        if rect.area <= 0:
+            return True
 
-        if rect.area > (best_rect.area if best_rect else 0):
-            best_hwnd = hwnd
-            best_rect = rect
-
-        return True  # continue enumeration
+        candidates.append((hwnd, rect, bool(_window_title(hwnd))))
+        return True
 
     _user32.EnumWindows(_WNDENUMPROC(_callback), 0)
 
-    if best_hwnd == 0 or best_rect is None:
+    if not candidates:
         raise WindowNotFoundError(
             f"No visible top-level window found for PID {pid}. "
             "Make sure the game window is open and not minimised."
         )
+
+    # Prefer titled windows (game main window) over untitled ones (DX surfaces).
+    titled = [(hwnd, rect) for hwnd, rect, has_title in candidates if has_title]
+    pool = titled if titled else [(hwnd, rect) for hwnd, rect, _ in candidates]
+
+    best_hwnd, best_rect = max(pool, key=lambda t: t[1].area)
     return best_hwnd, best_rect
 
 
-def _monitor_for_hwnd(hwnd: int) -> tuple[Rect, bool]:
-    """Return ``(monitor_rect, is_primary)`` for the monitor the window is on.
+def _monitor_for_hwnd(hwnd: int) -> tuple[int, Rect, bool]:
+    """Return ``(hmonitor, monitor_rect, is_primary)`` for the monitor the window is on.
 
     Uses ``MONITOR_DEFAULTTONEAREST`` so windows near a monitor edge still
     resolve correctly.
@@ -281,7 +348,7 @@ def _monitor_for_hwnd(hwnd: int) -> tuple[Rect, bool]:
     r = info.rcMonitor
     rect = Rect(r.left, r.top, r.right, r.bottom)
     is_primary = bool(info.dwFlags & _MONITORINFOF_PRIMARY)
-    return rect, is_primary
+    return int(hmonitor), rect, is_primary
 
 
 def _enumerate_monitor_rects() -> list[Rect]:
@@ -349,9 +416,10 @@ class GameTarget:
 
     pid: int
     hwnd: int
+    hmonitor: int
     window_rect: Rect
     capture_rect: Rect
-    dxcam_output_idx: int
+    dxcam_output_idx: int  # informational only — may not match dxcam (device_idx, output_idx)
     process_name: str
 
     # ------------------------------------------------------------------
@@ -367,8 +435,9 @@ class GameTarget:
         WindowNotFoundError
             If the process has no visible top-level window.
         """
+        _ensure_dpi_aware()
         hwnd, window_rect = _main_window_for_pid(pid)
-        monitor_rect, _ = _monitor_for_hwnd(hwnd)
+        hmonitor, monitor_rect, _ = _monitor_for_hwnd(hwnd)
         capture_rect = _compute_capture_rect(window_rect, monitor_rect)
         monitor_rects = _enumerate_monitor_rects()
         try:
@@ -379,6 +448,7 @@ class GameTarget:
         return cls(
             pid=pid,
             hwnd=hwnd,
+            hmonitor=hmonitor,
             window_rect=window_rect,
             capture_rect=capture_rect,
             dxcam_output_idx=dxcam_output_idx,
@@ -398,6 +468,7 @@ class GameTarget:
         WindowNotFoundError
             If the matched process has no visible top-level window.
         """
+        _ensure_dpi_aware()
         pids = _name_to_pids(name)
         if not pids:
             raise ProcessNotFoundError(
@@ -415,7 +486,7 @@ class GameTarget:
     def refresh(self) -> "GameTarget":
         """Re-query the window rect (call if the game window was moved/resized)."""
         hwnd, window_rect = _main_window_for_pid(self.pid)
-        monitor_rect, _ = _monitor_for_hwnd(hwnd)
+        hmonitor, monitor_rect, _ = _monitor_for_hwnd(hwnd)
         capture_rect = _compute_capture_rect(window_rect, monitor_rect)
         monitor_rects = _enumerate_monitor_rects()
         try:
@@ -425,6 +496,7 @@ class GameTarget:
         return GameTarget(
             pid=self.pid,
             hwnd=hwnd,
+            hmonitor=hmonitor,
             window_rect=window_rect,
             capture_rect=capture_rect,
             dxcam_output_idx=dxcam_output_idx,

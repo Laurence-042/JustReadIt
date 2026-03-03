@@ -35,6 +35,36 @@ import dxcam
 import numpy as np
 from PIL import Image
 
+
+def _find_dxgi_output(hmonitor: int) -> tuple[int, int]:
+    """Return the dxcam ``(device_idx, output_idx)`` that owns *hmonitor*.
+
+    dxcam's ``output_idx`` is **per-adapter** — it is NOT a global monitor
+    index.  On a dual-GPU laptop the second monitor is typically
+    ``(device_idx=1, output_idx=0)``, not ``(device_idx=0, output_idx=1)``.
+    Matching via the Win32 HMONITOR stored in ``DXGI_OUTPUT_DESC.Monitor``
+    is the only reliable way to find the correct pair.
+
+    Falls back to ``(0, 0)`` if no match is found (e.g. virtual display).
+
+    Note: the ``DXFactory`` instance **must** be explicitly deleted before
+    ``dxcam.create()`` is called — dxcam enforces "only 1 instance of
+    DXFactory is allowed" and will raise if a previous instance is still
+    alive when a new one is created internally.
+    """
+    try:
+        factory = dxcam.DXFactory()
+        try:
+            for dev_idx, outputs in enumerate(factory.outputs):
+                for out_idx, output in enumerate(outputs):
+                    if int(output.hmonitor) == hmonitor:
+                        return dev_idx, out_idx
+        finally:
+            del factory  # must be released before dxcam.create() below
+    except Exception:
+        pass
+    return 0, 0
+
 if TYPE_CHECKING:
     from src.target import GameTarget
 
@@ -76,10 +106,12 @@ class Capturer:
         device_idx: int = 0,
         output_idx: int | None = None,
         output_color: str = "RGB",
+        hmonitor: int | None = None,
     ) -> None:
         self._device_idx = device_idx
         self._output_idx = output_idx
         self._output_color = output_color
+        self._hmonitor = hmonitor
         self._camera: dxcam.DXCamera | None = None
 
     # ------------------------------------------------------------------
@@ -98,16 +130,42 @@ class Capturer:
     # ------------------------------------------------------------------
 
     def open(self) -> None:
-        """Initialise the D3D device and acquire the DXGI output duplication."""
+        """Initialise the D3D device and acquire the DXGI output duplication.
+
+        When ``hmonitor`` was supplied to the constructor, the correct DXGI
+        ``(device_idx, output_idx)`` pair is resolved by matching the Win32
+        HMONITOR against all DXGI output descriptors.  This is necessary
+        because dxcam's ``output_idx`` is **per-adapter**, not a global
+        monitor index.
+        """
         if self._camera is not None:
             return
+        device_idx = self._device_idx
+        output_idx = self._output_idx
+        if self._hmonitor is not None:
+            device_idx, output_idx = _find_dxgi_output(self._hmonitor)
         kwargs: dict = dict(
-            device_idx=self._device_idx,
+            device_idx=device_idx,
             output_color=self._output_color,
         )
-        if self._output_idx is not None:
-            kwargs["output_idx"] = self._output_idx
-        self._camera = dxcam.create(**kwargs)
+        if output_idx is not None:
+            kwargs["output_idx"] = output_idx
+        try:
+            self._camera = dxcam.create(**kwargs)
+        except IndexError:
+            # output_idx is out of range for this adapter — fall back to (0, 0).
+            if "output_idx" in kwargs:
+                import warnings
+                warnings.warn(
+                    f"dxcam output_idx={kwargs['output_idx']} is out of range for "
+                    f"device_idx={kwargs['device_idx']}; falling back to primary "
+                    "output (device_idx=0, output_idx=0).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._camera = dxcam.create(output_color=self._output_color)
+            else:
+                raise
 
     def close(self) -> None:
         """Release the DXGI duplication handle and D3D resources."""
@@ -183,15 +241,18 @@ class Capturer:
         Raises
         ------
         ValueError
-            If the Capturer's ``output_idx`` does not match
-            ``target.dxcam_output_idx``.  Recreate the Capturer with
-            ``Capturer(output_idx=target.dxcam_output_idx)``.
+            If this Capturer was created for a different monitor than the one
+            the target window is on.  Recreate with
+            ``Capturer(hmonitor=target.hmonitor)``.
         """
-        if self._output_idx != target.dxcam_output_idx:
+        # Compare by hmonitor when available (reliable across multi-GPU setups).
+        # dxcam output_idx is per-adapter and cannot be directly compared against
+        # the global dxcam_output_idx from GameTarget.
+        if self._hmonitor is not None and self._hmonitor != target.hmonitor:
             raise ValueError(
-                f"Capturer output_idx={self._output_idx!r} does not match "
-                f"target.dxcam_output_idx={target.dxcam_output_idx}. "
-                f"Recreate with Capturer(output_idx={target.dxcam_output_idx})."
+                f"Capturer hmonitor={self._hmonitor!r} does not match "
+                f"target.hmonitor={target.hmonitor!r}. "
+                f"Recreate with Capturer(hmonitor=target.hmonitor)."
             )
         return self.grab(region=target.capture_rect.as_tuple(), timeout=timeout)
 
