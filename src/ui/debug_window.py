@@ -15,9 +15,13 @@ import io
 import time
 
 from PySide6.QtCore import (
-    QObject, QSettings, QSize, QThread, QTimer,
+    QObject, QSize, QThread, QTimer,
     Signal, Slot, Qt,
 )
+
+from src.config import AppConfig
+
+_cfg = AppConfig()
 from PySide6.QtGui import (
     QAction, QColor, QCursor, QFont, QImage, QPainter, QPen, QPixmap,
 )
@@ -382,9 +386,8 @@ class DebugWindow(QMainWindow):
         tb.addAction(act_stop)
 
         # ── Restore persisted settings ───────────────────────────────────────────────
-        _s = QSettings("JustReadIt", "DebugWindow")
-        saved_lang = _s.value("ocr_language", "ja")
-        saved_interval = int(_s.value("interval_ms", 1500))
+        saved_lang = _cfg.ocr_language
+        saved_interval = _cfg.interval_ms
         self._spn_interval.setValue(saved_interval)
         for i in range(self._cmb_lang.count()):
             if self._cmb_lang.itemData(i) == saved_lang:
@@ -515,7 +518,7 @@ class DebugWindow(QMainWindow):
             self._run()
 
         # Persist the selection.
-        QSettings("JustReadIt", "DebugWindow").setValue("ocr_language", tag)
+        _cfg.ocr_language = tag
 
     def _start_install(self, lang_tag: str) -> None:
         """Ask for confirmation, then launch an elevated PowerShell to install
@@ -731,7 +734,5 @@ class DebugWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._stop()
         # Persist interval so it survives restarts.
-        QSettings("JustReadIt", "DebugWindow").setValue(
-            "interval_ms", self._spn_interval.value()
-        )
+        _cfg.interval_ms = self._spn_interval.value()
         super().closeEvent(event)
