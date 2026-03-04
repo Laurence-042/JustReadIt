@@ -121,24 +121,57 @@ class TestGroupIntoLines:
 
 class TestSingleBoxDetector:
     def _make_boxes(self):
+        # A (0–50) and B (100–150) share the same visual line (y 0–20).
+        # char_width = median(50/1, 50/1) = 50 → threshold = 3×50 = 150.
+        # Gap between A and B = 100-50 = 50 ≤ 150 → same cluster.
+        # C (0–50, y 50–70) is on a separate line below.
         return [
             BoundingBox(0, 0, 50, 20, "A"),
             BoundingBox(100, 0, 50, 20, "B"),
             BoundingBox(0, 50, 50, 20, "C"),
         ]
 
-    def test_cursor_inside_box(self):
+    def test_cursor_inside_box_clusters_nearby(self):
         det = SingleBoxDetector()
         boxes = self._make_boxes()
+        # Cursor inside A — gap(A,B)=50 ≤ threshold(150), so [A, B] returned.
         result = det.detect(boxes, 25, 10)
-        assert result == [boxes[0]]
+        assert result == [boxes[0], boxes[1]]
 
-    def test_cursor_nearest_box(self):
+    def test_cursor_nearest_box_clusters_nearby(self):
         det = SingleBoxDetector()
         boxes = self._make_boxes()
-        # Cursor between B (right) and A (left); closer to B
+        # Cursor closer to B — nearest=B; same cluster as A since gap ≤ threshold.
         result = det.detect(boxes, 90, 10)
-        assert result == [boxes[1]]
+        assert result == [boxes[0], boxes[1]]
+
+    def test_single_line_tight_glyphs(self):
+        """Regression: tightly packed single-line glyphs like 'A [ 0'.
+
+        char_width = median(19/1, 12/1, 18/1) = 18  →  threshold = 54 px.
+        gap(A,[) = 0, gap([,0) = 22 — both ≤ 54 → all three in one cluster.
+        """
+        det = SingleBoxDetector()
+        a = BoundingBox(755, 634, 19, 20, "A")
+        bracket = BoundingBox(774, 634, 12, 20, "[")
+        zero = BoundingBox(808, 634, 18, 20, "0")
+        boxes = [a, bracket, zero]
+        result = det.detect(boxes, 760, 640)
+        assert result == [a, bracket, zero]
+
+    def test_large_gap_separates_clusters(self):
+        """Two groups on the same horizontal band separated by a large gap
+        should each be returned independently depending on cursor position.
+
+        char_width = 50 → threshold = 150.
+        gap between X and Y = 300 - 50 = 250 > 150 → separate clusters.
+        """
+        det = SingleBoxDetector()
+        x_box = BoundingBox(0,   0, 50, 20, "X")
+        y_box = BoundingBox(300, 0, 50, 20, "Y")
+        boxes = [x_box, y_box]
+        assert det.detect(boxes, 25, 10) == [x_box]
+        assert det.detect(boxes, 320, 10) == [y_box]
 
     def test_empty_boxes(self):
         det = SingleBoxDetector()
@@ -147,11 +180,10 @@ class TestSingleBoxDetector:
     def test_beyond_max_distance(self):
         det = SingleBoxDetector(max_distance=10.0)
         boxes = [BoundingBox(0, 0, 50, 20)]
-        # Cursor at (200, 200) – far from the box
         result = det.detect(boxes, 200, 200)
         assert result is None
 
-    def test_within_max_distance(self):
+    def test_within_max_distance_single_box(self):
         det = SingleBoxDetector(max_distance=100.0)
         boxes = [BoundingBox(0, 0, 50, 20)]
         result = det.detect(boxes, 80, 10)

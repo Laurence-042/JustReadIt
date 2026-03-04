@@ -4,14 +4,17 @@ Attaches to the target process via Frida and intercepts Win32 text output
 functions to capture rendered text strings.  Captured text is stored in
 per-region sets for later cross-matching with OCR results.
 
-Hooked functions (all from ``gdi32.dll`` / ``user32.dll``)::
+Hooked functions (resolved at runtime from the target process):
 
-    TextOutW           — basic GDI text output
-    ExtTextOutW        — extended GDI text output (most common for VN engines)
+    gdi32 : TextOutW, ExtTextOutW
+    user32: DrawTextW, DrawTextExW
+    dwrite: IDWriteFactory::CreateTextLayout
 
-These cover the GDI path that Light.VN (and many DirectX-based VN engines)
-use for on-screen text.  The instrumentation script lives in
-``_HOOK_SCRIPT_JS`` and communicates with the Python side via Frida's
+The Frida instrumentation script is kept in the sibling file
+``hook_script.js`` and loaded at import time.  Edit that file to change
+hook targets without touching Python code.
+
+The script communicates with the Python side via Frida's
 ``send()`` / ``on('message', …)`` mechanism.
 
 Usage::
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from pathlib import Path
 from typing import Any
 
 import frida
@@ -61,86 +65,10 @@ class HookScriptError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Frida JavaScript instrumentation
+# Frida JavaScript instrumentation  (loaded from sibling hook_script.js)
 # ---------------------------------------------------------------------------
 
-_HOOK_SCRIPT_JS = r"""
-'use strict';
-
-/*
- * Hook Win32 GDI text output functions and send captured strings back to
- * the Python host via send().
- *
- * Each message has the shape:  { type: 'text', value: '<string>' }
- *
- * Filtering rules applied in-process (to avoid IPC overhead):
- *   - Empty / whitespace-only strings are dropped.
- *   - Pure ASCII strings shorter than 2 characters are dropped (avoids noise
- *     from single-char draws like separators).
- *   - Consecutive duplicate strings are suppressed (simple dedup).
- */
-
-var _lastText = '';
-
-function _onText(str) {
-    if (!str || str.length === 0) return;
-
-    var trimmed = str.replace(/^\s+|\s+$/g, '');
-    if (trimmed.length === 0) return;
-
-    // Drop very short pure-ASCII strings (noise from separator draws etc.)
-    if (trimmed.length < 2 && /^[\x00-\x7F]*$/.test(trimmed)) return;
-
-    // Simple consecutive dedup
-    if (trimmed === _lastText) return;
-    _lastText = trimmed;
-
-    send({ type: 'text', value: trimmed });
-}
-
-// Module.findExportByName(moduleName, exportName) was removed in Frida 16.1.
-// Use Process.getModuleByName() + instance findExportByName() instead.
-function _findExport(moduleName, exportName) {
-    try {
-        var mod = Process.getModuleByName(moduleName);
-        return mod ? mod.findExportByName(exportName) : null;
-    } catch (e) {
-        return null;
-    }
-}
-
-// ── TextOutW ──────────────────────────────────────────────────────────
-// BOOL TextOutW(HDC hdc, int x, int y, LPCWSTR lpString, int c);
-var pTextOutW = _findExport('gdi32.dll', 'TextOutW');
-if (pTextOutW) {
-    Interceptor.attach(pTextOutW, {
-        onEnter: function (args) {
-            var lpString = args[3];
-            var cchLen   = args[4].toInt32();
-            if (cchLen > 0) {
-                _onText(lpString.readUtf16String(cchLen));
-            }
-        }
-    });
-}
-
-// ── ExtTextOutW ───────────────────────────────────────────────────────
-// BOOL ExtTextOutW(HDC hdc, int x, int y, UINT options,
-//                  const RECT *lprect, LPCWSTR lpString, UINT c,
-//                  const INT *lpDx);
-var pExtTextOutW = _findExport('gdi32.dll', 'ExtTextOutW');
-if (pExtTextOutW) {
-    Interceptor.attach(pExtTextOutW, {
-        onEnter: function (args) {
-            var lpString = args[5];
-            var cchLen   = args[6].toInt32();
-            if (cchLen > 0 && !lpString.isNull()) {
-                _onText(lpString.readUtf16String(cchLen));
-            }
-        }
-    });
-}
-"""
+_HOOK_SCRIPT_JS: str = (Path(__file__).parent / "hook_script.js").read_text(encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # Python-side hook manager
@@ -169,6 +97,7 @@ class TextHook:
         self._session: frida.core.Session | None = None
         self._script: frida.core.Script | None = None
         self._texts: list[str] = []
+        self._diag: str = ""
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -273,6 +202,16 @@ class TextHook:
         with self._lock:
             return list(self._texts)
 
+    @property
+    def diag(self) -> str:
+        """Startup diagnostic from the JS instrumentation script.
+
+        Lists which hook points were attached and which text-related modules
+        are loaded in the target process.  Empty until the script has loaded.
+        """
+        with self._lock:
+            return self._diag
+
     def clear(self) -> None:
         """Discard all captured text strings."""
         with self._lock:
@@ -286,14 +225,18 @@ class TextHook:
         """Handle a message from the Frida script."""
         if message.get("type") == "send":
             payload = message.get("payload")
-            if isinstance(payload, dict) and payload.get("type") == "text":
+            if isinstance(payload, dict):
+                kind = payload.get("type")
                 value = payload.get("value", "")
-                if value:
+                if kind == "text" and value:
                     with self._lock:
                         self._texts.append(value)
-                        # Prevent unbounded growth.
                         if len(self._texts) > _MAX_TEXTS:
                             self._texts = self._texts[-_MAX_TEXTS:]
+                elif kind == "diag" and value:
+                    with self._lock:
+                        self._diag = value
+                    log.info("Hook diag: %s", value)
         elif message.get("type") == "error":
             log.warning("Frida script error: %s", message.get("description", ""))
 

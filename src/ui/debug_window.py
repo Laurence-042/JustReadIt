@@ -236,8 +236,13 @@ class _PipelineWorker(QObject):
         elif not self._hook.attached:
             hook_text = "[hook detached — target process may have exited]"
         else:
+            diag = self._hook.diag
             hook_texts = self._hook.texts
-            hook_text = "\n".join(hook_texts[-50:]) if hook_texts else "[attached — no text captured yet]"
+            if hook_texts:
+                header = f"[{diag}]\n\n" if diag else ""
+                hook_text = header + "\n".join(hook_texts[-50:])
+            else:
+                hook_text = f"[attached — no text captured yet]\n\n{diag}" if diag else "[attached — no text captured yet]"
 
         elapsed_ms = (time.monotonic() - t0) * 1000
 
