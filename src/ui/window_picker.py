@@ -17,6 +17,7 @@ import psutil
 import win32api
 import win32con
 import win32gui
+import win32process
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QInputDialog
@@ -54,7 +55,7 @@ def _enumerate_windows() -> list[tuple[str, int]]:
         title = win32gui.GetWindowText(hwnd)
         if not title:
             return True
-        _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
         if _is_shell(pid):
             return True
         results.append((title, pid))
@@ -70,7 +71,7 @@ def _foreground_pid() -> int:
     hwnd = win32gui.GetForegroundWindow()
     if not hwnd:
         return 0
-    _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+    _, pid = win32process.GetWindowThreadProcessId(hwnd)
     if not pid or _is_shell(pid):
         return 0
     ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)

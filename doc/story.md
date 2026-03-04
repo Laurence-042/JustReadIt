@@ -210,8 +210,8 @@ Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"
 - [x] 实现 `main.py --debug` 入口
 
 ### Hook
-- [ ] 用 Frida 实现 Light.VN 文本 API hook
-- [ ] 实现可扩展清洗规则链（基础规则：去控制符、去重复、trim）
+- [x] 用 Frida 实现 Light.VN 文本 API hook
+- [x] 实现可扩展清洗规则链（基础规则：去控制符、去重复、trim）
 
 ### 校正与缓存
 - [ ] 实现 OCR 结果与 hook 结果的 Levenshtein Distance 匹配

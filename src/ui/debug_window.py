@@ -425,10 +425,10 @@ class DebugWindow(QMainWindow):
         splitter.setStretchFactor(1, 2)
 
         grp_wocr, self._te_wocr = _make_panel("Windows OCR")
-        grp_hook, self._te_hook = _make_panel("Hook  (Frida — not yet implemented)")
+        grp_hook, self._te_hook = _make_panel("Hook  (Frida)")
         grp_tl,   self._te_tl   = _make_panel("Translation  (not yet implemented)")
 
-        self._te_hook.setPlaceholderText("Frida hook not yet implemented.")
+        self._te_hook.setPlaceholderText("Attach to a process to see hooked text.")
         self._te_tl.setPlaceholderText("Translation plugin not yet implemented.")
 
         right.addWidget(grp_wocr)
