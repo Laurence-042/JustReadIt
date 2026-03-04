@@ -98,9 +98,20 @@ function _onText(str) {
     send({ type: 'text', value: trimmed });
 }
 
+// Module.findExportByName(moduleName, exportName) was removed in Frida 16.1.
+// Use Process.getModuleByName() + instance findExportByName() instead.
+function _findExport(moduleName, exportName) {
+    try {
+        var mod = Process.getModuleByName(moduleName);
+        return mod ? mod.findExportByName(exportName) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 // ── TextOutW ──────────────────────────────────────────────────────────
 // BOOL TextOutW(HDC hdc, int x, int y, LPCWSTR lpString, int c);
-var pTextOutW = Module.findExportByName('gdi32.dll', 'TextOutW');
+var pTextOutW = _findExport('gdi32.dll', 'TextOutW');
 if (pTextOutW) {
     Interceptor.attach(pTextOutW, {
         onEnter: function (args) {
@@ -117,7 +128,7 @@ if (pTextOutW) {
 // BOOL ExtTextOutW(HDC hdc, int x, int y, UINT options,
 //                  const RECT *lprect, LPCWSTR lpString, UINT c,
 //                  const INT *lpDx);
-var pExtTextOutW = Module.findExportByName('gdi32.dll', 'ExtTextOutW');
+var pExtTextOutW = _findExport('gdi32.dll', 'ExtTextOutW');
 if (pExtTextOutW) {
     Interceptor.attach(pExtTextOutW, {
         onEnter: function (args) {

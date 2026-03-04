@@ -103,6 +103,7 @@ class _PipelineWorker(QObject):
         self._capturer: Capturer | None = None
         self._ocr: WindowsOcr | None = None
         self._hook: TextHook | None = None
+        self._hook_error: str = ""  # persists across ticks so the panel stays informative
 
     # ------------------------------------------------------------------
     # Lifecycle (called on worker thread via QThread.started / explicit slots)
@@ -129,9 +130,11 @@ class _PipelineWorker(QObject):
             self._hook = TextHook(self._target.pid)
             self._hook.attach()
         except (HookAttachError, HookScriptError) as exc:
-            self.error.emit(f"Hook attach warning: {exc}")
+            self._hook_error = str(exc)
+            self.error.emit(f"Hook: {exc}")
         except Exception as exc:
-            self.error.emit(f"Hook attach failed: {exc}")
+            self._hook_error = f"{type(exc).__name__}: {exc}"
+            self.error.emit(f"Hook: {self._hook_error}")
 
         self.ready.emit()  # signal that all resources are initialised
 
@@ -226,11 +229,15 @@ class _PipelineWorker(QObject):
                 )
 
         # ── Hook texts ────────────────────────────────────────────────
-        hook_text = ""
-        if self._hook is not None and self._hook.attached:
+        if self._hook_error:
+            hook_text = f"[attach failed]\n{self._hook_error}"
+        elif self._hook is None:
+            hook_text = "[hook not initialised]"
+        elif not self._hook.attached:
+            hook_text = "[hook detached — target process may have exited]"
+        else:
             hook_texts = self._hook.texts
-            if hook_texts:
-                hook_text = "\n".join(hook_texts[-50:])
+            hook_text = "\n".join(hook_texts[-50:]) if hook_texts else "[attached — no text captured yet]"
 
         elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -802,8 +809,7 @@ class DebugWindow(QMainWindow):
         self._te_wocr.setPlainText(header + win_ocr_text)
         if region_text:
             self._te_region.setPlainText(region_text)
-        if hook_text:
-            self._te_hook.setPlainText(hook_text)
+        self._te_hook.setPlainText(hook_text)
         self.statusBar().showMessage(
             f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
         )
