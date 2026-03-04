@@ -17,11 +17,10 @@ import ctypes
 import ctypes.wintypes as wt
 
 from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtGui import QCursor
+from PySide6.QtWidgets import QInputDialog
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_GA_ROOT = 2  # GetAncestor flag: return root (non-child) ancestor
 
 # Shell / system process names to skip when picking a window.
 # These processes own transparent overlay windows that sit on top of everything
@@ -74,64 +73,59 @@ def _pid_to_exe(pid: int) -> str:
         _kernel32.CloseHandle(snap)
 
 
-def _window_at(x: int, y: int) -> int:
-    """Return the PID of the topmost non-shell visible window that contains (x, y).
+_EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
 
-    Strategy (in order):
-    1. Read ``GetForegroundWindow()`` — after a real click the target window
-       becomes foreground.  This is the most reliable signal for DirectX /
-       hardware-composited game windows where ``WindowFromPoint`` and Z-order
-       walks are intercepted by transparent UWP shell overlays.
-    2. If the foreground window's process is a known shell process (e.g. the
-       desktop or taskbar was clicked), fall back to a Z-order walk that skips
-       shell processes and windows with WS_EX_TRANSPARENT / WS_EX_NOACTIVATE
-       extended styles.
 
-    Returns 0 if no suitable window is found.
-    """
-    # Extended-style flags that indicate "not a real interactive window".
-    WS_EX_TRANSPARENT  = 0x00000020
-    WS_EX_NOACTIVATE   = 0x08000000
-    GWL_EXSTYLE        = -20
+def _enumerate_windows() -> list[tuple[str, int]]:
+    """Return ``(title, pid)`` for every visible top-level window with a
+    non-empty title, skipping known shell/system processes."""
+    results: list[tuple[str, int]] = []
 
-    def _is_shell_or_overlay(hwnd: int) -> bool:
+    @_EnumWindowsProc
+    def _cb(hwnd: int, _: int) -> bool:
+        if not _user32.IsWindowVisible(hwnd):
+            return True
+        length = _user32.GetWindowTextLengthW(hwnd)
+        if not length:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        _user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value
+        if not title:
+            return True
         pid = wt.DWORD(0)
         _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        exe = _pid_to_exe(pid.value)
-        if exe in _SHELL_PROCESS_NAMES:
+        if not pid.value:
             return True
-        ex_style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        if ex_style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE):
+        if _pid_to_exe(pid.value) in _SHELL_PROCESS_NAMES:
             return True
-        return False
+        results.append((title, pid.value))
+        return True
 
-    # ── Strategy 1: foreground window after click ──────────────────────
-    fg = _user32.GetForegroundWindow()
-    if fg and not _is_shell_or_overlay(fg):
-        pid = wt.DWORD(0)
-        _user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
-        if pid.value:
-            return pid.value
-
-    # ── Strategy 2: Z-order walk, skip shell / transparent windows ─────
-    hwnd = _user32.GetTopWindow(None)
-    while hwnd:
-        if _user32.IsWindowVisible(hwnd):
-            raw = wt.RECT()
-            _user32.GetWindowRect(hwnd, ctypes.byref(raw))
-            if raw.left <= x < raw.right and raw.top <= y < raw.bottom:
-                if not _is_shell_or_overlay(hwnd):
-                    pid = wt.DWORD(0)
-                    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                    if pid.value:
-                        return pid.value
-        hwnd = _user32.GetWindow(hwnd, 2)  # GW_HWNDNEXT = 2
-
-    return 0
+    _user32.EnumWindows(_cb, 0)
+    return results
 
 
-class _POINT(ctypes.Structure):
-    _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
+def _foreground_pid() -> int:
+    """Return the PID of the current foreground window if it is not a shell
+    process, otherwise return 0."""
+    WS_EX_TRANSPARENT = 0x00000020
+    WS_EX_NOACTIVATE  = 0x08000000
+    GWL_EXSTYLE       = -20
+
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return 0
+    pid = wt.DWORD(0)
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return 0
+    if _pid_to_exe(pid.value) in _SHELL_PROCESS_NAMES:
+        return 0
+    ex_style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    if ex_style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE):
+        return 0
+    return pid.value
 
 
 class WindowPicker(QObject):
@@ -186,9 +180,41 @@ class WindowPicker(QObject):
 
         if lbutton_down:
             self._timer.stop()
-            pos = QCursor.pos()
-            pid = _window_at(pos.x(), pos.y())
+            pid = _foreground_pid()
             if pid:
                 self.picked.emit(pid)
-            else:
-                self.cancelled.emit()
+                return
+            # Strategy 1 failed (e.g. exclusive-fullscreen game that never
+            # takes Win32 foreground focus).  Let the user pick manually.
+            self._pick_from_list()
+
+    def _pick_from_list(self) -> None:
+        """Show a dialog listing all visible non-shell windows; emit
+        ``picked`` or ``cancelled`` based on the user's choice."""
+        windows = _enumerate_windows()
+        if not windows:
+            self.cancelled.emit()
+            return
+
+        # Build display labels; append PID when titles are duplicated.
+        title_counts: dict[str, int] = {}
+        for title, _ in windows:
+            title_counts[title] = title_counts.get(title, 0) + 1
+        labels = [
+            f"{title}  (PID {pid})" if title_counts[title] > 1 else title
+            for title, pid in windows
+        ]
+
+        chosen, ok = QInputDialog.getItem(
+            None,
+            "选择目标窗口",
+            "未能自动识别目标窗口，请手动选择：",
+            labels,
+            0,
+            False,
+        )
+        if ok:
+            idx = labels.index(chosen)
+            self.picked.emit(windows[idx][1])
+        else:
+            self.cancelled.emit()
