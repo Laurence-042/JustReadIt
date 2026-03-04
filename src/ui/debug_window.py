@@ -26,7 +26,8 @@ from PySide6.QtGui import (
     QAction, QColor, QCursor, QFont, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QGroupBox, QHBoxLayout, QLabel,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QGroupBox,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
@@ -37,6 +38,7 @@ from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.hook.text_hook import TextHook, HookAttachError, HookScriptError
+from src.hook.hook_search import HookCandidate, HookCode, HookSearcher, HookSearchError
 from .window_picker import WindowPicker
 
 
@@ -96,10 +98,12 @@ class _PipelineWorker(QObject):
     error = Signal(str)
     ready = Signal()  # emitted once setup() completes — used to defer timer start
 
-    def __init__(self, target: GameTarget, language_tag: str) -> None:
+    def __init__(self, target: GameTarget, language_tag: str, *, diagnostic: bool = False, hook_code: HookCode | None = None) -> None:
         super().__init__()
         self._target = target
         self._language_tag = language_tag
+        self._diagnostic = diagnostic
+        self._hook_code = hook_code
         self._capturer: Capturer | None = None
         self._ocr: WindowsOcr | None = None
         self._hook: TextHook | None = None
@@ -127,7 +131,7 @@ class _PipelineWorker(QObject):
             self.error.emit(f"Windows OCR init failed: {exc}")
 
         try:
-            self._hook = TextHook(self._target.pid)
+            self._hook = TextHook(self._target.pid, diagnostic=self._diagnostic, hook_code=self._hook_code)
             self._hook.attach()
         except (HookAttachError, HookScriptError) as exc:
             self._hook_error = str(exc)
@@ -235,6 +239,13 @@ class _PipelineWorker(QObject):
             hook_text = "[hook not initialised]"
         elif not self._hook.attached:
             hook_text = "[hook detached — target process may have exited]"
+        elif self._diagnostic:
+            # Diagnostic mode — diag messages are the primary output.
+            diag = self._hook.diag
+            hook_texts = self._hook.texts
+            hook_text = "── DIAGNOSTIC MODE ──\n\n" + (diag or "(waiting for data…)")
+            if hook_texts:
+                hook_text += "\n\n── Captured Text ──\n" + "\n".join(hook_texts[-50:])
         else:
             diag = self._hook.diag
             hook_texts = self._hook.texts
@@ -374,6 +385,155 @@ def _make_panel(title: str) -> tuple[QGroupBox, QTextEdit]:
 
 
 # ---------------------------------------------------------------------------
+# Hook-search dialog
+# ---------------------------------------------------------------------------
+
+class _HookSearchDialog(QDialog):
+    """Two-phase dialog for discovering engine-specific hook sites.
+
+    Phase 1 — Scanning  (a few seconds)
+        Frida scans the exe for function prologues and attaches interceptors.
+
+    Phase 2 — Collecting  (user plays game for ~30 s)
+        Interceptors fire and candidates appear in the list.
+        The user picks the best one and clicks OK.
+    """
+
+    def __init__(self, target: "GameTarget", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Search Hook Sites")
+        self.resize(820, 500)
+
+        self._target = target
+        self._searcher: HookSearcher | None = None
+        self.selected_code: HookCode | None = None
+
+        # ── Layout ──────────────────────────────────────────────────
+        root = QVBoxLayout(self)
+
+        # Status / info label
+        self._lbl_status = QLabel("Scanning game executable for function prologues…")
+        self._lbl_status.setWordWrap(True)
+        root.addWidget(self._lbl_status)
+
+        # Indeterminate progress bar (shown during scan phase)
+        self._prog = QProgressBar()
+        self._prog.setRange(0, 0)
+        self._prog.setFixedHeight(14)
+        root.addWidget(self._prog)
+
+        # Candidate list
+        self._lst = QListWidget()
+        self._lst.setFont(QFont("Consolas", 9))
+        self._lst.itemDoubleClicked.connect(self._accept_selection)
+        root.addWidget(self._lst, 1)
+
+        # Diag output (collapsible area — initially hidden)
+        self._te_diag = QTextEdit()
+        self._te_diag.setReadOnly(True)
+        self._te_diag.setFont(QFont("Consolas", 8))
+        self._te_diag.setFixedHeight(100)
+        self._te_diag.setPlaceholderText("Frida diagnostic output…")
+        root.addWidget(self._te_diag)
+
+        # Buttons
+        self._btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._btn_box.accepted.connect(self._accept_selection)
+        self._btn_box.rejected.connect(self.reject)
+        self._btn_ok = self._btn_box.button(QDialogButtonBox.StandardButton.Ok)
+        self._btn_ok.setEnabled(False)
+        root.addWidget(self._btn_box)
+
+        # ── Refresh timer ────────────────────────────────────────────
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._refresh)
+
+        # Start search immediately
+        self._start()
+
+    # ------------------------------------------------------------------
+
+    def _start(self) -> None:
+        try:
+            self._searcher = HookSearcher(self._target.pid)
+            self._searcher.start()
+        except HookSearchError as exc:
+            self._lbl_status.setText(f"⚠ Could not start search: {exc}")
+            self._prog.setVisible(False)
+            return
+        self._timer.start()
+
+    def _refresh(self) -> None:
+        if self._searcher is None:
+            return
+
+        # Update diag
+        diags = self._searcher.diags()
+        if diags:
+            self._te_diag.setPlainText("\n".join(diags))
+
+        # Once scan is done, update status and stop the spinner
+        if self._searcher.scan_complete and self._prog.maximum() == 0:
+            self._prog.setRange(0, 1)
+            self._prog.setValue(1)
+            self._lbl_status.setText(
+                "Scan complete — play the game to load text, then select a candidate and click OK.\n"
+                "Candidates with dialogue text (quoted) are boosted to the top."
+            )
+
+        # Repopulate list with current ranked candidates
+        candidates = self._searcher.ranked_candidates()
+        current_key = self._lst.currentItem().data(32) if self._lst.currentItem() else None
+
+        self._lst.clear()
+        for c in candidates:
+            if c.score <= 0:
+                continue
+            label = c.display_label()
+            item = QListWidgetItem(label)
+            item.setData(32, c.to_hook_code().to_str())  # store serialised code
+            self._lst.addItem(item)
+            if item.data(32) == current_key:
+                self._lst.setCurrentItem(item)
+
+        if candidates:
+            self._btn_ok.setEnabled(self._lst.currentItem() is not None or bool(candidates))
+            if self._lst.count() > 0 and self._lst.currentItem() is None:
+                self._lst.setCurrentRow(0)
+                self._btn_ok.setEnabled(True)
+
+    def _accept_selection(self) -> None:
+        item = self._lst.currentItem()
+        if item is None and self._lst.count() > 0:
+            item = self._lst.item(0)
+        if item is not None:
+            try:
+                self.selected_code = HookCode.from_str(item.data(32))
+            except ValueError:
+                pass
+        self._cleanup()
+        self.accept()
+
+    def reject(self) -> None:  # type: ignore[override]
+        self._cleanup()
+        super().reject()
+
+    def _cleanup(self) -> None:
+        self._timer.stop()
+        if self._searcher is not None:
+            self._searcher.stop()
+            self._searcher = None
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._cleanup()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Main debug window
 # ---------------------------------------------------------------------------
 
@@ -473,6 +633,31 @@ class DebugWindow(QMainWindow):
         act_stop.triggered.connect(self._stop)
         tb.addAction(act_stop)
 
+        tb.addSeparator()
+
+        act_diag = QAction("🔍 Diagnose", self)
+        act_diag.setToolTip(
+            "Run deep diagnostics: enumerate modules, scan exports, "
+            "hook glyph/font APIs to determine how the engine renders text"
+        )
+        act_diag.triggered.connect(self._diagnose)
+        tb.addAction(act_diag)
+
+        act_search = QAction("🧲 Search Hooks", self)
+        act_search.setToolTip(
+            "Scan the game process for functions that pass CJK text. "
+            "Play the game for ~30 s then pick the best result."
+        )
+        act_search.triggered.connect(self._search_hooks)
+        tb.addAction(act_search)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Hook: "))
+        self._lbl_hook_code = QLabel("(Win32 default)")
+        self._lbl_hook_code.setToolTip("Currently configured engine-specific hook (or Win32 default)")
+        self._lbl_hook_code.setMaximumWidth(300)
+        tb.addWidget(self._lbl_hook_code)
+
         # ── Restore persisted settings ───────────────────────────────────────────────
         saved_lang = _cfg.ocr_language
         saved_interval = _cfg.interval_ms
@@ -481,6 +666,16 @@ class DebugWindow(QMainWindow):
             if self._cmb_lang.itemData(i) == saved_lang:
                 self._cmb_lang.setCurrentIndex(i)
                 break
+
+        # Restore saved hook code label
+        saved_hook = _cfg.hook_code
+        if saved_hook:
+            try:
+                hc = HookCode.from_str(saved_hook)
+                self._lbl_hook_code.setText(f"+{hc.rva:#x}:{hc.access_pattern} ({hc.encoding})")
+                self._lbl_hook_code.setToolTip(saved_hook)
+            except ValueError:
+                pass
 
         # ── Install progress bar (hidden until a capability install runs) ──────
         self._install_bar = QWidget()
@@ -742,14 +937,23 @@ class DebugWindow(QMainWindow):
     # Pipeline run / stop
     # ------------------------------------------------------------------
 
-    def _run(self) -> None:
+    def _run(self, *, diagnostic: bool = False, hook_code: HookCode | None = None) -> None:
         if self._target is None:
             self.statusBar().showMessage("Pick a window first.", 3000)
             return
         self._stop()
 
+        # If no explicit hook_code provided, load from config.
+        if hook_code is None and not diagnostic:
+            saved = _cfg.hook_code
+            if saved:
+                try:
+                    hook_code = HookCode.from_str(saved)
+                except ValueError:
+                    pass
+
         lang = self._selected_language
-        self._worker = _PipelineWorker(self._target, lang)
+        self._worker = _PipelineWorker(self._target, lang, diagnostic=diagnostic, hook_code=hook_code)
         self._worker_thread = QThread(self)
         self._worker.moveToThread(self._worker_thread)
 
@@ -765,7 +969,27 @@ class DebugWindow(QMainWindow):
         # Timer is started by _on_worker_ready once setup() completes.
         self.statusBar().showMessage(
             f"Starting — lang={lang}  interval={self._spn_interval.value()} ms"
+            + ("  [DIAGNOSTIC]" if diagnostic else "")
         )
+
+    def _diagnose(self) -> None:
+        """Start the pipeline in diagnostic mode."""
+        self._run(diagnostic=True)
+
+    def _search_hooks(self) -> None:
+        """Open the hook-search dialog."""
+        if self._target is None:
+            self.statusBar().showMessage("Pick a window first.", 3000)
+            return
+        dlg = _HookSearchDialog(self._target, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_code is not None:
+            code = dlg.selected_code
+            _cfg.hook_code = code.to_str()
+            self._lbl_hook_code.setText(f"+{code.rva:#x}:{code.access_pattern} ({code.encoding})")
+            self._lbl_hook_code.setToolTip(code.to_str())
+            self.statusBar().showMessage(
+                f"Hook code saved: {code.to_str()}  — press ▶ Run to use it.", 6000
+            )
 
     def _stop(self) -> None:
         self._run_timer.stop()

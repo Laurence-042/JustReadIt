@@ -44,10 +44,13 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import frida
 import frida.core
+
+if TYPE_CHECKING:
+    from src.hook.hook_search import HookCode
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +73,11 @@ class HookScriptError(RuntimeError):
 
 _HOOK_SCRIPT_JS: str = (Path(__file__).parent / "hook_script.js").read_text(encoding="utf-8")
 
+
+def _load_diag_script() -> str:
+    """Lazy-load the diagnostic Frida script (avoids import-time crash if missing)."""
+    return (Path(__file__).parent / "diag_script.js").read_text(encoding="utf-8")
+
 # ---------------------------------------------------------------------------
 # Python-side hook manager
 # ---------------------------------------------------------------------------
@@ -79,12 +87,20 @@ _MAX_TEXTS = 4096
 
 
 class TextHook:
-    """Frida-based text hook that captures Win32 text output.
+    """Frida-based text hook that captures text output.
 
     Parameters
     ----------
     pid:
         Target process ID (usually ``GameTarget.pid``).
+    diagnostic:
+        When ``True`` loads ``diag_script.js`` instead of the normal hook
+        script.  The diagnostic script enumerates all modules, scans for
+        font/text-related exports, and hooks glyph rendering APIs.
+    hook_code:
+        When provided, use a targeted single-address hook generated from
+        :class:`~src.hook.hook_search.HookCode` instead of the generic
+        Win32 API hooks.  Takes precedence over ``diagnostic``.
 
     Attributes
     ----------
@@ -92,12 +108,20 @@ class TextHook:
         Snapshot of captured text strings (newest last).  Thread-safe.
     """
 
-    def __init__(self, pid: int) -> None:
+    def __init__(
+        self,
+        pid: int,
+        *,
+        diagnostic: bool = False,
+        hook_code: "HookCode | None" = None,
+    ) -> None:
         self._pid = pid
+        self._diagnostic = diagnostic
+        self._hook_code = hook_code
         self._session: frida.core.Session | None = None
         self._script: frida.core.Script | None = None
         self._texts: list[str] = []
-        self._diag: str = ""
+        self._diags: list[str] = []
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -148,8 +172,14 @@ class TextHook:
 
         self._session.on("detached", self._on_session_detached)
 
+        if self._hook_code is not None:
+            js = self._hook_code.to_js()
+        elif self._diagnostic:
+            js = _load_diag_script()
+        else:
+            js = _HOOK_SCRIPT_JS
         try:
-            self._script = self._session.create_script(_HOOK_SCRIPT_JS)
+            self._script = self._session.create_script(js)
             self._script.on("message", self._on_message)
             self._script.load()
         except Exception as exc:
@@ -203,14 +233,25 @@ class TextHook:
             return list(self._texts)
 
     @property
-    def diag(self) -> str:
-        """Startup diagnostic from the JS instrumentation script.
+    def diagnostic(self) -> bool:
+        """``True`` if this hook was created in diagnostic mode."""
+        return self._diagnostic
 
-        Lists which hook points were attached and which text-related modules
-        are loaded in the target process.  Empty until the script has loaded.
+    @property
+    def hook_code(self) -> "HookCode | None":
+        """The :class:`~src.hook.hook_search.HookCode` used for this hook, if any."""
+        return self._hook_code
+
+    @property
+    def diag(self) -> str:
+        """All diagnostic messages joined as a single string.
+
+        In normal mode this is the startup diagnostic (attached hooks,
+        relevant modules).  In diagnostic mode it accumulates module
+        enumeration, export scans, and live glyph/font hook results.
         """
         with self._lock:
-            return self._diag
+            return "\n\n".join(self._diags)
 
     def clear(self) -> None:
         """Discard all captured text strings."""
@@ -235,7 +276,7 @@ class TextHook:
                             self._texts = self._texts[-_MAX_TEXTS:]
                 elif kind == "diag" and value:
                     with self._lock:
-                        self._diag = value
+                        self._diags.append(value)
                     log.info("Hook diag: %s", value)
         elif message.get("type") == "error":
             log.warning("Frida script error: %s", message.get("description", ""))

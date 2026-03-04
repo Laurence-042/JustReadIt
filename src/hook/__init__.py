@@ -3,6 +3,8 @@
 Public API
 ----------
 .. autoclass:: TextHook
+.. autoclass:: HookCode
+.. autoclass:: HookSearcher
 .. autoclass:: Cleaner
 .. autofunction:: run_cleaners
 """

@@ -60,3 +60,21 @@ class AppConfig:
         s = _make_qsettings()
         s.setValue("pipeline/interval_ms", value)
         s.sync()
+
+    # ── Hook ────────────────────────────────────────────────
+
+    @property
+    def hook_code(self) -> str:
+        """Serialised :class:`~src.hook.hook_search.HookCode` string, or empty.
+
+        Stored as ``"<module>!<rva_hex>:<access_pattern>:<encoding>"``.
+        See :meth:`~src.hook.hook_search.HookCode.to_str` for pattern syntax.
+        Empty string means no engine-specific hook has been configured.
+        """
+        return str(_make_qsettings().value("hook/code", ""))
+
+    @hook_code.setter
+    def hook_code(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("hook/code", value)
+        s.sync()

@@ -57,3 +57,5 @@ _frida_agent/
 *.env
 .env
 secrets.toml
+
+tmp/
