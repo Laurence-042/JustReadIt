@@ -21,6 +21,11 @@
  *
  * Config vars (injected from Python before this source):
  *   config.maxCandidates, config.maxHooks, config.scanLimitBytes
+ *
+ * NOTE on Memory.scanSync pattern syntax (frida-gum gum_match_pattern_seal):
+ *   The pattern must NOT start or end with a wildcard token.
+ *   All prologue patterns below therefore omit trailing wildcard bytes --
+ *   the fixed prefix is already sufficient to locate the instruction.
  */
 
 /* -- Config --------------------------------------------------------------- */
@@ -106,28 +111,23 @@ if (!_mainMod) {
     });
 
     /*
-     * Per-range scanning via Process.enumerateRanges('r-x') avoids two
-     * failure modes of scanning the full module as one flat buffer:
-     *
-     *  1. Any non-readable page (PE header, .reloc, guard pages) causes
-     *     Memory.scanSync to throw; the empty catch would return 0 results
-     *     for the entire range, even though the .text section is fine.
-     *
-     *  2. VN engines often unpack code to dynamically allocated regions
-     *     outside the .exe image; those are r-x ranges with no module entry.
+     * Prologue patterns -- trailing wildcard bytes are intentionally omitted
+     * because frida-gum rejects any pattern whose last token is GUM_MATCH_WILDCARD
+     * (gum_match_pattern_seal, gummemory.c).  The fixed-byte prefix is sufficient
+     * to identify each prologue variant.
      */
     var _PROLOGUE_PATS = [
-        '48 83 EC ??',           /* sub rsp, imm8   (most common MSVC/Clang) */
-        '48 81 EC ?? ?? ?? ??',  /* sub rsp, imm32                           */
-        '40 53 48 83 EC ??',     /* push rbx; sub rsp                        */
-        '40 55 48 83 EC ??',     /* push rbp; sub rsp                        */
-        '40 56 48 83 EC ??',     /* push rsi; sub rsp                        */
-        '40 57 48 83 EC ??',     /* push rdi; sub rsp                        */
-        '41 54 48 83 EC ??',     /* push r12; sub rsp                        */
-        '41 55 48 83 EC ??',     /* push r13; sub rsp                        */
-        '41 56 48 83 EC ??',     /* push r14; sub rsp                        */
-        '41 57 48 83 EC ??',     /* push r15; sub rsp                        */
-        '55 48 89 E5'            /* push rbp; mov rbp,rsp  (GCC-style)       */
+        '48 83 EC',         /* sub rsp, imm8          (imm omitted -- wildcard) */
+        '48 81 EC',         /* sub rsp, imm32         (imm omitted)             */
+        '40 53 48 83 EC',   /* push rbx; sub rsp      (imm omitted)             */
+        '40 55 48 83 EC',   /* push rbp; sub rsp      (imm omitted)             */
+        '40 56 48 83 EC',   /* push rsi; sub rsp      (imm omitted)             */
+        '40 57 48 83 EC',   /* push rdi; sub rsp      (imm omitted)             */
+        '41 54 48 83 EC',   /* push r12; sub rsp      (imm omitted)             */
+        '41 55 48 83 EC',   /* push r13; sub rsp      (imm omitted)             */
+        '41 56 48 83 EC',   /* push r14; sub rsp      (imm omitted)             */
+        '41 57 48 83 EC',   /* push r15; sub rsp      (imm omitted)             */
+        '55 48 89 E5'       /* push rbp; mov rbp,rsp  (GCC-style, no wildcard)  */
     ];
 
     var _hookAddrSet   = {};
