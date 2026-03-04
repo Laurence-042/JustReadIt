@@ -314,24 +314,43 @@ class HookSearchError(RuntimeError):
     """Raised when the hook-search session cannot be started."""
 
 
+@dataclass
+class FoundString:
+    """A CJK string discovered in game process memory during Phase 1."""
+    address: str   # hex string as sent by JS
+    encoding: str  # 'utf16' or 'utf8'
+    text: str
+
+
 class HookSearcher:
-    """Brute-force hook-site discovery via Frida.
+    """Hook-site discovery via Frida (auto-scan + read-monitor strategy).
+
+    Phase 1 (starts immediately on :meth:`start`):
+        JS scans rw- memory for UTF-16LE CJK strings.  Results are
+        available via :attr:`found_strings` once :attr:`scan_complete`.
+
+    Phase 2 (triggered by calling :meth:`watch`):
+        ``MemoryAccessMonitor`` is armed on the selected addresses.
+        The game render loop fires it within one frame.
+        Hook candidates are reported via :attr:`ranked_candidates`.
 
     Parameters
     ----------
     pid:
         Target process ID.
     max_candidates:
-        Stop reporting after this many unique CJK-carrying sites.
-    max_hooks:
-        Maximum function prologues to instrument.  Capped to keep
-        overhead manageable (default 5000).
+        Stop after this many unique hook sites.
+    max_strings:
+        Cap on CJK strings reported in Phase 1.
 
     Usage::
 
         searcher = HookSearcher(pid=12345)
         searcher.start()
-        # … user plays the game for ~30 s …
+        searcher.wait_for_scan()
+        # show searcher.found_strings to user, they pick
+        searcher.watch([s.address for s in selected])
+        # render loop fires -> candidates arrive
         candidates = searcher.ranked_candidates()
         searcher.stop()
     """
@@ -340,18 +359,18 @@ class HookSearcher:
         self,
         pid: int,
         *,
-        max_candidates: int = 500,
-        max_hooks: int = 5000,
+        max_candidates: int = 50,
+        max_strings: int = 200,
     ) -> None:
-        self._pid          = pid
-        self._max_c        = max_candidates
-        self._max_hooks    = max_hooks
+        self._pid         = pid
+        self._max_c       = max_candidates
+        self._max_strings = max_strings
         self._session: frida.core.Session | None = None
         self._script: frida.core.Script | None   = None
 
-        # key: "rva:argIdx" → HookCandidate (updated on repeated hits)
         self._candidates: dict[str, HookCandidate] = {}
         self._diags: list[str] = []
+        self._found_strings: list[FoundString] = []
         self._scan_done = threading.Event()
         self._lock = threading.Lock()
 
@@ -378,8 +397,8 @@ class HookSearcher:
         config_prefix = (
             f"var config = {{"
             f"  maxCandidates: {self._max_c},"
-            f"  maxHooks: {self._max_hooks}"
-            f"}};\n"
+            f"  maxStrings: {self._max_strings}"
+            f"}};"
         )
         try:
             self._script = self._session.create_script(
@@ -433,8 +452,28 @@ class HookSearcher:
 
     @property
     def scan_complete(self) -> bool:
-        """``True`` once the initial prologue scan has finished."""
+        """``True`` once the Phase 1 memory scan has finished."""
         return self._scan_done.is_set()
+
+    @property
+    def found_strings(self) -> list[FoundString]:
+        """CJK strings found in process memory during Phase 1."""
+        with self._lock:
+            return list(self._found_strings)
+
+    def watch(self, addresses: list[str]) -> None:
+        """Start Phase 2: arm MemoryAccessMonitor on *addresses*.
+
+        Parameters
+        ----------
+        addresses:
+            Hex-string addresses as returned by :attr:`found_strings`.
+            Pass the ones whose text is currently on screen.
+        """
+        if self._script is None:
+            raise HookSearchError("Cannot watch: script not loaded.")
+        self._script.post({"type": "watch", "addresses": addresses})
+        log.info("Posted watch for %d address(es)", len(addresses))
 
     # ------------------------------------------------------------------
     # Frida callbacks
@@ -456,12 +495,19 @@ class HookSearcher:
             with self._lock:
                 self._diags.append(value)
             log.debug("Search diag: %s", value)
-        elif kind == "scan_done":
-            count = payload.get("hookCount", 0)
+        elif kind == "string_found":
+            addr = str(payload.get("address", ""))
+            enc  = str(payload.get("encoding", "utf16"))
+            text = str(payload.get("text", ""))
             with self._lock:
-                self._diags.append(f"Scan complete — {count} hooks active")
+                self._found_strings.append(FoundString(addr, enc, text))
+            log.debug("String found at %s: %.30r", addr, text)
+        elif kind == "scan_done":
+            count = int(payload.get("count", 0))
+            with self._lock:
+                self._diags.append(f"Scan complete — {count} CJK string(s) found")
             self._scan_done.set()
-            log.info("Hook scan complete: %d hooks", count)
+            log.info("Phase 1 scan complete: %d strings", count)
 
     def _handle_candidate(self, payload: dict[str, Any]) -> None:
         module   = str(payload.get("module", ""))
