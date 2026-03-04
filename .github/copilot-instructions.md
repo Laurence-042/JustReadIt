@@ -45,7 +45,7 @@ Project not yet initialised. When scaffolding:
 uv init   # or: python -m venv .venv && pip install -e ".[dev]"
 
 # install deps
-pip install frida winsdk imagehash rapidfuzz pywin32 Pillow
+pip install frida imagehash rapidfuzz pywin32 psutil Pillow
 
 # run tests
 pytest tests/

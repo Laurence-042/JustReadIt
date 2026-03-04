@@ -13,14 +13,13 @@ mouse-down that triggered the "Pick Window" button itself is ignored.
 """
 from __future__ import annotations
 
-import ctypes
-import ctypes.wintypes as wt
+import psutil
+import win32api
+import win32con
+import win32gui
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QInputDialog
-
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 # Shell / system process names to skip when picking a window.
 # These processes own transparent overlay windows that sit on top of everything
@@ -35,45 +34,13 @@ _SHELL_PROCESS_NAMES = frozenset({
     "applicationframehost.exe",
 })
 
-_TH32CS_SNAPPROCESS = 0x00000002
-_MAX_PATH = 260
-_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-
-class _PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize",              wt.DWORD),
-        ("cntUsage",            wt.DWORD),
-        ("th32ProcessID",       wt.DWORD),
-        ("th32DefaultHeapID",   ctypes.POINTER(ctypes.c_ulong)),
-        ("th32ModuleID",        wt.DWORD),
-        ("cntThreads",          wt.DWORD),
-        ("th32ParentProcessID", wt.DWORD),
-        ("pcPriClassBase",      ctypes.c_long),
-        ("dwFlags",             wt.DWORD),
-        ("szExeFile",           ctypes.c_wchar * _MAX_PATH),
-    ]
-
-
-def _pid_to_exe(pid: int) -> str:
-    """Return the lowercase exe basename for *pid*, or ``""``."""
-    snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
-    if snap == _INVALID_HANDLE_VALUE:
-        return ""
+def _is_shell(pid: int) -> bool:
+    """Return True if *pid* belongs to a known shell/system process."""
     try:
-        entry = _PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
-        ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
-        while ok:
-            if entry.th32ProcessID == pid:
-                return entry.szExeFile.lower()
-            ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
-        return ""
-    finally:
-        _kernel32.CloseHandle(snap)
-
-
-_EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+        return psutil.Process(pid).name().lower() in _SHELL_PROCESS_NAMES
+    except psutil.NoSuchProcess:
+        return True
 
 
 def _enumerate_windows() -> list[tuple[str, int]]:
@@ -81,51 +48,35 @@ def _enumerate_windows() -> list[tuple[str, int]]:
     non-empty title, skipping known shell/system processes."""
     results: list[tuple[str, int]] = []
 
-    @_EnumWindowsProc
-    def _cb(hwnd: int, _: int) -> bool:
-        if not _user32.IsWindowVisible(hwnd):
+    def _cb(hwnd: int, _: None) -> bool:
+        if not win32gui.IsWindowVisible(hwnd):
             return True
-        length = _user32.GetWindowTextLengthW(hwnd)
-        if not length:
-            return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        _user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value
+        title = win32gui.GetWindowText(hwnd)
         if not title:
             return True
-        pid = wt.DWORD(0)
-        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if not pid.value:
+        _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+        if _is_shell(pid):
             return True
-        if _pid_to_exe(pid.value) in _SHELL_PROCESS_NAMES:
-            return True
-        results.append((title, pid.value))
+        results.append((title, pid))
         return True
 
-    _user32.EnumWindows(_cb, 0)
+    win32gui.EnumWindows(_cb, None)
     return results
 
 
 def _foreground_pid() -> int:
     """Return the PID of the current foreground window if it is not a shell
-    process, otherwise return 0."""
-    WS_EX_TRANSPARENT = 0x00000020
-    WS_EX_NOACTIVATE  = 0x08000000
-    GWL_EXSTYLE       = -20
-
-    hwnd = _user32.GetForegroundWindow()
+    or overlay process, otherwise return 0."""
+    hwnd = win32gui.GetForegroundWindow()
     if not hwnd:
         return 0
-    pid = wt.DWORD(0)
-    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    if not pid.value:
+    _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+    if not pid or _is_shell(pid):
         return 0
-    if _pid_to_exe(pid.value) in _SHELL_PROCESS_NAMES:
+    ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+    if ex_style & (win32con.WS_EX_TRANSPARENT | win32con.WS_EX_NOACTIVATE):
         return 0
-    ex_style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    if ex_style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE):
-        return 0
-    return pid.value
+    return pid
 
 
 class WindowPicker(QObject):
@@ -164,7 +115,7 @@ class WindowPicker(QObject):
     # ------------------------------------------------------------------
 
     def _poll(self) -> None:
-        lbutton_down = bool(_user32.GetAsyncKeyState(0x01) & 0x8000)
+        lbutton_down = bool(win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000)
 
         if not self._seen_release:
             # Ignore the button-down that came from clicking "Pick Window".
@@ -172,8 +123,7 @@ class WindowPicker(QObject):
                 self._seen_release = True
             return
 
-        rbutton_down = bool(_user32.GetAsyncKeyState(0x02) & 0x8000)
-        if rbutton_down:
+        if win32api.GetAsyncKeyState(win32con.VK_RBUTTON) & 0x8000:
             self._timer.stop()
             self.cancelled.emit()
             return
@@ -184,8 +134,8 @@ class WindowPicker(QObject):
             if pid:
                 self.picked.emit(pid)
                 return
-            # Strategy 1 failed (e.g. exclusive-fullscreen game that never
-            # takes Win32 foreground focus).  Let the user pick manually.
+            # Foreground detection failed (e.g. exclusive-fullscreen game that
+            # never takes Win32 foreground focus).  Let the user pick manually.
             self._pick_from_list()
 
     def _pick_from_list(self) -> None:

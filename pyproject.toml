@@ -21,6 +21,7 @@ dependencies = [
     "imagehash",
     "rapidfuzz",
     "pywin32",
+    "psutil",
     "Pillow",
     "dxcam",        # DXGI Desktop Duplication capture
 ]
@@ -29,6 +30,7 @@ dependencies = [
 dev = [
     "pytest",
     "pip-licenses",
+    "pywin32-stubs",
 ]
 ui = [
     "PySide6",
