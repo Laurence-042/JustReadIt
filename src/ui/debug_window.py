@@ -35,7 +35,8 @@ from PIL import Image
 from src.capture import Capturer
 from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
-from src.ocr.range_detectors import BoundingBox
+from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
+from src.hook.text_hook import TextHook, HookAttachError, HookScriptError
 from .window_picker import WindowPicker
 
 
@@ -71,6 +72,11 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040
 _WAIT_TIMEOUT            = 0x00000102
 _kernel32_ui = ctypes.WinDLL("kernel32", use_last_error=True)
+_user32_ui   = ctypes.WinDLL("user32",   use_last_error=True)
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +92,7 @@ class _PipelineWorker(QObject):
     error(message)
     """
 
-    result_ready = Signal(bytes, list, str, float)  # img, boxes, win_ocr_text, ms
+    result_ready = Signal(bytes, list, object, str, str, str, float)  # img, boxes, crop_rect|None, win_ocr, region_text, hook_text, ms
     error = Signal(str)
     ready = Signal()  # emitted once setup() completes — used to defer timer start
 
@@ -96,6 +102,7 @@ class _PipelineWorker(QObject):
         self._language_tag = language_tag
         self._capturer: Capturer | None = None
         self._ocr: WindowsOcr | None = None
+        self._hook: TextHook | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle (called on worker thread via QThread.started / explicit slots)
@@ -118,11 +125,22 @@ class _PipelineWorker(QObject):
         except Exception as exc:
             self.error.emit(f"Windows OCR init failed: {exc}")
 
+        try:
+            self._hook = TextHook(self._target.pid)
+            self._hook.attach()
+        except (HookAttachError, HookScriptError) as exc:
+            self.error.emit(f"Hook attach warning: {exc}")
+        except Exception as exc:
+            self.error.emit(f"Hook attach failed: {exc}")
+
         self.ready.emit()  # signal that all resources are initialised
 
     @Slot()
     def teardown(self) -> None:
         """Release resources when the thread is stopping."""
+        if self._hook is not None:
+            self._hook.detach()
+            self._hook = None
         if self._capturer is not None:
             self._capturer.close()
             self._capturer = None
@@ -176,12 +194,50 @@ class _PipelineWorker(QObject):
         lang_info = f"lang={self._ocr.language_tag}" if self._ocr else "lang=?"
         win_ocr_text = f"[ {lang_info} ]\n" + "\n".join(win_ocr_lines)
 
+        # ── Region detection ──────────────────────────────────────────
+        region_text = ""
+        crop_rect: tuple[int, int, int, int] | None = None
+        if boxes:
+            _pt = _POINT()
+            _user32_ui.GetCursorPos(ctypes.byref(_pt))
+            cr = self._target.capture_rect
+            cursor_x = _pt.x - cr.left
+            cursor_y = _pt.y - cr.top
+            # When the cursor is outside the captured frame (e.g. user is
+            # hovering over the debug window) fall back to the bottom-centre
+            # of the image — where VN dialog boxes typically sit.
+            if not (0 <= cursor_x < img.width and 0 <= cursor_y < img.height):
+                cursor_x = img.width // 2
+                cursor_y = int(img.height * 0.75)
+
+            dialog_boxes = run_detectors(boxes, cursor_x, cursor_y)
+            if dialog_boxes:
+                region_text = merge_boxes_text(dialog_boxes)
+                xs  = [b.x       for b in dialog_boxes]
+                ys  = [b.y       for b in dialog_boxes]
+                x2s = [b.x + b.w for b in dialog_boxes]
+                y2s = [b.y + b.h for b in dialog_boxes]
+                margin = 8
+                crop_rect = (
+                    max(0, min(xs)  - margin),
+                    max(0, min(ys)  - margin),
+                    min(img.width,  max(x2s) + margin),
+                    min(img.height, max(y2s) + margin),
+                )
+
+        # ── Hook texts ────────────────────────────────────────────────
+        hook_text = ""
+        if self._hook is not None and self._hook.attached:
+            hook_texts = self._hook.texts
+            if hook_texts:
+                hook_text = "\n".join(hook_texts[-50:])
+
         elapsed_ms = (time.monotonic() - t0) * 1000
 
         # Encode frame as JPEG bytes so the PIL object doesn't cross thread boundary.
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=75)
-        self.result_ready.emit(buf.getvalue(), boxes, win_ocr_text, elapsed_ms)
+        self.result_ready.emit(buf.getvalue(), boxes, crop_rect, win_ocr_text, region_text, hook_text, elapsed_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -209,15 +265,22 @@ class _PreviewLabel(QLabel):
         self.setText("No capture yet.\nPick a window and press ▶ Run.")
         self._raw: QPixmap | None = None
         self._boxes: list[BoundingBox] = []
+        self._crop_rect: tuple[int, int, int, int] | None = None
         self._orig_w = 1
         self._orig_h = 1
 
-    def update_frame(self, img_bytes: bytes, boxes: list[BoundingBox]) -> None:
+    def update_frame(
+        self,
+        img_bytes: bytes,
+        boxes: list[BoundingBox],
+        crop_rect: tuple[int, int, int, int] | None = None,
+    ) -> None:
         qimg = QImage.fromData(img_bytes)
         self._raw = QPixmap.fromImage(qimg)
         self._orig_w = qimg.width()
         self._orig_h = qimg.height()
         self._boxes = boxes
+        self._crop_rect = crop_rect
         self._render()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
@@ -260,6 +323,19 @@ class _PreviewLabel(QLabel):
                 painter.setPen(QColor(255, 255, 255))
                 painter.drawText(rx + 1, max(9, ry - 1), box.text[:24])
             painter.end()
+
+        # Draw the detected region as a dashed yellow rectangle.
+        if self._crop_rect is not None:
+            cl, ct, cr, cb = self._crop_rect
+            painter2 = QPainter(scaled)
+            pen = QPen(QColor(255, 255, 100), 2, Qt.PenStyle.DashLine)
+            painter2.setPen(pen)
+            painter2.drawRect(
+                int(cl * sx), int(ct * sy),
+                max(1, int((cr - cl) * sx)),
+                max(1, int((cb - ct) * sy)),
+            )
+            painter2.end()
 
         # Compose onto a dark canvas (letter-box background).
         canvas = QPixmap(lw, lh)
@@ -425,16 +501,19 @@ class DebugWindow(QMainWindow):
         splitter.setStretchFactor(1, 2)
 
         grp_wocr, self._te_wocr = _make_panel("Windows OCR")
+        grp_region, self._te_region = _make_panel("Detected Region")
         grp_hook, self._te_hook = _make_panel("Hook  (Frida)")
         grp_tl,   self._te_tl   = _make_panel("Translation  (not yet implemented)")
 
-        self._te_hook.setPlaceholderText("Attach to a process to see hooked text.")
+        self._te_region.setPlaceholderText("Region text will appear after range detection.")
+        self._te_hook.setPlaceholderText("Hook will attach automatically when pipeline starts.")
         self._te_tl.setPlaceholderText("Translation plugin not yet implemented.")
 
         right.addWidget(grp_wocr)
+        right.addWidget(grp_region)
         right.addWidget(grp_hook)
         right.addWidget(grp_tl)
-        right.setSizes([400, 160, 160])
+        right.setSizes([280, 160, 160, 120])
 
         # ── Status bar ─────────────────────────────────────────────────
         self.setStatusBar(QStatusBar(self))
@@ -707,17 +786,24 @@ class DebugWindow(QMainWindow):
     # Result / error handlers
     # ------------------------------------------------------------------
 
-    @Slot(bytes, list, str, float)
+    @Slot(bytes, list, object, str, str, str, float)
     def _on_result(
         self,
         img_bytes: bytes,
         boxes: list,
+        crop_rect: object,  # tuple[int,int,int,int] | None
         win_ocr_text: str,
+        region_text: str,
+        hook_text: str,
         elapsed_ms: float,
     ) -> None:
-        self._preview.update_frame(img_bytes, boxes)
+        self._preview.update_frame(img_bytes, boxes, crop_rect)
         header = f"[ {len(boxes)} boxes  —  {elapsed_ms:.0f} ms ]\n\n"
         self._te_wocr.setPlainText(header + win_ocr_text)
+        if region_text:
+            self._te_region.setPlainText(region_text)
+        if hook_text:
+            self._te_hook.setPlainText(hook_text)
         self.statusBar().showMessage(
             f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
         )

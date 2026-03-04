@@ -414,6 +414,31 @@ Append or insert custom detectors to customise behaviour per game layout.
 """
 
 
+def merge_boxes_text(boxes: Sequence[BoundingBox]) -> str:
+    """Merge bounding-box texts into a single string, grouped by visual line.
+
+    Boxes on the same visual line (determined by vertical overlap) are
+    concatenated left-to-right **without** a space separator — appropriate
+    for CJK scripts where characters are not space-delimited.  Lines are
+    joined with ``\\n``.
+
+    Parameters
+    ----------
+    boxes:
+        The bounding boxes whose ``.text`` to merge (typically the output
+        of :func:`run_detectors`).
+
+    Returns
+    -------
+    str
+        The merged text.  Empty string when *boxes* is empty.
+    """
+    if not boxes:
+        return ""
+    lines = _group_into_lines(list(boxes))
+    return "\n".join("".join(b.text for b in line) for line in lines)
+
+
 def run_detectors(
     boxes: Sequence[BoundingBox],
     cursor_x: int,
