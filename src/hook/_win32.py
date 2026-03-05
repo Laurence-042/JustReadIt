@@ -63,6 +63,9 @@ _k32.CreateRemoteThread.argtypes  = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t
 _k32.WaitForSingleObject.restype  = wt.DWORD
 _k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
 
+_k32.GetExitCodeThread.restype    = wt.BOOL
+_k32.GetExitCodeThread.argtypes   = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+
 _k32.CloseHandle.restype          = wt.BOOL
 _k32.CloseHandle.argtypes         = [wt.HANDLE]
 
@@ -158,8 +161,16 @@ def inject_dll(pid: int, dll_path: Path | str) -> None:
                 f"CreateRemoteThread failed: error {ctypes.get_last_error()}"
             )
         _k32.WaitForSingleObject(thr, 10_000)
+        exit_code = wt.DWORD(0)
+        _k32.GetExitCodeThread(thr, ctypes.byref(exit_code))
         _k32.CloseHandle(thr)
         _k32.VirtualFreeEx(h_proc, remote_buf, 0, MEM_RELEASE)
+        if exit_code.value == 0:
+            raise InjectionError(
+                f"LoadLibraryA returned NULL for {dll_path.name} — "
+                "a dependency DLL is missing or the image is corrupt. "
+                "Make sure MinHook.x64.dll is in the same directory as hook_engine.dll."
+            )
     finally:
         _k32.CloseHandle(h_proc)
 

@@ -363,6 +363,19 @@ class HookSearcher:
         except OSError as exc:
             raise HookSearchError(f"Named Pipe creation failed: {exc}") from exc
 
+        # Inject MinHook.x64.dll first so hook_engine.dll's implicit import resolves
+        # (the game's DLL search path doesn't include src/hook/ by default).
+        _minhook_path = _DLL_PATH.parent / "MinHook.x64.dll"
+        if _minhook_path.exists():
+            try:
+                inject_dll(self._pid, _minhook_path)
+            except InjectionError as exc:
+                close_pipe(self._h_pipe)
+                self._h_pipe = 0
+                raise HookSearchError(
+                    f"MinHook.x64.dll pre-injection failed: {exc}"
+                ) from exc
+
         try:
             inject_dll(self._pid, _DLL_PATH)
         except InjectionError as exc:
@@ -495,21 +508,34 @@ class HookSearcher:
 
     def _handle_hit(self, hook_va: int, slot_i: int,
                      encoding: int, text: str) -> None:
-        """Build / update a HookCandidate from a single pipe result."""
+        """Build / update a HookCandidate from a single pipe result.
+
+        slot_i values come from the trampoline's ``i`` counter, which reflects
+        the position of the value in the saved-register + caller-stack window::
+
+            -16 = rax    -15 = rbx    -14 = rcx (arg0)  -13 = rdx (arg1)
+            -12 = rsp    -11 = rbp    -10 = rsi  -9 = rdi
+             -8 = r8 (arg2)   -7 = r9 (arg3)   -6...-1 = r10-r15
+              0 = return addr   1..N = caller stack slots
+        """
         s = score_candidate(text)
         if s <= 0:
             return
 
-        # Determine access_pattern label from slot index:
-        #   slot_i < 0 → saved register copy (arg = slot_i + 4)  e.g. slot -4 = arg0
-        #   slot_i >= 0 → return addr (0) or caller stack slot
-        if -4 <= slot_i < 0:
-            arg_idx = slot_i + 4         # -4→0, -3→1, -2→2, -1→3
-            pattern = f"r{arg_idx}"
-        elif slot_i < -4:
-            pattern = "rax"              # saved rax, rarely useful
-        else:
+        # Map slot index to HookCode access_pattern.
+        # Only the 4 register args and positive stack slots are actionable.
+        _reg_to_pattern: dict[int, str] = {
+            -14: "r0",   # rcx
+            -13: "r1",   # rdx
+            -8:  "r2",   # r8
+            -7:  "r3",   # r9
+        }
+        if slot_i in _reg_to_pattern:
+            pattern = _reg_to_pattern[slot_i]
+        elif slot_i >= 1:
             pattern = f"s+{slot_i * 8:#x}"
+        else:
+            return   # saved non-arg register or return addr — ignore
 
         enc_str = "utf16" if encoding == 0 else "utf8"
 
@@ -549,10 +575,13 @@ import ctypes.wintypes as _wt
 
 _psapi = _ctypes.WinDLL("psapi", use_last_error=True)
 _psapi.EnumProcessModules.restype  = _wt.BOOL
-_psapi.EnumProcessModules.argtypes = [_wt.HANDLE, _ctypes.POINTER(_wt.HMODULE),
+_psapi.EnumProcessModules.argtypes = [_wt.HANDLE, _ctypes.POINTER(_ctypes.c_void_p),
                                        _wt.DWORD, _ctypes.POINTER(_wt.DWORD)]
 _psapi.GetModuleFileNameExW.restype  = _wt.DWORD
-_psapi.GetModuleFileNameExW.argtypes = [_wt.HANDLE, _wt.HMODULE, _wt.LPWSTR, _wt.DWORD]
+_psapi.GetModuleFileNameExW.argtypes = [_wt.HANDLE, _ctypes.c_void_p, _wt.LPWSTR, _wt.DWORD]
+_psapi.GetModuleInformation.restype  = _wt.BOOL
+_psapi.GetModuleInformation.argtypes = [_wt.HANDLE, _ctypes.c_void_p,
+                                         _ctypes.c_void_p, _wt.DWORD]
 
 _k32p = _ctypes.WinDLL("kernel32", use_last_error=True)
 _k32p.OpenProcess.restype  = _wt.HANDLE
@@ -582,8 +611,8 @@ def _resolve_module(va: int, pid: int) -> tuple[int, str] | None:
         try:
             needed = _wt.DWORD(0)
             _psapi.EnumProcessModules(h, None, 0, _ctypes.byref(needed))
-            count = needed.value // _ctypes.sizeof(_wt.HMODULE)
-            mods  = (_wt.HMODULE * count)()
+            count = needed.value // _ctypes.sizeof(_ctypes.c_void_p)
+            mods  = (_ctypes.c_void_p * count)()
             _psapi.EnumProcessModules(h, mods, needed, _ctypes.byref(needed))
 
             class _MI(_ctypes.Structure):
@@ -591,15 +620,16 @@ def _resolve_module(va: int, pid: int) -> tuple[int, str] | None:
                             ("SizeOfImage",  _wt.DWORD),
                             ("EntryPoint",   _ctypes.c_void_p)]
 
-            _psapi2 = _ctypes.WinDLL("psapi")
             buf = _ctypes.create_unicode_buffer(260)
-            for mod in mods:
+            for mod_val in mods:
+                if not mod_val:
+                    continue
                 mi = _MI()
-                if _psapi2.GetModuleInformation(h, mod, _ctypes.byref(mi),
-                                                _ctypes.sizeof(mi)):
+                if _psapi.GetModuleInformation(h, mod_val, _ctypes.byref(mi),
+                                               _ctypes.sizeof(mi)):
                     base = mi.lpBaseOfDll or 0
                     end  = base + mi.SizeOfImage  # exclusive upper bound
-                    _psapi.GetModuleFileNameExW(h, mod, buf, 260)
+                    _psapi.GetModuleFileNameExW(h, mod_val, buf, 260)
                     name = Path(buf.value).name
                     entries.append((base, end, name))
         finally:
