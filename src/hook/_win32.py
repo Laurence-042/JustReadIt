@@ -277,8 +277,8 @@ def close_pipe(h: int) -> None:
 #   [1]  deref          0=direct, 1=*(ptr+offset)
 #   [2]  byte_offset
 #   [2]  encoding       0=utf16le, 1=utf8
-#   [2]  _pad1
-_CONFIG_FMT = "<B3xIQ2BHH2x"
+#   [2]  batch_size     MODE_SEARCH: hooks per batch (0 = all at once)
+_CONFIG_FMT = "<B3xIQ2BHHH"
 _CONFIG_SIZE = struct.calcsize(_CONFIG_FMT)  # must be 24
 
 assert _CONFIG_SIZE == 24, f"Config struct size mismatch: {_CONFIG_SIZE}"
@@ -294,13 +294,23 @@ _RESULT_HDR_SIZE = struct.calcsize(_RESULT_HDR_FMT)  # must be 16
 assert _RESULT_HDR_SIZE == 16, f"ResultHdr struct size mismatch: {_RESULT_HDR_SIZE}"
 
 
-def pack_search_config(max_hooks: int) -> bytes:
-    """Pack a MODE_SEARCH Config."""
+def pack_search_config(max_hooks: int, batch_size: int = 0) -> bytes:
+    """Pack a MODE_SEARCH Config.
+
+    Parameters
+    ----------
+    max_hooks:
+        Total hook capacity (pre-allocated for all batches).
+    batch_size:
+        Number of functions to hook in the first batch.  0 means hook all
+        at once (original single-batch behaviour).
+    """
     return struct.pack(_CONFIG_FMT,
                        0,          # mode = search
                        max_hooks,
                        0,          # hook_address unused
                        0, 0, 0, 0, # arg_idx, deref, byte_offset, encoding
+                       batch_size,
                        )
 
 
@@ -312,6 +322,7 @@ def pack_hook_config(hook_address: int, arg_idx: int, deref: int,
                        0,           # max_hooks unused
                        hook_address,
                        arg_idx, deref, byte_offset, encoding,
+                       0,           # batch_size unused in MODE_HOOK
                        )
 
 
@@ -320,8 +331,10 @@ def unpack_result_hdr(data: bytes) -> tuple[int, int, int, int]:
     return struct.unpack(_RESULT_HDR_FMT, data)
 
 
-# CMD_DISABLE: uint8_t(1) + uint32_t(count) + count × uint64_t(va)
-_CMD_DISABLE: int = 1
+# CMD_DISABLE:   uint8_t(1) + uint32_t(count) + count × uint64_t(va)
+# CMD_SCAN_NEXT: uint8_t(2) + uint32_t(batch_size)
+_CMD_DISABLE:   int = 1
+_CMD_SCAN_NEXT: int = 2
 
 
 def pack_disable_command(vas: list[int]) -> bytes:
@@ -336,6 +349,15 @@ def pack_disable_command(vas: list[int]) -> bytes:
         List of absolute virtual addresses to disable.
     """
     return struct.pack("<BI", _CMD_DISABLE, len(vas)) + struct.pack(f"<{len(vas)}Q", *vas)
+
+
+def pack_scan_next_command(batch_size: int) -> bytes:
+    """Pack a CMD_SCAN_NEXT command.
+
+    Tells the DLL to hook the next *batch_size* functions from the current
+    .pdata position and report a ``scan_done:N@pos`` control message.
+    """
+    return struct.pack("<BI", _CMD_SCAN_NEXT, batch_size)
 
 
 # ---------------------------------------------------------------------------

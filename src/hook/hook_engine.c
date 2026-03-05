@@ -31,7 +31,8 @@
 #pragma pack(push, 1)
 typedef struct { uint8_t mode; uint8_t _p0[3]; uint32_t max_hooks;
                  uint64_t hook_address; uint8_t arg_idx; uint8_t deref;
-                 uint16_t byte_offset; uint16_t encoding; uint8_t _p1[2]; } Config;
+                 uint16_t byte_offset; uint16_t encoding;
+                 uint16_t batch_size;   /* MODE_SEARCH: hooks per batch (0 = all at once) */ } Config;
 typedef struct { uint64_t hook_va; int32_t slot_i;
                  uint16_t encoding; uint16_t text_len; } ResultHdr;
 #pragma pack(pop)
@@ -46,6 +47,16 @@ static long          g_hook_count = 0;
 
 typedef UINT64 (__fastcall *GenericFn)(UINT64,UINT64,UINT64,UINT64);
 static GenericFn g_orig = NULL;
+
+/* ---- batch-scan state (set once in do_search, used by scan_next_batch) ---- */
+static RUNTIME_FUNCTION *g_pdata       = NULL;
+static DWORD             g_pdata_count = 0;
+static DWORD             g_pdata_pos   = 0;   /* next .pdata entry to process  */
+static uintptr_t         g_img_base    = 0;
+static uintptr_t         g_ts_base     = 0;   /* .text section VA              */
+static uintptr_t         g_ts_size     = 0;
+static BYTE              g_tpl[TRAMPOLINE_SIZE]; /* Send-patched template       */
+static DWORD             g_mh          = 0;   /* total hook capacity           */
 
 /* ---- ring buffer ---- */
 #define RING_SLOTS 4096
@@ -307,75 +318,115 @@ typedef struct {
 static TrampolineUnwindEntry *g_unwind_table = NULL;
 static DWORD                  g_unwind_count  = 0;
 
-static void register_trampolines_for_seh(BYTE *base,
-                                          long  count,
-                                          size_t stride) {
-    /*
-     * CRITICAL: allocate the unwind table with alloc_near(base, ...) so that
-     * the UnwindData field in each RUNTIME_FUNCTION --
-     *   UnwindData = (DWORD)(ui_address - ImageBase)
-     * -- is a valid 32-bit RVA relative to `base` (our ImageBase).
-     *
-     * HeapAlloc returns low-address memory (e.g. 0x0000_01E7_...) while the
-     * trampoline buffer `base` is at a high address (e.g. 0x7FF5_E816_0000).
-     * Subtracting and truncating to DWORD gives a completely wrong pointer;
-     * the OS unwind code then reads garbage, eventually causing an AV in
-     * unrelated game code.
-     */
-    size_t tbl_size = (size_t)count * sizeof(TrampolineUnwindEntry);
+/* init_unwind_table: allocate and pre-fill the unwind table for the full
+ * trampoline capacity.  Each slot's BeginAddress/EndAddress/UnwindData are
+ * written once here and never touched again, so incremental batches only
+ * need to call update_seh_registration() with the new active count.
+ *
+ * Must be alloc_near(base) so that UnwindData RVAs fit in 32 bits.        */
+static void init_unwind_table(BYTE *base, DWORD capacity, size_t stride) {
+    size_t tbl_size = (size_t)capacity * sizeof(TrampolineUnwindEntry);
     g_unwind_table = (TrampolineUnwindEntry *)alloc_near((uintptr_t)base, tbl_size);
     if (!g_unwind_table) return;
     ZeroMemory(g_unwind_table, tbl_size);
 
-    for (long i = 0; i < count; i++) {
+    for (DWORD i = 0; i < capacity; i++) {
         BYTE *tramp = base + (size_t)i * stride;
         DWORD rva_begin = (DWORD)((uintptr_t)tramp - (uintptr_t)base);
-        DWORD rva_end   = rva_begin + (DWORD)stride;
-
-        /* RUNTIME_FUNCTION uses RVAs relative to the ImageBase
-         * passed to RtlAddFunctionTable -- we use `base` as ImageBase */
         g_unwind_table[i].rf.BeginAddress        = rva_begin;
-        g_unwind_table[i].rf.EndAddress           = rva_end;
-        g_unwind_table[i].rf.UnwindData           =
+        g_unwind_table[i].rf.EndAddress          = rva_begin + (DWORD)stride;
+        g_unwind_table[i].rf.UnwindData          =
             (DWORD)((uintptr_t)&g_unwind_table[i].ui - (uintptr_t)base);
-
-        /* Minimal UNWIND_INFO: version 1, no flags, 0 unwind codes */
         g_unwind_table[i].ui.Version_Flags        = 1; /* version=1, flags=0 */
         g_unwind_table[i].ui.SizeOfProlog         = 0;
         g_unwind_table[i].ui.CountOfCodes         = 0;
         g_unwind_table[i].ui.FrameRegister_Offset = 0;
     }
+    g_unwind_count = 0;  /* not registered yet */
+}
 
-    g_unwind_count = (DWORD)count;
-    /* Register with the OS so the exception dispatcher can find us */
+/* update_seh_registration: (re-)register the first active_count trampolines.
+ * Safe to call after each batch: delete the old registration, add the new
+ * one with the extended count.  The tiny window between delete and add is
+ * acceptable -- exceptions inside a trampoline are caught by Send's handler
+ * so no external unwind traversal is needed during that window.            */
+static void update_seh_registration(long active_count) {
+    if (!g_unwind_table || active_count <= 0) return;
+    if (g_unwind_count > 0)
+        RtlDeleteFunctionTable((PRUNTIME_FUNCTION)g_unwind_table);
+    g_unwind_count = (DWORD)active_count;
     RtlAddFunctionTable(
         (PRUNTIME_FUNCTION)g_unwind_table,
-        (DWORD)count,
-        (DWORD64)base   /* ImageBase: RVAs are relative to this */
+        (DWORD)active_count,
+        (DWORD64)(uintptr_t)g_trampolines   /* ImageBase */
     );
 }
 
 static void unregister_trampolines_for_seh(void) {
     if (!g_unwind_table) return;
     RtlDeleteFunctionTable((PRUNTIME_FUNCTION)g_unwind_table);
-    VirtualFree(g_unwind_table, 0, MEM_RELEASE);  /* was HeapFree -- see alloc_near above */
+    VirtualFree(g_unwind_table, 0, MEM_RELEASE);
     g_unwind_table = NULL;
     g_unwind_count = 0;
 }
 
 /* ================================================================
- * do_search
+ * scan_next_batch
+ *
+ * Hook up to `batch` more functions from g_pdata starting at
+ * g_pdata_pos, appending trampolines/addrs from g_hook_count.
+ * The trampoline buffer MUST be PAGE_EXECUTE_READWRITE when called.
+ * MH_QueueEnableHook is called for each new hook; caller must call
+ * MH_ApplyQueued() once after this returns.
+ * Returns the number of hooks newly installed.
  * ============================================================= */
+static long scan_next_batch(DWORD batch) {
+    long newly = 0;
+    for (; g_pdata_pos < g_pdata_count
+           && g_hook_count < (long)g_mh
+           && (DWORD)newly < batch;
+         g_pdata_pos++) {
+
+        uintptr_t fn_addr = g_img_base + g_pdata[g_pdata_pos].BeginAddress;
+        if (fn_addr < g_ts_base || fn_addr >= g_ts_base + g_ts_size) continue;
+
+        BYTE *tramp = (BYTE*)g_trampolines + (size_t)g_hook_count * TRAMPOLINE_SIZE;
+        void *orig  = NULL;
+
+        memcpy(tramp, g_tpl, TRAMPOLINE_SIZE);
+        *(uintptr_t*)(tramp + TRAMPOLINE_ADDR_OFFSET) = fn_addr;
+
+        if (MH_CreateHook((LPVOID)fn_addr, (LPVOID)tramp, &orig) != MH_OK) continue;
+        *(void**)(tramp + TRAMPOLINE_ORIG_OFFSET) = orig;
+        MH_QueueEnableHook((LPVOID)fn_addr);
+        g_hook_addrs[g_hook_count++] = (uint64_t)fn_addr;
+        newly++;
+    }
+    return newly;
+}
+
+/* ================================================================
+ * do_search
+ *
+ * Protocol (Python → DLL, after initial Config):
+ *   CMD_DISABLE  (1): uint32_t count, then count × uint64_t va
+ *     → MH_QueueDisableHook + ApplyQueued; confirms via "disabled:N"
+ *   CMD_SCAN_NEXT(2): uint32_t batch_size
+ *     → hooks next batch_size functions from current pdata position,
+ *       applies, reports "scan_done:N@pos"
+ * ============================================================= */
+#define CMD_DISABLE   1
+#define CMD_SCAN_NEXT 2
+
 static void do_search(const Config *cfg) {
     if (MH_Initialize()!=MH_OK) {
         pipe_write(0,0,1,"ERROR:MH_Initialize",19); return;
     }
 
-    BYTE tpl[TRAMPOLINE_SIZE];
-    memcpy(tpl, s_tpl, TRAMPOLINE_SIZE);
-    *(void**)(tpl+TRAMPOLINE_SEND_OFFSET)=(void*)Send;
+    /* Patch Send pointer into module-level template (shared by all batches) */
+    memcpy(g_tpl, s_tpl, TRAMPOLINE_SIZE);
+    *(void**)(g_tpl+TRAMPOLINE_SEND_OFFSET)=(void*)Send;
 
-    /* dump Send ptr so we can verify the template was patched */
     {
         char dbg[128];
         int n = _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
@@ -384,8 +435,8 @@ static void do_search(const Config *cfg) {
             TRAMPOLINE_ADDR_OFFSET, TRAMPOLINE_SEND_OFFSET,
             TRAMPOLINE_ORIG_OFFSET, TRAMPOLINE_SIZE,
             (unsigned long long)(uintptr_t)Send,
-            tpl[60],tpl[61],tpl[62],tpl[63],
-            tpl[64],tpl[65],tpl[66],tpl[67]);
+            g_tpl[60],g_tpl[61],g_tpl[62],g_tpl[63],
+            g_tpl[64],g_tpl[65],g_tpl[66],g_tpl[67]);
         pipe_write(0,0,1,dbg,(DWORD)n);
     }
 
@@ -393,56 +444,54 @@ static void do_search(const Config *cfg) {
     MODULEINFO mi={0};
     GetModuleInformation(GetCurrentProcess(),hmod,&mi,sizeof(mi));
 
-    uintptr_t base=(uintptr_t)mi.lpBaseOfDll;
-    IMAGE_DOS_HEADER *dos=(IMAGE_DOS_HEADER*)base;
-    IMAGE_NT_HEADERS *nt=(IMAGE_NT_HEADERS*)(base+dos->e_lfanew);
+    g_img_base=(uintptr_t)mi.lpBaseOfDll;
+    IMAGE_DOS_HEADER *dos=(IMAGE_DOS_HEADER*)g_img_base;
+    IMAGE_NT_HEADERS *nt=(IMAGE_NT_HEADERS*)(g_img_base+dos->e_lfanew);
     IMAGE_SECTION_HEADER *sec=IMAGE_FIRST_SECTION(nt);
 
-    uintptr_t ts=0, tsz=0;
+    g_ts_base=0; g_ts_size=0;
     for (WORD i=0;i<nt->FileHeader.NumberOfSections;i++)
         if (!memcmp(sec[i].Name,".text",5))
-            { ts=base+sec[i].VirtualAddress; tsz=sec[i].Misc.VirtualSize; break; }
-    if (!ts) { ts=base; tsz=mi.SizeOfImage; }
+            { g_ts_base=g_img_base+sec[i].VirtualAddress; g_ts_size=sec[i].Misc.VirtualSize; break; }
+    if (!g_ts_base) { g_ts_base=g_img_base; g_ts_size=mi.SizeOfImage; }
 
-    DWORD mh=cfg->max_hooks?cfg->max_hooks:MAX_HOOKS;
-    if (mh>MAX_HOOKS) mh=MAX_HOOKS;
+    /* Total hook capacity (pre-allocated once for all batches) */
+    g_mh = cfg->max_hooks ? cfg->max_hooks : MAX_HOOKS;
+    if (g_mh > MAX_HOOKS) g_mh = MAX_HOOKS;
 
-    size_t blksz=(size_t)mh*TRAMPOLINE_SIZE;
-    BYTE *trampolines=alloc_near(ts,blksz);
+    /* First-batch size (0 in config → use full capacity, i.e. scan all at once) */
+    DWORD first_batch = cfg->batch_size ? cfg->batch_size : g_mh;
+    if (first_batch > g_mh) first_batch = g_mh;
+
+    size_t blksz = (size_t)g_mh * TRAMPOLINE_SIZE;
+    BYTE *trampolines = alloc_near(g_ts_base, blksz);
     if (!trampolines) {
         pipe_write(0,0,1,"ERROR:alloc_near failed",23);
         MH_Uninitialize(); return;
     }
 
-    uint64_t *addrs=(uint64_t*)HeapAlloc(GetProcessHeap(),0,
-                                          (size_t)mh*sizeof(uint64_t));
-    if (!addrs) { VirtualFree(trampolines,0,MEM_RELEASE);
-                  MH_Uninitialize(); return; }
+    uint64_t *addrs = (uint64_t*)HeapAlloc(GetProcessHeap(), 0,
+                                             (size_t)g_mh * sizeof(uint64_t));
+    if (!addrs) {
+        VirtualFree(trampolines, 0, MEM_RELEASE);
+        MH_Uninitialize(); return;
+    }
+
+    /* Set globals before scan_next_batch uses them */
+    g_hook_addrs  = addrs;
+    g_trampolines = trampolines;
+    g_hook_count  = 0;
+    g_pdata_pos   = 0;
 
     pipe_write(0,0,1,"phase:scan_start",16);
     log_phase("phase:scan_start");
     {
         char gb_msg[80];
         _snprintf_s(gb_msg, sizeof(gb_msg), _TRUNCATE,
-            "game_base=0x%llX", (unsigned long long)(uintptr_t)mi.lpBaseOfDll);
+            "game_base=0x%llX", (unsigned long long)g_img_base);
         log_phase(gb_msg);
     }
-    long hooked=0;
 
-    /* ---- Enumerate .pdata (exception directory) instead of byte-scanning ----
-     *
-     * On x64 Windows every non-leaf function has a RUNTIME_FUNCTION entry in the
-     * PE exception directory (.pdata).  BeginAddress is an image-relative RVA
-     * pointing to the exact function start -- guaranteed by the compiler/linker.
-     *
-     * Byte-scanning .text for prologue patterns causes false positives when
-     * the matched bytes happen to sit in the middle of a larger instruction
-     * (e.g. an immediate operand of 0x48 0x83 0xEC ...).  MinHook then writes
-     * a JMP there, corrupting execution and causing an AV when that code path
-     * is reached.
-     *
-     * .pdata enumeration has no false positives and is O(N) simpler.
-     */
     IMAGE_DATA_DIRECTORY *edir =
         &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (!edir->VirtualAddress || !edir->Size) {
@@ -450,94 +499,118 @@ static void do_search(const Config *cfg) {
         log_phase("ERROR:no .pdata section");
         HeapFree(GetProcessHeap(),0,addrs);
         VirtualFree(trampolines,0,MEM_RELEASE);
+        g_hook_addrs=NULL; g_trampolines=NULL;
         MH_Uninitialize(); return;
     }
-    RUNTIME_FUNCTION *pdata = (RUNTIME_FUNCTION *)(base + edir->VirtualAddress);
-    DWORD pdata_count = edir->Size / sizeof(RUNTIME_FUNCTION);
+    g_pdata       = (RUNTIME_FUNCTION *)(g_img_base + edir->VirtualAddress);
+    g_pdata_count = edir->Size / sizeof(RUNTIME_FUNCTION);
 
-    for (DWORD j = 0; j < pdata_count && hooked < (long)mh; j++) {
-        uintptr_t fn_addr = base + pdata[j].BeginAddress;
+    /* Pre-allocate unwind table for FULL capacity so incremental batches
+     * only need update_seh_registration(new_count)                        */
+    init_unwind_table(trampolines, g_mh, TRAMPOLINE_SIZE);
 
-        /* Skip if outside .text (some pdata entries point to cold/CGO sections) */
-        if (fn_addr < ts || fn_addr >= ts + tsz) continue;
-
-        BYTE *tramp=trampolines+(size_t)hooked*TRAMPOLINE_SIZE;
-        void *orig=NULL;
-
-        memcpy(tramp,tpl,TRAMPOLINE_SIZE);
-        *(uintptr_t*)(tramp+TRAMPOLINE_ADDR_OFFSET)=fn_addr;
-
-        if (MH_CreateHook((LPVOID)fn_addr,(LPVOID)tramp,&orig)!=MH_OK) continue;
-
-        /* Write original pointer BEFORE queuing */
-        *(void**)(tramp+TRAMPOLINE_ORIG_OFFSET)=orig;
-        MH_QueueEnableHook((LPVOID)fn_addr);
-        addrs[hooked++]=(uint64_t)fn_addr;
-    }
+    /* ---- First batch ---- */
+    long newly = scan_next_batch(first_batch);
 
     {
-        char tmp2[64];
-        int n=_snprintf_s(tmp2,64,_TRUNCATE,"phase:scan_done count=%ld",hooked);
+        char tmp2[80];
+        int n=_snprintf_s(tmp2,sizeof(tmp2),_TRUNCATE,"phase:scan_done count=%ld",g_hook_count);
         pipe_write(0,0,1,tmp2,(DWORD)n);
         log_phase(tmp2);
     }
 
     /*
-     * CRITICAL: register unwind info for ALL trampolines BEFORE
-     * MH_ApplyQueued() activates them.  If any exception fires inside
-     * a trampoline after activation but before registration, the OS
-     * would call RtlFailFast.  Registering first is the safe order.
+     * CRITICAL: register unwind info BEFORE MH_ApplyQueued activates hooks.
      */
-    register_trampolines_for_seh(trampolines, hooked, TRAMPOLINE_SIZE);
+    update_seh_registration(g_hook_count);
     pipe_write(0,0,1,"phase:seh_registered",20);
     log_phase("phase:seh_registered");
-    {
-        char uw_msg[128];
-        _snprintf_s(uw_msg, sizeof(uw_msg), _TRUNCATE,
-            "unwind_table=0x%llX tpl_base=0x%llX delta=0x%llX",
-            (unsigned long long)(uintptr_t)g_unwind_table,
-            (unsigned long long)(uintptr_t)trampolines,
-            (unsigned long long)((uintptr_t)g_unwind_table > (uintptr_t)trampolines
-                ? (uintptr_t)g_unwind_table - (uintptr_t)trampolines
-                : (uintptr_t)trampolines - (uintptr_t)g_unwind_table));
-        log_phase(uw_msg);
-    }
 
-    /* Atomic batch install */
     MH_ApplyQueued();
     pipe_write(0,0,1,"phase:hooks_applied",19);
     log_phase("phase:hooks_applied");
 
-    g_hook_addrs=addrs; g_trampolines=trampolines; g_hook_count=hooked;
-
     DWORD dummy;
-    VirtualProtect(trampolines,blksz,PAGE_EXECUTE_READ,&dummy);
+    VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READ, &dummy);
     pipe_write(0,0,1,"phase:rx_protected",18);
     log_phase("phase:rx_protected");
 
-    char msg[64];
-    int ml=_snprintf_s(msg,sizeof(msg),_TRUNCATE,"scan_done:%ld",(long)hooked);
-    pipe_write(0,0,1,msg,ml>0?(DWORD)ml:0);
+    {
+        char msg[80];
+        int ml=_snprintf_s(msg,sizeof(msg),_TRUNCATE,
+            "scan_done:%ld@%lu", newly, (unsigned long)g_pdata_pos);
+        pipe_write(0,0,1,msg,ml>0?(DWORD)ml:0);
+        log_phase(msg);
+    }
 
-    while (g_pipe!=INVALID_HANDLE_VALUE) {
-        DWORD av=0;
-        if (!PeekNamedPipe(g_pipe,NULL,0,NULL,&av,NULL)) break;
-        ring_drain(); Sleep(10);
+    /* ================================================================
+     * Command + drain loop
+     * ============================================================= */
+    bool pipe_ok = true;
+    while (pipe_ok && g_pipe != INVALID_HANDLE_VALUE) {
+        DWORD av = 0;
+        if (!PeekNamedPipe(g_pipe, NULL, 0, NULL, &av, NULL)) break;
+
+        if (av >= 1) {
+            uint8_t cmd = 0;
+            if (!pipe_read_all(&cmd, 1)) break;
+
+            if (cmd == CMD_DISABLE) {
+                /* Payload: uint32_t count, then count × uint64_t va */
+                uint32_t cnt = 0;
+                if (!pipe_read_all(&cnt, 4)) break;
+                for (uint32_t k = 0; pipe_ok && k < cnt; k++) {
+                    uint64_t va = 0;
+                    if (!pipe_read_all(&va, 8)) { pipe_ok = false; break; }
+                    MH_QueueDisableHook((LPVOID)(uintptr_t)va);
+                }
+                if (pipe_ok) {
+                    MH_ApplyQueued();
+                    char dbuf[48];
+                    int n = _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
+                        "disabled:%lu", (unsigned long)cnt);
+                    pipe_write(0,0,1,dbuf, n>0?(DWORD)n:0);
+                }
+
+            } else if (cmd == CMD_SCAN_NEXT) {
+                /* Payload: uint32_t batch_size */
+                uint32_t nbatch = 0;
+                if (!pipe_read_all(&nbatch, 4)) break;
+
+                /* Temporarily make buffer writable to write new trampolines */
+                VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READWRITE, &dummy);
+                newly = scan_next_batch(nbatch);
+                if (newly > 0) {
+                    update_seh_registration(g_hook_count);
+                    MH_ApplyQueued();
+                }
+                VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READ, &dummy);
+
+                char nbuf[80];
+                int n = _snprintf_s(nbuf, sizeof(nbuf), _TRUNCATE,
+                    "scan_done:%ld@%lu", newly, (unsigned long)g_pdata_pos);
+                pipe_write(0,0,1,nbuf, n>0?(DWORD)n:0);
+                log_phase(nbuf);
+            }
+        }
+
+        ring_drain();
+        Sleep(10);
     }
     ring_drain();
 
-    for (long i=0;i<hooked;i++)
+    for (long i=0; i<g_hook_count; i++)
         MH_QueueDisableHook((LPVOID)(uintptr_t)addrs[i]);
     MH_ApplyQueued();
     Sleep(500);
-    for (long i=0;i<hooked;i++)
+    for (long i=0; i<g_hook_count; i++)
         MH_RemoveHook((LPVOID)(uintptr_t)addrs[i]);
 
     unregister_trampolines_for_seh();
-
-    VirtualFree(trampolines,0,MEM_RELEASE);
-    HeapFree(GetProcessHeap(),0,addrs);
+    VirtualFree(trampolines, 0, MEM_RELEASE);
+    HeapFree(GetProcessHeap(), 0, addrs);
     g_hook_addrs=NULL; g_trampolines=NULL; g_hook_count=0;
+    g_pdata=NULL; g_pdata_count=0; g_pdata_pos=0;
     MH_Uninitialize();
 }
 
