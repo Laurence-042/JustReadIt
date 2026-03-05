@@ -275,12 +275,22 @@ static DWORD                  g_unwind_count  = 0;
 static void register_trampolines_for_seh(BYTE *base,
                                           long  count,
                                           size_t stride) {
-    /* Allocate unwind table (must be in the same ±2GB as the code,
-     * but any RW memory works for RtlAddFunctionTable).             */
-    g_unwind_table = (TrampolineUnwindEntry *)HeapAlloc(
-        GetProcessHeap(), HEAP_ZERO_MEMORY,
-        (size_t)count * sizeof(TrampolineUnwindEntry));
+    /*
+     * CRITICAL: allocate the unwind table with alloc_near(base, ...) so that
+     * the UnwindData field in each RUNTIME_FUNCTION --
+     *   UnwindData = (DWORD)(ui_address - ImageBase)
+     * -- is a valid 32-bit RVA relative to `base` (our ImageBase).
+     *
+     * HeapAlloc returns low-address memory (e.g. 0x0000_01E7_...) while the
+     * trampoline buffer `base` is at a high address (e.g. 0x7FF5_E816_0000).
+     * Subtracting and truncating to DWORD gives a completely wrong pointer;
+     * the OS unwind code then reads garbage, eventually causing an AV in
+     * unrelated game code.
+     */
+    size_t tbl_size = (size_t)count * sizeof(TrampolineUnwindEntry);
+    g_unwind_table = (TrampolineUnwindEntry *)alloc_near((uintptr_t)base, tbl_size);
     if (!g_unwind_table) return;
+    ZeroMemory(g_unwind_table, tbl_size);
 
     for (long i = 0; i < count; i++) {
         BYTE *tramp = base + (size_t)i * stride;
@@ -313,7 +323,7 @@ static void register_trampolines_for_seh(BYTE *base,
 static void unregister_trampolines_for_seh(void) {
     if (!g_unwind_table) return;
     RtlDeleteFunctionTable((PRUNTIME_FUNCTION)g_unwind_table);
-    HeapFree(GetProcessHeap(), 0, g_unwind_table);
+    VirtualFree(g_unwind_table, 0, MEM_RELEASE);  /* was HeapFree -- see alloc_near above */
     g_unwind_table = NULL;
     g_unwind_count = 0;
 }
@@ -376,6 +386,12 @@ static void do_search(const Config *cfg) {
 
     pipe_write(0,0,1,"phase:scan_start",16);
     log_phase("phase:scan_start");
+    {
+        char gb_msg[80];
+        _snprintf_s(gb_msg, sizeof(gb_msg), _TRUNCATE,
+            "game_base=0x%llX", (unsigned long long)(uintptr_t)mi.lpBaseOfDll);
+        log_phase(gb_msg);
+    }
     long hooked=0;
 
     /* ---- Enumerate .pdata (exception directory) instead of byte-scanning ----
@@ -440,6 +456,17 @@ static void do_search(const Config *cfg) {
     register_trampolines_for_seh(trampolines, hooked, TRAMPOLINE_SIZE);
     pipe_write(0,0,1,"phase:seh_registered",20);
     log_phase("phase:seh_registered");
+    {
+        char uw_msg[128];
+        _snprintf_s(uw_msg, sizeof(uw_msg), _TRUNCATE,
+            "unwind_table=0x%llX tpl_base=0x%llX delta=0x%llX",
+            (unsigned long long)(uintptr_t)g_unwind_table,
+            (unsigned long long)(uintptr_t)trampolines,
+            (unsigned long long)((uintptr_t)g_unwind_table > (uintptr_t)trampolines
+                ? (uintptr_t)g_unwind_table - (uintptr_t)trampolines
+                : (uintptr_t)trampolines - (uintptr_t)g_unwind_table));
+        log_phase(uw_msg);
+    }
 
     /* Atomic batch install */
     MH_ApplyQueued();
@@ -515,40 +542,51 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
                            GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
-        char buf[512];
+        char buf[640];
         EXCEPTION_RECORD *er = ep->ExceptionRecord;
         CONTEXT          *ctx= ep->ContextRecord;
+        uintptr_t gb = (uintptr_t)GetModuleHandleW(NULL);
         int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "CODE:    0x%08X\r\n"
-            "ADDRESS: 0x%016llX\r\n"
-            "RIP:     0x%016llX\r\n"
-            "RSP:     0x%016llX\r\n"
-            "RCX:     0x%016llX\r\n"
-            "RDX:     0x%016llX\r\n"
-            "trampoline base: 0x%016llX\r\n"
-            "trampoline end:  0x%016llX\r\n"
-            "hook_count: %ld\r\n",
+            "CODE:       0x%08X\r\n"
+            "ADDRESS:    0x%016llX\r\n"
+            "RIP:        0x%016llX\r\n"
+            "RSP:        0x%016llX\r\n"
+            "RCX:        0x%016llX\r\n"
+            "RDX:        0x%016llX\r\n"
+            "game_base:  0x%016llX\r\n"
+            "RIP_RVA:    0x%016llX\r\n"
+            "tpl base:   0x%016llX\r\n"
+            "tpl end:    0x%016llX\r\n"
+            "hook_count: %ld\r\n"
+            "unwind_tbl: 0x%016llX\r\n",
             (unsigned)er->ExceptionCode,
             (unsigned long long)er->ExceptionAddress,
             (unsigned long long)ctx->Rip,
             (unsigned long long)ctx->Rsp,
             (unsigned long long)ctx->Rcx,
             (unsigned long long)ctx->Rdx,
+            (unsigned long long)gb,
+            (unsigned long long)(ctx->Rip - gb),
             (unsigned long long)(uintptr_t)g_trampolines,
             (unsigned long long)((uintptr_t)g_trampolines
                                  + (size_t)g_hook_count * TRAMPOLINE_SIZE),
-            g_hook_count);
+            g_hook_count,
+            (unsigned long long)(uintptr_t)g_unwind_table);
         DWORD wr = 0;
         WriteFile(f, buf, (DWORD)n, &wr, NULL);
         CloseHandle(f);
     }
-    char phase_msg[128];
+    char phase_msg[256];
     EXCEPTION_RECORD *er2 = ep->ExceptionRecord;
+    /* Report game module base so caller can compute RVA = crash_RIP - game_base */
+    uintptr_t game_base = (uintptr_t)GetModuleHandleW(NULL);
     _snprintf_s(phase_msg, sizeof(phase_msg), _TRUNCATE,
-        "crash CODE=0x%08X ADDR=0x%llX RIP=0x%llX",
+        "crash CODE=0x%08X ADDR=0x%llX RIP=0x%llX game_base=0x%llX RIP_RVA=0x%llX",
         (unsigned)er2->ExceptionCode,
         (unsigned long long)er2->ExceptionAddress,
-        (unsigned long long)ep->ContextRecord->Rip);
+        (unsigned long long)ep->ContextRecord->Rip,
+        (unsigned long long)game_base,
+        (unsigned long long)(ep->ContextRecord->Rip - game_base));
     log_phase(phase_msg);
     return EXCEPTION_CONTINUE_SEARCH;
 }
