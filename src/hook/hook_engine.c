@@ -804,6 +804,12 @@ static void do_hook(const Config *cfg){
 
 static DWORD WINAPI worker(LPVOID _){
     (void)_;
+    /* Boost this thread so it stays responsive even when Windows throttles
+     * the game process (e.g. when the game window is in the background or
+     * the VN engine is idle / waiting for user input).  ABOVE_NORMAL is
+     * sufficient to escape process-class throttling without starving the
+     * game at TIME_CRITICAL priority.                                      */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     wchar_t name[64];
     _snwprintf_s(name,64,_TRUNCATE,L"\\\\.\\pipe\\JRI-%lu",(unsigned long)GetCurrentProcessId());
     for(int r=0;r<50;r++){

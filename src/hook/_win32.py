@@ -185,18 +185,28 @@ def pipe_name(pid: int) -> str:
     return rf"\\.\pipe\JRI-{pid}"
 
 
+PIPE_UNLIMITED_INSTANCES = 255
+
+
 def create_pipe_server(pid: int) -> int:
     """Create a duplex Named Pipe server for *pid* and return its HANDLE.
 
     Python is the server; the injected DLL connects as client.
     Call :func:`connect_pipe` (blocking) after injecting the DLL.
+
+    ``nMaxInstances`` is ``PIPE_UNLIMITED_INSTANCES`` so that a new server
+    instance can always be created even if a previous DLL client handle is
+    still open (e.g. the DLL worker thread is mid-cleanup after the last
+    session).  With ``nMaxInstances=1`` the old orphaned client handle keeps
+    the pipe object alive, causing ``CreateNamedPipeW`` to fail with
+    ERROR_PIPE_BUSY (231).
     """
     name = pipe_name(pid)
     h = _k32.CreateNamedPipeW(
         name,
         PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1,          # max instances
+        PIPE_UNLIMITED_INSTANCES,  # was 1 — see docstring
         65_536,     # out buffer
         65_536,     # in buffer
         5_000,      # timeout ms
