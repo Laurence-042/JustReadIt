@@ -37,7 +37,6 @@ from src.capture import Capturer
 from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
-from src.hook.text_hook import TextHook, HookAttachError, HookScriptError
 from src.hook.hook_search import (
     HookCandidate, HookCode, HookSearcher, HookSearchError, score_candidate,
 )
@@ -100,16 +99,20 @@ class _PipelineWorker(QObject):
     error = Signal(str)
     ready = Signal()  # emitted once setup() completes — used to defer timer start
 
-    def __init__(self, target: GameTarget, language_tag: str, *, diagnostic: bool = False, hook_code: HookCode | None = None) -> None:
+    def __init__(self, target: GameTarget, language_tag: str, *,
+                 diagnostic: bool = False,
+                 searcher: HookSearcher | None = None) -> None:
         super().__init__()
         self._target = target
         self._language_tag = language_tag
         self._diagnostic = diagnostic
-        self._hook_code = hook_code
+        # The searcher is owned by DebugWindow; the worker only reads from it.
+        # After filter_to() the searcher's live feed receives texts from the
+        # confirmed hook addresses without any additional DLL injection.
+        self._searcher = searcher
+        self._hook_texts: list[str] = []
         self._capturer: Capturer | None = None
         self._ocr: WindowsOcr | None = None
-        self._hook: TextHook | None = None
-        self._hook_error: str = ""  # persists across ticks so the panel stays informative
 
     # ------------------------------------------------------------------
     # Lifecycle (called on worker thread via QThread.started / explicit slots)
@@ -132,24 +135,15 @@ class _PipelineWorker(QObject):
         except Exception as exc:
             self.error.emit(f"Windows OCR init failed: {exc}")
 
-        try:
-            self._hook = TextHook(self._target.pid, diagnostic=self._diagnostic, hook_code=self._hook_code)
-            self._hook.attach()
-        except (HookAttachError, HookScriptError) as exc:
-            self._hook_error = str(exc)
-            self.error.emit(f"Hook: {exc}")
-        except Exception as exc:
-            self._hook_error = f"{type(exc).__name__}: {exc}"
-            self.error.emit(f"Hook: {self._hook_error}")
-
         self.ready.emit()  # signal that all resources are initialised
 
     @Slot()
     def teardown(self) -> None:
-        """Release resources when the thread is stopping."""
-        if self._hook is not None:
-            self._hook.detach()
-            self._hook = None
+        """Release resources when the thread is stopping.
+
+        The searcher is *not* stopped here — DebugWindow owns it and may
+        keep it alive for further candidate collection.
+        """
         if self._capturer is not None:
             self._capturer.close()
             self._capturer = None
@@ -235,27 +229,18 @@ class _PipelineWorker(QObject):
                 )
 
         # ── Hook texts ────────────────────────────────────────────────
-        if self._hook_error:
-            hook_text = f"[attach failed]\n{self._hook_error}"
-        elif self._hook is None:
-            hook_text = "[hook not initialised]"
-        elif not self._hook.attached:
-            hook_text = "[hook detached — target process may have exited]"
-        elif self._diagnostic:
-            # Diagnostic mode — diag messages are the primary output.
-            diag = self._hook.diag
-            hook_texts = self._hook.texts
-            hook_text = "── DIAGNOSTIC MODE ──\n\n" + (diag or "(waiting for data…)")
-            if hook_texts:
-                hook_text += "\n\n── Captured Text ──\n" + "\n".join(hook_texts[-50:])
+        if self._searcher is None:
+            hook_text = "[no confirmed hooks — select candidates and click Confirm]"
         else:
-            diag = self._hook.diag
-            hook_texts = self._hook.texts
-            if hook_texts:
-                header = f"[{diag}]\n\n" if diag else ""
-                hook_text = header + "\n".join(hook_texts[-50:])
+            new_texts = self._searcher.drain_live_feed()
+            if new_texts:
+                self._hook_texts.extend(new_texts)
+                if len(self._hook_texts) > 2048:
+                    self._hook_texts = self._hook_texts[-2048:]
+            if self._hook_texts:
+                hook_text = "\n".join(self._hook_texts[-50:])
             else:
-                hook_text = f"[attached — no text captured yet]\n\n{diag}" if diag else "[attached — no text captured yet]"
+                hook_text = "[confirmed hooks active — waiting for game text…]"
 
         elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -682,15 +667,20 @@ class DebugWindow(QMainWindow):
                 self._cmb_lang.setCurrentIndex(i)
                 break
 
-        # Restore saved hook code label
+        # Restore saved hook code label (supports comma-separated multi-hook strings)
         saved_hook = _cfg.hook_code
         if saved_hook:
-            try:
-                hc = HookCode.from_str(saved_hook)
-                self._lbl_hook_code.setText(f"+{hc.rva:#x}:{hc.access_pattern} ({hc.encoding})")
+            parts = [p.strip() for p in saved_hook.split(",") if p.strip()]
+            parsed: list[HookCode] = []
+            for p in parts:
+                try:
+                    parsed.append(HookCode.from_str(p))
+                except ValueError:
+                    pass
+            if parsed:
+                label = "  +  ".join(f"+{hc.rva:#x}:{hc.access_pattern}" for hc in parsed)
+                self._lbl_hook_code.setText(label[:80])
                 self._lbl_hook_code.setToolTip(saved_hook)
-            except ValueError:
-                pass
 
         # ── Install progress bar (hidden until a capability install runs) ──────
         self._install_bar = QWidget()
@@ -723,7 +713,7 @@ class DebugWindow(QMainWindow):
 
         grp_wocr, self._te_wocr = _make_panel("Windows OCR")
         grp_region, self._te_region = _make_panel("Detected Region")
-        grp_hook, self._te_hook = _make_panel("Hook  (Frida)")
+        grp_hook, self._te_hook = _make_panel("Hook")
         grp_tl,   self._te_tl   = _make_panel("Translation  (not yet implemented)")
 
         self._te_region.setPlaceholderText("Region text will appear after range detection.")
@@ -750,6 +740,7 @@ class DebugWindow(QMainWindow):
         _cands_lay.addWidget(self._cands_search)
         self._lst_candidates = QListWidget()
         self._lst_candidates.setFont(QFont("Consolas", 9))
+        self._lst_candidates.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._lst_candidates.itemDoubleClicked.connect(self._confirm_candidate)
         _cands_lay.addWidget(self._lst_candidates, 1)
         self._te_search_diag = QTextEdit()
@@ -985,23 +976,14 @@ class DebugWindow(QMainWindow):
     # Pipeline run / stop
     # ------------------------------------------------------------------
 
-    def _run(self, *, diagnostic: bool = False, hook_code: HookCode | None = None) -> None:
+    def _run(self, *, diagnostic: bool = False, searcher: HookSearcher | None = None) -> None:
         if self._target is None:
             self.statusBar().showMessage("Pick a window first.", 3000)
             return
         self._stop()
 
-        # If no explicit hook_code provided, load from config.
-        if hook_code is None and not diagnostic:
-            saved = _cfg.hook_code
-            if saved:
-                try:
-                    hook_code = HookCode.from_str(saved)
-                except ValueError:
-                    pass
-
         lang = self._selected_language
-        self._worker = _PipelineWorker(self._target, lang, diagnostic=diagnostic, hook_code=hook_code)
+        self._worker = _PipelineWorker(self._target, lang, diagnostic=diagnostic, searcher=searcher)
         self._worker_thread = QThread(self)
         self._worker.moveToThread(self._worker_thread)
 
@@ -1113,25 +1095,41 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _confirm_candidate(self) -> None:
-        """Confirm the selected candidate as the active hook code and start pipeline."""
-        item = self._lst_candidates.currentItem()
-        if item is None and self._lst_candidates.count() > 0:
-            item = self._lst_candidates.item(0)
-        if item is None:
+        """Confirm selected candidate(s) and route their live output into the pipeline."""
+        if self._searcher is None:
+            self.statusBar().showMessage("No active search — pick a window first.", 3000)
+            return
+        selected_items = self._lst_candidates.selectedItems()
+        if not selected_items:
+            if self._lst_candidates.count() > 0:
+                selected_items = [self._lst_candidates.item(0)]
+        if not selected_items:
             self.statusBar().showMessage("No candidate selected.", 3000)
             return
-        try:
-            code = HookCode.from_str(item.data(32))
-        except ValueError as exc:
-            self.statusBar().showMessage(f"Invalid hook code: {exc}", 5000)
+
+        codes: list[HookCode] = []
+        bad: list[str] = []
+        for item in selected_items:
+            try:
+                codes.append(HookCode.from_str(item.data(32)))
+            except ValueError as exc:
+                bad.append(str(exc))
+        if bad:
+            self.statusBar().showMessage(f"Invalid hook code(s): {'; '.join(bad)}", 5000)
             return
-        _cfg.hook_code = code.to_str()
-        self._lbl_hook_code.setText(f"+{code.rva:#x}:{code.access_pattern} ({code.encoding})")
-        self._lbl_hook_code.setToolTip(code.to_str())
-        self._lbl_search_status.setText(f"Confirmed: +{code.rva:#x}:{code.access_pattern}")
-        self._stop_search()
-        self.statusBar().showMessage(f"Hook confirmed: {code.to_str()} \u2014 starting pipeline\u2026", 6000)
-        self._run(hook_code=code)
+
+        code_keys = {c.to_str() for c in codes}
+        all_candidates = self._searcher.ranked_candidates()
+        confirmed = [c for c in all_candidates if c.to_hook_code().to_str() in code_keys]
+        self._searcher.filter_to(confirmed)
+
+        _cfg.hook_code = ",".join(c.to_str() for c in codes)
+        label = "  +  ".join(f"+{c.rva:#x}:{c.access_pattern}" for c in codes)
+        self._lbl_hook_code.setText(label[:80])
+        self._lbl_hook_code.setToolTip(",".join(c.to_str() for c in codes))
+        self._lbl_search_status.setText(f"Confirmed {len(codes)} hook(s) — live feed active.")
+        self.statusBar().showMessage(f"{len(codes)} hook(s) confirmed — starting pipeline\u2026", 6000)
+        self._run(searcher=self._searcher)
 
     def _stop(self) -> None:
         self._run_timer.stop()

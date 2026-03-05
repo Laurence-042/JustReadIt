@@ -1,8 +1,7 @@
-"""Frida text hook and cleaner rule chain.
+"""Hook discovery and cleaner rule chain.
 
 Public API
 ----------
-.. autoclass:: TextHook
 .. autoclass:: HookCode
 .. autoclass:: HookSearcher
 .. autoclass:: Cleaner
@@ -18,20 +17,12 @@ from .cleaner import (
     TrimWhitespace,
     run_cleaners,
 )
-from .text_hook import (
-    HookAttachError,
-    HookScriptError,
-    TextHook,
-)
 
 __all__ = [
     "Cleaner",
     "DEFAULT_CLEANERS",
     "DeduplicateLines",
-    "HookAttachError",
-    "HookScriptError",
     "StripControlChars",
-    "TextHook",
     "TrimWhitespace",
     "run_cleaners",
 ]

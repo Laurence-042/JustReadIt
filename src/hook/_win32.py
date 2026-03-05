@@ -324,41 +324,13 @@ def pack_search_config(max_hooks: int, batch_size: int = 0) -> bytes:
                        )
 
 
-def pack_hook_config(hook_address: int, arg_idx: int, deref: int,
-                     byte_offset: int, encoding: int) -> bytes:
-    """Pack a MODE_HOOK Config."""
-    return struct.pack(_CONFIG_FMT,
-                       1,           # mode = hook
-                       0,           # max_hooks unused
-                       hook_address,
-                       arg_idx, deref, byte_offset, encoding,
-                       0,           # batch_size unused in MODE_HOOK
-                       )
-
-
 def unpack_result_hdr(data: bytes) -> tuple[int, int, int, int]:
     """Unpack a ResultHdr into (hook_va, slot_i, encoding, text_len)."""
     return struct.unpack(_RESULT_HDR_FMT, data)
 
 
-# CMD_DISABLE:   uint8_t(1) + uint32_t(count) + count × uint64_t(va)
 # CMD_SCAN_NEXT: uint8_t(2) + uint32_t(batch_size)
-_CMD_DISABLE:   int = 1
 _CMD_SCAN_NEXT: int = 2
-
-
-def pack_disable_command(vas: list[int]) -> bytes:
-    """Pack a CMD_DISABLE command to send to the DLL mid-session.
-
-    Instructs the DLL to immediately disable (and queue-remove) the hooks
-    at each of the given virtual addresses.
-
-    Parameters
-    ----------
-    vas:
-        List of absolute virtual addresses to disable.
-    """
-    return struct.pack("<BI", _CMD_DISABLE, len(vas)) + struct.pack(f"<{len(vas)}Q", *vas)
 
 
 def pack_scan_next_command(batch_size: int) -> bytes:

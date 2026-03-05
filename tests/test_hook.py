@@ -168,38 +168,3 @@ class TestDefaultCleaners:
         for c in DEFAULT_CLEANERS:
             assert isinstance(c, Cleaner)
 
-
-# ==========================================================================
-# TextHook (import-only; live tests require a target process)
-# ==========================================================================
-
-
-class TestTextHookImport:
-    """Verify TextHook can be imported and instantiated without a live process."""
-
-    def test_import(self) -> None:
-        from src.hook.text_hook import TextHook
-        assert TextHook is not None
-
-    def test_init_no_attach(self) -> None:
-        from src.hook.text_hook import TextHook
-        hook = TextHook(pid=0)
-        assert not hook.attached
-        assert hook.texts == []
-
-    def test_clear_empty(self) -> None:
-        from src.hook.text_hook import TextHook
-        hook = TextHook(pid=0)
-        hook.clear()
-        assert hook.texts == []
-
-    def test_detach_when_not_attached(self) -> None:
-        from src.hook.text_hook import TextHook
-        hook = TextHook(pid=0)
-        hook.detach()  # should not raise
-
-    def test_context_manager_not_attached_exit(self) -> None:
-        """__exit__ should not raise even if attach was never called."""
-        from src.hook.text_hook import TextHook
-        hook = TextHook(pid=0)
-        hook.__exit__(None, None, None)  # should not raise

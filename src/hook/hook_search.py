@@ -12,7 +12,8 @@ Typical workflow
 3.  Call :meth:`~HookSearcher.ranked_candidates` to get filtered, ranked hits.
 4.  Present the list to the user; they pick the best candidate.
 5.  Store it as a :class:`HookCode` in ``AppConfig.hook_code``.
-6.  Pass the :class:`HookCode` to :class:`~src.hook.text_hook.TextHook`.
+6.  Call :meth:`~HookSearcher.filter_to` with the confirmed candidates;
+    the live feed is then available via :meth:`~HookSearcher.drain_live_feed`.
 """
 from __future__ import annotations
 
@@ -193,6 +194,7 @@ class HookCandidate:
     text: str
     hit_count: int = 0
     score: float = 0.0
+    hook_va: int = 0  # absolute VA as received from the pipe; used for confirmed-set filtering
 
     def to_hook_code(self) -> HookCode:
         return HookCode(
@@ -368,6 +370,9 @@ class HookSearcher:
         # Batch-advance state (no settle timer — advance fires immediately)
         self._batch_exhausted: bool              = False
         self._advance_thread:  threading.Timer | None = None
+        # Confirmed-address live feed (populated after filter_to())
+        self._confirmed_vas: set[int] = set()
+        self._live_feed:     list[str] = []
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -600,11 +605,33 @@ class HookSearcher:
                     self._diags.append(f"CMD_SCAN_NEXT write failed: {exc}")
                 log.warning("Failed to send CMD_SCAN_NEXT: %s", exc)
 
-    def _flush_culls(self) -> None:
-        """No-op: high-frequency culling is now handled entirely by the DLL.
-        Kept for API compatibility; CMD_DISABLE may still be used for manual
-        disabling in future.
+    def filter_to(self, candidates: list["HookCandidate"]) -> None:
+        """Set the confirmed address set so the live feed receives their texts.
+
+        All hooks continue running in the DLL.  The player can call
+        ``filter_to`` again at any time to add or change confirmed candidates
+        without losing data.
+
+        After this call, texts from confirmed addresses are queued in the live
+        feed and can be drained with :meth:`drain_live_feed`.
+
+        Safe to call on the UI thread; can be called multiple times.
         """
+        confirmed_vas: set[int] = {c.hook_va for c in candidates if c.hook_va}
+        with self._lock:
+            self._confirmed_vas = confirmed_vas
+        log.info("filter_to: live feed watching %d address(es)", len(confirmed_vas))
+
+    def drain_live_feed(self) -> list[str]:
+        """Return and clear all texts queued since the last drain.
+
+        Only populated after :meth:`filter_to` is called.  Returns an empty
+        list if no confirmed addresses have fired since the last call.
+        """
+        with self._lock:
+            texts = list(self._live_feed)
+            self._live_feed.clear()
+        return texts
 
     def _handle_hit(self, hook_va: int, slot_i: int,
                      encoding: int, text: str) -> None:
@@ -665,6 +692,8 @@ class HookSearcher:
                 c.hit_count += 1
                 if len(text) > len(c.text):
                     c.text = text
+                if not c.hook_va:
+                    c.hook_va = hook_va
             else:
                 self._candidates[key] = HookCandidate(
                     module=name,
@@ -674,7 +703,13 @@ class HookSearcher:
                     text=text,
                     hit_count=1,
                     score=s,
+                    hook_va=hook_va,
                 )
+            # If this address is in the confirmed set, add to the live feed.
+            if self._confirmed_vas and hook_va in self._confirmed_vas:
+                self._live_feed.append(text)
+                if len(self._live_feed) > 2048:
+                    self._live_feed = self._live_feed[-2048:]
 
 
 # ---------------------------------------------------------------------------
