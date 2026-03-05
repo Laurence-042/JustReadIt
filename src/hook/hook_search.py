@@ -523,12 +523,18 @@ class HookSearcher:
             return
 
         # Map slot index to HookCode access_pattern.
-        # Only the 4 register args and positive stack slots are actionable.
+        # Stack layout (push order: pushfq, rax, rbx, rcx, rdx, rsp, rbp,
+        #               rsi, rdi, r8, r9, r10-r15):
+        #   stack[-1]=rflags  stack[-2]=rax   stack[-3]=rbx
+        #   stack[-4]=rcx(arg0)  stack[-5]=rdx(arg1)
+        #   stack[-6]=rsp  stack[-7]=rbp  stack[-8]=rsi  stack[-9]=rdi
+        #   stack[-10]=r8(arg2)  stack[-11]=r9(arg3)  stack[-12...-17]=r10-r15
+        #   stack[0]=ret addr  stack[1..N]=caller stack frame
         _reg_to_pattern: dict[int, str] = {
-            -14: "r0",   # rcx
-            -13: "r1",   # rdx
-            -8:  "r2",   # r8
-            -7:  "r3",   # r9
+            -4:  "r0",   # rcx = arg0
+            -5:  "r1",   # rdx = arg1
+            -10: "r2",   # r8  = arg2
+            -11: "r3",   # r9  = arg3
         }
         if slot_i in _reg_to_pattern:
             pattern = _reg_to_pattern[slot_i]

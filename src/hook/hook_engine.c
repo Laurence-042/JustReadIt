@@ -119,8 +119,28 @@ typedef struct ResultHdr_t {
  * ========================================================================= */
 
 static HANDLE           g_pipe        = INVALID_HANDLE_VALUE;
-static CRITICAL_SECTION g_pipe_cs;
 static Config           g_cfg;
+
+/* ===========================================================================
+ * Lock-free ring buffer -- decouples trampolines from pipe I/O.
+ *
+ * Send() (called from hooked game threads) does only CAS + memcpy: no locks,
+ * no kernel calls, no blocking. The worker thread drains the ring to the
+ * Named Pipe synchronously inside its 10ms sleep loop.
+ *
+ * State machine per slot: 0=empty  1=filling(claimed by writer)  2=ready
+ * Drainer: atomically transitions 2→3 (draining), writes to pipe, sets 0.
+ * ========================================================================= */
+#define RING_SLOTS 4096     /* must be power of 2; ~3.2 MB total            */
+
+typedef struct {
+    volatile LONG  state;           /* 0=empty 1=filling 2=ready 3=draining */
+    ResultHdr      hdr;
+    uint8_t        text[MAX_STR_LEN * 2];
+} RingSlot;
+
+static RingSlot        g_ring[RING_SLOTS];
+static volatile LONG   g_ring_seq = 0;  /* monotone write cursor             */
 
 /* Search-mode tracking */
 static uint64_t        *g_hook_addrs  = NULL;
@@ -131,8 +151,11 @@ static long             g_hook_count  = 0;
 typedef UINT64 (__fastcall *GenericFn)(UINT64, UINT64, UINT64, UINT64);
 static GenericFn g_mh_original_fn = NULL;
 
-/* Per-thread reentrancy guard */
-static __declspec(thread) int tls_in_send = 0;
+/* Signature dedup cache -- prevents the same (address, slot, char-sig) tuple
+ * from flooding the ring.  Uses InterlockedCompareExchange (CPU intrinsic,
+ * no kernel call) so it is safe to call from inside hooked functions.      */
+#define SIG_CACHE_SIZE 65521u   /* prime */
+static volatile LONG g_sig_cache[SIG_CACHE_SIZE];
 
 /* ===========================================================================
  * Pipe helpers
@@ -165,9 +188,50 @@ static void pipe_send_text(uintptr_t hook_va, int slot_i,
 
     DWORD to_write = (DWORD)(sizeof(ResultHdr) + text_bytes);
     DWORD written  = 0;
-    EnterCriticalSection(&g_pipe_cs);
     WriteFile(g_pipe, buf, to_write, &written, NULL);
-    LeaveCriticalSection(&g_pipe_cs);
+    /* Only called from the worker thread (control messages), never from
+     * trampolines -- no concurrent writers, no lock required.            */
+}
+
+/* ===========================================================================
+ * Ring buffer push / drain
+ * ========================================================================= */
+
+/* Called from trampolines (any game thread): CAS-claim a slot, fill, mark
+ * ready.  If the ring is saturated, the hit is silently dropped.           */
+static void ring_push(uintptr_t hook_va, int slot_i,
+                      int encoding, const void *text, DWORD text_bytes) {
+    if (text_bytes == 0 || text_bytes > MAX_STR_LEN * 2) return;
+    LONG seq = InterlockedIncrement(&g_ring_seq) - 1;
+    RingSlot *s = &g_ring[seq & (RING_SLOTS - 1)];
+    /* Claim slot; drop if still occupied by previous write cycle */
+    if (InterlockedCompareExchange(&s->state, 1, 0) != 0) return;
+    s->hdr.hook_va  = (uint64_t)hook_va;
+    s->hdr.slot_i   = (int32_t)slot_i;
+    s->hdr.encoding = (uint16_t)encoding;
+    s->hdr.text_len = (uint16_t)text_bytes;
+    memcpy(s->text, text, text_bytes);
+    _WriteBarrier();
+    s->state = 2;  /* visible to drainer */
+}
+
+/* Called from the worker thread: write all ready slots to the pipe, then
+ * release them back to the pool.  Single drainer -- no concurrency.       */
+static void ring_drain(void) {
+    if (g_pipe == INVALID_HANDLE_VALUE) return;
+    for (int i = 0; i < RING_SLOTS; i++) {
+        RingSlot *s = &g_ring[i];
+        if (s->state != 2) continue;
+        if (InterlockedCompareExchange(&s->state, 3, 2) != 2) continue;
+        uint8_t buf[sizeof(ResultHdr) + MAX_STR_LEN * 2];
+        memcpy(buf, &s->hdr, sizeof(ResultHdr));
+        memcpy(buf + sizeof(ResultHdr), s->text, s->hdr.text_len);
+        DWORD to_write = (DWORD)(sizeof(ResultHdr) + s->hdr.text_len);
+        DWORD written  = 0;
+        WriteFile(g_pipe, buf, to_write, &written, NULL);
+        _WriteBarrier();
+        s->state = 0;
+    }
 }
 
 /* ===========================================================================
@@ -183,43 +247,81 @@ static bool has_cjk_w(const WCHAR *ws, int len) {
     return false;
 }
 
-static int probe_wstr(const WCHAR *p) {
-    if ((uintptr_t)p < 0x10000) return -1;
-    __try {
-        int len = 0;
-        while (len < MAX_STR_LEN && p[len]) len++;
-        if (len < MIN_STR_LEN || p[len] != 0) return -1;
-        return len;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
-}
-
 /* ===========================================================================
- * Send -- called from every search-mode trampoline
+ * Send -- called from every search-mode trampoline (any game thread).
  *
- * stack  : pointer to the entry RSP of the trampoline
- *            stack[-16...-1] = saved GPRs (rax,rbx,rcx,rdx,rsp,rbp,rsi,rdi,
- *                                           r8,r9,r10,r11,r12,r13,r14,r15)
- *            stack[0]        = caller's return address
- *            stack[1..N]     = caller's stack slots
- * address: VA of the hooked function
+ * MUST NOT call any external DLL function -- only compiler intrinsics and
+ * direct memory reads are safe here.  (External calls risk recursion if the
+ * callee was itself hooked, and kernel calls block under high hook load.)
+ *
+ * Stack layout relative to `stack` (= entry RSP when trampoline fires):
+ *   push order: pushfq, rax, rbx, rcx, rdx, rsp, rbp, rsi, rdi,
+ *               r8, r9, r10, r11, r12, r13, r14, r15
+ *   stack[ 0] = return address          (caller's return address)
+ *   stack[-1] = rflags
+ *   stack[-2] = rax
+ *   stack[-3] = rbx
+ *   stack[-4] = rcx   -- arg0 (r0)
+ *   stack[-5] = rdx   -- arg1 (r1)
+ *   stack[-6] = rsp
+ *   stack[-7] = rbp
+ *   stack[-8] = rsi
+ *   stack[-9] = rdi
+ *   stack[-10]= r8    -- arg2 (r2)
+ *   stack[-11]= r9    -- arg3 (r3)
+ *   stack[-12...-17] = r10-r15
+ *   stack[1..N] = caller's stack frame slots
  * ========================================================================= */
-
 void __cdecl Send(char **stack, uintptr_t address) {
-    if (tls_in_send) return;
-    tls_in_send = 1;
-
     for (int i = -(int)SEND_REG_LO; i < (int)SEND_STK_HI; i++) {
-        __try {
-            uintptr_t val = (uintptr_t)stack[i];
-            int wlen = probe_wstr((const WCHAR *)val);
-            if (wlen > 0 && has_cjk_w((const WCHAR *)val, wlen))
-                pipe_send_text(address, i, 0,
-                               (const WCHAR *)val,
-                               (DWORD)(wlen * sizeof(WCHAR)));
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
+        char *candidate = stack[i];
+        if ((uintptr_t)candidate < 0x10000) continue;
 
-    tls_in_send = 0;
+        /* Read first 4 WCHARs under a single SEH frame (cheap) */
+        WCHAR c0, c1, c2, c3;
+        __try {
+            c0 = ((const WCHAR *)candidate)[0];
+            c1 = ((const WCHAR *)candidate)[1];
+            c2 = ((const WCHAR *)candidate)[2];
+            c3 = ((const WCHAR *)candidate)[3];
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+        if (!c0 || !c1) continue;
+
+        /* Quick CJK pre-filter: at least one of the first two WCHARs must
+         * be in CJK Unified / Hiragana / Katakana / Halfwidth range.     */
+        if (!((c0 >= 0x3000 && c0 <= 0x9FFF) || (c0 >= 0xFF00 && c0 <= 0xFFEF) ||
+              (c1 >= 0x3000 && c1 <= 0x9FFF) || (c1 >= 0xFF00 && c1 <= 0xFFEF)))
+            continue;
+
+        /* Signature dedup: hash (address, slot_i, c2, c3) to a cache slot.
+         * InterlockedCompareExchange / InterlockedExchange compile to
+         * LOCK CMPXCHG / LOCK XCHG -- no kernel call, no blocking.      */
+        LONG sig = (LONG)(
+            (address * 2654435761UL) ^
+            ((ULONG)i  * 1234567891UL) ^
+            ((ULONG)(c2 << 16) | (ULONG)c3));
+        if (sig == 0) sig = 1;   /* 0 is the empty-slot sentinel */
+        ULONG idx = (ULONG)((sig & 0x7FFFFFFFL) % SIG_CACHE_SIZE);
+        if (InterlockedCompareExchange(&g_sig_cache[idx], sig, sig) == sig)
+            continue;   /* identical signature seen before, skip */
+        InterlockedExchange(&g_sig_cache[idx], sig);
+
+        /* Full length scan under SEH */
+        int wlen;
+        __try {
+            const WCHAR *p = (const WCHAR *)candidate;
+            wlen = 0;
+            while (wlen < MAX_STR_LEN && p[wlen]) wlen++;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+        if (wlen < MIN_STR_LEN) continue;
+
+        /* Full CJK density check */
+        if (!has_cjk_w((const WCHAR *)candidate, wlen)) continue;
+
+        ring_push(address, i, 0, candidate, (DWORD)(wlen * sizeof(WCHAR)));
+    }
 }
 
 /* ===========================================================================
@@ -345,24 +447,38 @@ static const BYTE s_trampoline_template[TRAMPOLINE_SIZE] = {
  * SEARCH MODE
  * ========================================================================= */
 
-/* Quick prologue filter -- MinHook's HDE disassembler does the real check. */
+/* Prologue filter -- only unambiguous multi-byte sequences that can only
+ * appear at a real function entry, not inside a function body.            */
 static bool is_prologue(const uint8_t *b) {
-    /* sub rsp, N (most common x64 MSVC entry) */
-    if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
-    if (b[0] == 0x48 && b[1] == 0x81 && b[2] == 0xEC) return true;
-    /* push rbp / rbx / rsi / rdi */
-    if (b[0] == 0x55 || b[0] == 0x53 || b[0] == 0x56 || b[0] == 0x57) return true;
-    /* REX push (r8-r15) */
-    if (b[0] == 0x41 && b[1] >= 0x50 && b[1] <= 0x57) return true;
-    /* REX push rbp */
-    if (b[0] == 0x40 && b[1] == 0x55) return true;
-    /* mov [rsp+N], rX -- spill args */
-    if (b[0] == 0x48 && b[1] == 0x89 &&
-        (b[2] == 0x4C || b[2] == 0x54 || b[2] == 0x44 || b[2] == 0x5C))
-        return true;
-    /* REX.W mov -- generic prologue start */
-    if (b[0] == 0x48 && (b[1] & 0xF0) == 0x80) return true;
+    /* sub rsp, imm8  (48 83 EC xx) */
+    if (b[0]==0x48 && b[1]==0x83 && b[2]==0xEC) return true;
+    /* sub rsp, imm32 (48 81 EC xx xx xx xx) */
+    if (b[0]==0x48 && b[1]==0x81 && b[2]==0xEC) return true;
+    /* push rbp; mov rbp, rsp  (55 48 89 E5) */
+    if (b[0]==0x55 && b[1]==0x48 && b[2]==0x89 && b[3]==0xE5) return true;
+    /* push rbp; mov rbp, rsp  -- REX variant (55 48 8B EC) */
+    if (b[0]==0x55 && b[1]==0x48 && b[2]==0x8B && b[3]==0xEC) return true;
     return false;
+}
+
+/* Allocate executable memory within ±1.8 GB of `target` so MinHook's
+ * 32-bit relative JMP can always reach our trampolines.                  */
+static BYTE *alloc_near(uintptr_t target, size_t size) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    /* Search window: ±0x70000000 (safely within the ±0x7FFFFFFF limit)   */
+    uintptr_t lo = (target > 0x70000000ULL) ? target - 0x70000000ULL
+                                             : (uintptr_t)si.lpMinimumApplicationAddress;
+    uintptr_t hi = target + 0x70000000ULL;
+    if (hi > (uintptr_t)si.lpMaximumApplicationAddress)
+        hi = (uintptr_t)si.lpMaximumApplicationAddress;
+    for (uintptr_t addr = lo; addr < hi; addr += si.dwAllocationGranularity) {
+        BYTE *p = (BYTE *)VirtualAlloc((LPVOID)addr, size,
+                                        MEM_COMMIT | MEM_RESERVE,
+                                        PAGE_EXECUTE_READWRITE);
+        if (p) return p;
+    }
+    return NULL;
 }
 
 static void do_search(const Config *cfg) {
@@ -403,11 +519,10 @@ static void do_search(const Config *cfg) {
     DWORD max_hooks = cfg->max_hooks > 0 ? cfg->max_hooks : MAX_HOOKS;
     if (max_hooks > MAX_HOOKS) max_hooks = MAX_HOOKS;
 
-    /* Allocate RWX block for N trampoline copies */
+    /* Allocate RWX block for N trampoline copies, near .text so MinHook's
+     * 32-bit relative relay can reach our detours (±2 GB requirement).   */
     size_t tramp_block_size = (size_t)max_hooks * TRAMPOLINE_SIZE;
-    BYTE *trampolines = (BYTE *)VirtualAlloc(NULL, tramp_block_size,
-                                              MEM_COMMIT | MEM_RESERVE,
-                                              PAGE_EXECUTE_READWRITE);
+    BYTE *trampolines = alloc_near(text_start, tramp_block_size);
     if (!trampolines) {
         pipe_send_text(0, 0, 1, "ERROR:trampoline alloc failed", 29);
         MH_Uninitialize();
@@ -427,7 +542,8 @@ static void do_search(const Config *cfg) {
 
     for (size_t off = 0;
          off + 16 < text_size && hooked < (long)max_hooks;
-         off += 16) {
+         off++) {   /* byte-by-byte: only real function entries match */
+
 
         const uint8_t *p = text_ptr + off;
         LPVOID target = (LPVOID)p;
@@ -470,12 +586,14 @@ static void do_search(const Config *cfg) {
                            "scan_done:%ld", (long)hooked);
     pipe_send_text(0, 0, 1, msg, mlen > 0 ? (DWORD)mlen : 0);
 
-    /* Stay alive, streaming hits to pipe, until pipe is closed by Python */
+    /* Stay alive, draining ring→pipe until Python closes the pipe */
     while (g_pipe != INVALID_HANDLE_VALUE) {
         DWORD avail = 0;
         if (!PeekNamedPipe(g_pipe, NULL, 0, NULL, &avail, NULL)) break;
-        Sleep(100);
+        ring_drain();
+        Sleep(10);
     }
+    ring_drain();  /* final pass before uninstalling hooks */
 
     /* Disable and remove all search hooks */
     for (long i = 0; i < hooked; i++)
@@ -512,9 +630,13 @@ static UINT64 __fastcall text_hook_detour(UINT64 a0, UINT64 a1,
         __try { ptr = *(uintptr_t *)ptr; }
         __except (EXCEPTION_EXECUTE_HANDLER) { ptr = 0; }
 
-    if (ptr && c->encoding == 0) {
-        int wlen = probe_wstr((const WCHAR *)ptr);
-        if (wlen > 0 && has_cjk_w((const WCHAR *)ptr, wlen))
+    if (ptr && c->encoding == 0 && ptr >= 0x10000) {
+        int wlen = 0;
+        __try {
+            const WCHAR *p = (const WCHAR *)ptr;
+            while (wlen < MAX_STR_LEN && p[wlen]) wlen++;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { wlen = 0; }
+        if (wlen >= MIN_STR_LEN && has_cjk_w((const WCHAR *)ptr, wlen))
             pipe_send_text(c->hook_address, (int)c->arg_idx, 0,
                            (const WCHAR *)ptr, (DWORD)(wlen * 2));
     }
@@ -608,7 +730,6 @@ BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hDll);
-        InitializeCriticalSection(&g_pipe_cs);
         g_pipe = INVALID_HANDLE_VALUE;
         CreateThread(NULL, 0, worker_thread, NULL, 0, NULL);
         break;
@@ -621,7 +742,6 @@ BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved) {
         }
         if (g_trampolines) VirtualFree(g_trampolines, 0, MEM_RELEASE);
         if (g_hook_addrs)  HeapFree(GetProcessHeap(), 0, g_hook_addrs);
-        DeleteCriticalSection(&g_pipe_cs);
         break;
     }
     return TRUE;
