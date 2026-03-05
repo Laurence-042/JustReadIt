@@ -523,13 +523,22 @@ class HookSearcher:
             return
 
         # Map slot index to HookCode access_pattern.
-        # Stack layout (push order: pushfq, rax, rbx, rcx, rdx, rsp, rbp,
-        #               rsi, rdi, r8, r9, r10-r15):
-        #   stack[-1]=rflags  stack[-2]=rax   stack[-3]=rbx
-        #   stack[-4]=rcx(arg0)  stack[-5]=rdx(arg1)
-        #   stack[-6]=rsp  stack[-7]=rbp  stack[-8]=rsi  stack[-9]=rdi
-        #   stack[-10]=r8(arg2)  stack[-11]=r9(arg3)  stack[-12...-17]=r10-r15
-        #   stack[0]=ret addr  stack[1..N]=caller stack frame
+        #
+        # Trampoline push order (from the s_tpl template in hook_engine.c):
+        #   pushfq, rax, rbx, rcx, rdx, rsp, rbp, rsi, rdi,
+        #   r8, r9, r10, r11, r12, r13, r14, r15  (17 values)
+        #   sub rsp, 0x20  (xmm shadow space)
+        #   lea rcx, [rsp+0xa8]  ← points to entry RSP (== stack param)
+        #
+        # stack[i] = *(entry_RSP + i*8)
+        #   stack[ 0] = return address
+        #   stack[-1] = rflags    stack[-2] = rax     stack[-3] = rbx
+        #   stack[-4] = rcx (arg0)  stack[-5] = rdx (arg1)
+        #   stack[-6] = rsp (saved)  stack[-7] = rbp
+        #   stack[-8] = rsi    stack[-9] = rdi
+        #   stack[-10] = r8 (arg2)  stack[-11] = r9 (arg3)
+        #   stack[-12..-17] = r10-r15
+        #   stack[1..N] = caller stack frame
         _reg_to_pattern: dict[int, str] = {
             -4:  "r0",   # rcx = arg0
             -5:  "r1",   # rdx = arg1

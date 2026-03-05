@@ -168,3 +168,6 @@ python main.py --debug
 ## Reference
 
 Full design rationale and TODO list: [`doc/story.md`](../doc/story.md)
+
+# Language
+优先使用中文回复，英文也可以接受

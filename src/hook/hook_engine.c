@@ -36,6 +36,8 @@ typedef struct { uint64_t hook_va; int32_t slot_i;
                  uint16_t encoding; uint16_t text_len; } ResultHdr;
 #pragma pack(pop)
 
+static void log_phase(const char *msg);  /* forward decl */
+
 static HANDLE        g_pipe       = INVALID_HANDLE_VALUE;
 static Config        g_cfg;
 static uint64_t     *g_hook_addrs = NULL;
@@ -225,17 +227,6 @@ static const BYTE s_tpl[TRAMPOLINE_SIZE] = {
 };
 
 /* ================================================================
- * Prologue filter
- * ============================================================= */
-static bool is_prologue(const uint8_t *b) {
-    if (b[0]==0x48&&b[1]==0x83&&b[2]==0xEC) return true;
-    if (b[0]==0x48&&b[1]==0x81&&b[2]==0xEC) return true;
-    if (b[0]==0x55&&b[1]==0x48&&b[2]==0x89&&b[3]==0xE5) return true;
-    if (b[0]==0x55&&b[1]==0x48&&b[2]==0x8B&&b[3]==0xEC) return true;
-    return false;
-}
-
-/* ================================================================
  * alloc_near: VirtualAlloc within ±1.75 GB of target
  * ============================================================= */
 static BYTE *alloc_near(uintptr_t target, size_t size) {
@@ -339,6 +330,20 @@ static void do_search(const Config *cfg) {
     memcpy(tpl, s_tpl, TRAMPOLINE_SIZE);
     *(void**)(tpl+TRAMPOLINE_SEND_OFFSET)=(void*)Send;
 
+    /* dump Send ptr so we can verify the template was patched */
+    {
+        char dbg[128];
+        int n = _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "tpl_check: ADDR_OFF=%d SEND_OFF=%d ORIG_OFF=%d SIZE=%d "
+            "send_ptr=0x%llX tpl[60..67]=%02X%02X%02X%02X%02X%02X%02X%02X",
+            TRAMPOLINE_ADDR_OFFSET, TRAMPOLINE_SEND_OFFSET,
+            TRAMPOLINE_ORIG_OFFSET, TRAMPOLINE_SIZE,
+            (unsigned long long)(uintptr_t)Send,
+            tpl[60],tpl[61],tpl[62],tpl[63],
+            tpl[64],tpl[65],tpl[66],tpl[67]);
+        pipe_write(0,0,1,dbg,(DWORD)n);
+    }
+
     HMODULE hmod=GetModuleHandleW(NULL);
     MODULEINFO mi={0};
     GetModuleInformation(GetCurrentProcess(),hmod,&mi,sizeof(mi));
@@ -369,26 +374,61 @@ static void do_search(const Config *cfg) {
     if (!addrs) { VirtualFree(trampolines,0,MEM_RELEASE);
                   MH_Uninitialize(); return; }
 
+    pipe_write(0,0,1,"phase:scan_start",16);
+    log_phase("phase:scan_start");
     long hooked=0;
-    const uint8_t *tp=(const uint8_t*)ts;
 
-    for (size_t off=0; off+16<tsz && hooked<(long)mh; off++) {
-        const uint8_t *p=tp+off;
-        __try { if (!is_prologue(p)) continue; }
-        __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
+    /* ---- Enumerate .pdata (exception directory) instead of byte-scanning ----
+     *
+     * On x64 Windows every non-leaf function has a RUNTIME_FUNCTION entry in the
+     * PE exception directory (.pdata).  BeginAddress is an image-relative RVA
+     * pointing to the exact function start -- guaranteed by the compiler/linker.
+     *
+     * Byte-scanning .text for prologue patterns causes false positives when
+     * the matched bytes happen to sit in the middle of a larger instruction
+     * (e.g. an immediate operand of 0x48 0x83 0xEC ...).  MinHook then writes
+     * a JMP there, corrupting execution and causing an AV when that code path
+     * is reached.
+     *
+     * .pdata enumeration has no false positives and is O(N) simpler.
+     */
+    IMAGE_DATA_DIRECTORY *edir =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!edir->VirtualAddress || !edir->Size) {
+        pipe_write(0,0,1,"ERROR:no .pdata section",23);
+        log_phase("ERROR:no .pdata section");
+        HeapFree(GetProcessHeap(),0,addrs);
+        VirtualFree(trampolines,0,MEM_RELEASE);
+        MH_Uninitialize(); return;
+    }
+    RUNTIME_FUNCTION *pdata = (RUNTIME_FUNCTION *)(base + edir->VirtualAddress);
+    DWORD pdata_count = edir->Size / sizeof(RUNTIME_FUNCTION);
+
+    for (DWORD j = 0; j < pdata_count && hooked < (long)mh; j++) {
+        uintptr_t fn_addr = base + pdata[j].BeginAddress;
+
+        /* Skip if outside .text (some pdata entries point to cold/CGO sections) */
+        if (fn_addr < ts || fn_addr >= ts + tsz) continue;
 
         BYTE *tramp=trampolines+(size_t)hooked*TRAMPOLINE_SIZE;
         void *orig=NULL;
 
         memcpy(tramp,tpl,TRAMPOLINE_SIZE);
-        *(uintptr_t*)(tramp+TRAMPOLINE_ADDR_OFFSET)=(uintptr_t)p;
+        *(uintptr_t*)(tramp+TRAMPOLINE_ADDR_OFFSET)=fn_addr;
 
-        if (MH_CreateHook((LPVOID)p,(LPVOID)tramp,&orig)!=MH_OK) continue;
+        if (MH_CreateHook((LPVOID)fn_addr,(LPVOID)tramp,&orig)!=MH_OK) continue;
 
         /* Write original pointer BEFORE queuing */
         *(void**)(tramp+TRAMPOLINE_ORIG_OFFSET)=orig;
-        MH_QueueEnableHook((LPVOID)p);
-        addrs[hooked++]=(uint64_t)(uintptr_t)p;
+        MH_QueueEnableHook((LPVOID)fn_addr);
+        addrs[hooked++]=(uint64_t)fn_addr;
+    }
+
+    {
+        char tmp2[64];
+        int n=_snprintf_s(tmp2,64,_TRUNCATE,"phase:scan_done count=%ld",hooked);
+        pipe_write(0,0,1,tmp2,(DWORD)n);
+        log_phase(tmp2);
     }
 
     /*
@@ -398,14 +438,20 @@ static void do_search(const Config *cfg) {
      * would call RtlFailFast.  Registering first is the safe order.
      */
     register_trampolines_for_seh(trampolines, hooked, TRAMPOLINE_SIZE);
+    pipe_write(0,0,1,"phase:seh_registered",20);
+    log_phase("phase:seh_registered");
 
     /* Atomic batch install */
     MH_ApplyQueued();
+    pipe_write(0,0,1,"phase:hooks_applied",19);
+    log_phase("phase:hooks_applied");
 
     g_hook_addrs=addrs; g_trampolines=trampolines; g_hook_count=hooked;
 
     DWORD dummy;
     VirtualProtect(trampolines,blksz,PAGE_EXECUTE_READ,&dummy);
+    pipe_write(0,0,1,"phase:rx_protected",18);
+    log_phase("phase:rx_protected");
 
     char msg[64];
     int ml=_snprintf_s(msg,sizeof(msg),_TRUNCATE,"scan_done:%ld",(long)hooked);
@@ -431,6 +477,80 @@ static void do_search(const Config *cfg) {
     HeapFree(GetProcessHeap(),0,addrs);
     g_hook_addrs=NULL; g_trampolines=NULL; g_hook_count=0;
     MH_Uninitialize();
+}
+
+/* ================================================================
+ * Phase heartbeat log -- written at every major step so that even
+ * if the crash handler never fires we know where execution stopped.
+ * Writes to %TEMP%\jri_phases.txt (append mode).
+ * ============================================================= */
+static void log_phase(const char *msg) {
+    wchar_t tmp[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%sjri_phases.txt", tmp);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(f, 0, NULL, FILE_END);
+    char buf[256];
+    int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s\r\n", msg);
+    DWORD wr = 0;
+    if (n > 0) WriteFile(f, buf, (DWORD)n, &wr, NULL);
+    CloseHandle(f);
+}
+
+/* ================================================================
+ * Crash handler -- writes %TEMP%\jri_crash.txt on any exception.
+ * Registered as BOTH a Vectored Exception Handler (first in chain)
+ * and as the Unhandled Exception Filter, so it fires even if the
+ * game installs its own SEH-based crash reporter.
+ * ============================================================= */
+static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
+    wchar_t tmp[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, tmp)) { tmp[0]=L'C'; tmp[1]=L':'; tmp[2]=L'\\'; tmp[3]=0; }
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%sjri_crash.txt", tmp);
+    HANDLE f = CreateFileW(path,
+                           GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        char buf[512];
+        EXCEPTION_RECORD *er = ep->ExceptionRecord;
+        CONTEXT          *ctx= ep->ContextRecord;
+        int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "CODE:    0x%08X\r\n"
+            "ADDRESS: 0x%016llX\r\n"
+            "RIP:     0x%016llX\r\n"
+            "RSP:     0x%016llX\r\n"
+            "RCX:     0x%016llX\r\n"
+            "RDX:     0x%016llX\r\n"
+            "trampoline base: 0x%016llX\r\n"
+            "trampoline end:  0x%016llX\r\n"
+            "hook_count: %ld\r\n",
+            (unsigned)er->ExceptionCode,
+            (unsigned long long)er->ExceptionAddress,
+            (unsigned long long)ctx->Rip,
+            (unsigned long long)ctx->Rsp,
+            (unsigned long long)ctx->Rcx,
+            (unsigned long long)ctx->Rdx,
+            (unsigned long long)(uintptr_t)g_trampolines,
+            (unsigned long long)((uintptr_t)g_trampolines
+                                 + (size_t)g_hook_count * TRAMPOLINE_SIZE),
+            g_hook_count);
+        DWORD wr = 0;
+        WriteFile(f, buf, (DWORD)n, &wr, NULL);
+        CloseHandle(f);
+    }
+    char phase_msg[128];
+    EXCEPTION_RECORD *er2 = ep->ExceptionRecord;
+    _snprintf_s(phase_msg, sizeof(phase_msg), _TRUNCATE,
+        "crash CODE=0x%08X ADDR=0x%llX RIP=0x%llX",
+        (unsigned)er2->ExceptionCode,
+        (unsigned long long)er2->ExceptionAddress,
+        (unsigned long long)ep->ContextRecord->Rip);
+    log_phase(phase_msg);
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* ================================================================
@@ -490,6 +610,13 @@ BOOL WINAPI DllMain(HINSTANCE h,DWORD reason,LPVOID _){
     if(reason==DLL_PROCESS_ATTACH){
         DisableThreadLibraryCalls(h);
         g_pipe=INVALID_HANDLE_VALUE;
+        /* UEHF only -- catches real unhandled crashes.
+         * Do NOT use AddVectoredExceptionHandler: it would intercept
+         * every AV from Send's own __try/__except probes, causing
+         * hundreds of spurious crash_handler invocations and massive
+         * file-I/O overhead on every game thread. */
+        SetUnhandledExceptionFilter(crash_handler);
+        log_phase("DLL_PROCESS_ATTACH");
         CreateThread(NULL,0,worker,NULL,0,NULL);
     } else if(reason==DLL_PROCESS_DETACH){
         if(g_hook_count&&g_hook_addrs){
