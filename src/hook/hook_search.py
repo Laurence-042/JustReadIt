@@ -20,6 +20,7 @@ import logging
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,17 @@ from src.hook._win32 import (
 log = logging.getLogger(__name__)
 
 _DLL_PATH = Path(__file__).parent / "hook_engine.dll"
+
+# ---------------------------------------------------------------------------
+# Frequency-cull parameters
+# ---------------------------------------------------------------------------
+# A hook that fires >= _CULL_THRESHOLD times within _CULL_WINDOW_S seconds is
+# considered a high-frequency non-text function and is disabled in the DLL to
+# reduce game overhead.  Dialogue functions in a Light.VN game fire at most a
+# few times per text-advance event; game-loop helpers fire hundreds of times
+# per second.
+_CULL_WINDOW_S:  float = 3.0   # sliding window length in seconds
+_CULL_THRESHOLD: int   = 30    # hits within window that trigger cull
 
 # ---------------------------------------------------------------------------
 # HookCode — serialisable reference to a confirmed hook site
@@ -228,6 +240,11 @@ def score_candidate(text: str) -> float:
 
     # --- hard rejects ------------------------------------------------------
 
+    # Non-printable control characters (beep, null residue, escape sequences…)
+    # Allow only common whitespace: \t (0x09), \n (0x0A), \r (0x0D).
+    if any(ord(c) < 0x20 and c not in '\t\n\r' for c in text):
+        return 0.0
+
     # Binary / high-entropy garbage
     if _shannon_entropy(text) > 5.5:
         return 0.0
@@ -344,6 +361,10 @@ class HookSearcher:
         self._scan_done  = threading.Event()
         self._lock       = threading.Lock()
         self._reader:     threading.Thread | None  = None
+        # Frequency-cull state (all guarded by _lock)
+        # _va_rate: va → [first_seen: float, hit_count: int]
+        self._va_rate:     dict[int, list]  = {}
+        self._culled_vas:  set[int]         = set()
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -506,6 +527,28 @@ class HookSearcher:
             with self._lock:
                 self._diags.append(text)
 
+    def _flush_culls(self) -> None:
+        """Send a CMD_DISABLE command to the DLL for any pending high-frequency VAs.
+
+        Called from the reader thread after every processed pipe message so
+        that culls are sent as soon as they are detected without a separate
+        writer thread.
+        """
+        with self._lock:
+            pending = self._pending_culls[:]
+            self._pending_culls.clear()
+        if not pending or not self._h_pipe:
+            return
+        try:
+            write_pipe(self._h_pipe, pack_disable_command(pending))
+            log.info(
+                "Sent CMD_DISABLE for %d high-frequency hook(s): %s",
+                len(pending),
+                ", ".join(f"0x{va:x}" for va in pending),
+            )
+        except (PipeError, OSError) as exc:
+            log.warning("Failed to send CMD_DISABLE: %s", exc)
+
     def _handle_hit(self, hook_va: int, slot_i: int,
                      encoding: int, text: str) -> None:
         """Build / update a HookCandidate from a single pipe result.
@@ -517,7 +560,42 @@ class HookSearcher:
             -12 = rsp    -11 = rbp    -10 = rsi  -9 = rdi
              -8 = r8 (arg2)   -7 = r9 (arg3)   -6...-1 = r10-r15
               0 = return addr   1..N = caller stack slots
+
+        High-frequency VAs (fires >= _CULL_THRESHOLD times in _CULL_WINDOW_S
+        seconds) are queued for removal and silently dropped from candidates.
         """
+        # --- frequency guard (before expensive score_candidate) ---
+        #
+        # We anchor on the *first* observed time for each VA and count every
+        # subsequent hit accumulating from that moment.  The window is never
+        # reset: if a VA fires >= _CULL_THRESHOLD times within the first
+        # _CULL_WINDOW_S seconds of observation it is a high-frequency helper
+        # and is culled.  Resetting the window on each timeout was the bug
+        # that let steady-rate functions (e.g. 29 hits / 3 s) slip through.
+        #
+        # Once _CULL_WINDOW_S has elapsed without hitting the threshold the
+        # VA is considered benign (slow-firing dialogue function) and is
+        # allowed through forever without further counting.
+        now = time.monotonic()
+        with self._lock:
+            if hook_va in self._culled_vas:
+                return
+            entry = self._va_rate.get(hook_va)
+            if entry is None:
+                # [first_seen, count]
+                self._va_rate[hook_va] = [now, 1]
+            else:
+                elapsed = now - entry[0]
+                if elapsed < _CULL_WINDOW_S:
+                    entry[1] += 1
+                    if entry[1] >= _CULL_THRESHOLD:
+                        self._culled_vas.add(hook_va)
+                        log.debug(
+                            "VA 0x%x culled (%d hits in %.1fs)",
+                            hook_va, entry[1], elapsed,
+                        )
+                        return
+                # elapsed >= _CULL_WINDOW_S and not yet culled → benign, fall through
         s = score_candidate(text)
         if s <= 0:
             return

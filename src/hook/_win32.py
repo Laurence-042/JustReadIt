@@ -320,6 +320,24 @@ def unpack_result_hdr(data: bytes) -> tuple[int, int, int, int]:
     return struct.unpack(_RESULT_HDR_FMT, data)
 
 
+# CMD_DISABLE: uint8_t(1) + uint32_t(count) + count × uint64_t(va)
+_CMD_DISABLE: int = 1
+
+
+def pack_disable_command(vas: list[int]) -> bytes:
+    """Pack a CMD_DISABLE command to send to the DLL mid-session.
+
+    Instructs the DLL to immediately disable (and queue-remove) the hooks
+    at each of the given virtual addresses.
+
+    Parameters
+    ----------
+    vas:
+        List of absolute virtual addresses to disable.
+    """
+    return struct.pack("<BI", _CMD_DISABLE, len(vas)) + struct.pack(f"<{len(vas)}Q", *vas)
+
+
 # ---------------------------------------------------------------------------
 # Module base lookup
 # ---------------------------------------------------------------------------
