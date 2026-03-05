@@ -236,7 +236,17 @@ static BYTE *alloc_near(uintptr_t target, size_t size) {
     uintptr_t hi=target+0x68000000ULL;
     if (hi>(uintptr_t)si.lpMaximumApplicationAddress)
         hi=(uintptr_t)si.lpMaximumApplicationAddress;
-    for (uintptr_t a=lo;a<hi;a+=si.dwAllocationGranularity) {
+    /* Try ABOVE target first so that RVAs (allocation - target) are
+     * small positive values and always fit in a DWORD. */
+    for (uintptr_t a=target; a<hi; a+=si.dwAllocationGranularity) {
+        BYTE *p=(BYTE*)VirtualAlloc((LPVOID)a,size,
+                                    MEM_COMMIT|MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+        if (p) return p;
+    }
+    /* Fall back to below target (RVAs wrap as unsigned DWORD but still
+     * fit; caller must treat UnwindData as unsigned). */
+    for (uintptr_t a=lo; a<target; a+=si.dwAllocationGranularity) {
         BYTE *p=(BYTE*)VirtualAlloc((LPVOID)a,size,
                                     MEM_COMMIT|MEM_RESERVE,
                                     PAGE_EXECUTE_READWRITE);
