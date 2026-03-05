@@ -32,6 +32,7 @@ from src.hook._win32 import (
     connect_pipe,
     create_pipe_server,
     inject_dll,
+    pack_disable_command,
     pack_search_config,
     read_pipe_exact,
     unpack_result_hdr,
@@ -201,11 +202,10 @@ class HookCandidate:
         )
 
     def display_label(self) -> str:
-        """Short label for UI display."""
+        """Short label for UI display (sorted by RVA; no score)."""
         preview = self.text[:60].replace("\n", " ")
         return (
-            f"{self.module}  +{self.rva:#x}  {self.access_pattern}"
-            f"  hits={self.hit_count}  {preview!r}"
+            f"+{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}  {preview!r}"
         )
 
 
@@ -365,6 +365,7 @@ class HookSearcher:
         # _va_rate: va → [first_seen: float, hit_count: int]
         self._va_rate:     dict[int, list]  = {}
         self._culled_vas:  set[int]         = set()
+        self._pending_culls: list[int]      = []  # VAs queued to send CMD_DISABLE
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -430,12 +431,15 @@ class HookSearcher:
     # ------------------------------------------------------------------
 
     def ranked_candidates(self) -> list[HookCandidate]:
-        """Return candidates sorted best-first (snapshot)."""
+        """Return candidates sorted by RVA ascending (snapshot).
+
+        Ordering by RVA is stable across repeated calls; score-based ordering
+        caused constant reordering as `hit_count` accumulated.
+        Candidates with score == 0 (hard-rejected by :func:`score_candidate`)
+        are still included; callers may filter them if desired.
+        """
         with self._lock:
-            candidates = list(self._candidates.values())
-        for c in candidates:
-            c.score = score_candidate(c.text) * (1.0 + 0.1 * c.hit_count)
-        return sorted(candidates, key=lambda c: -c.score)
+            return sorted(self._candidates.values(), key=lambda c: c.rva)
 
     def diags(self) -> list[str]:
         """Return all diagnostic messages received so far."""

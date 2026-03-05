@@ -38,7 +38,9 @@ from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.hook.text_hook import TextHook, HookAttachError, HookScriptError
-from src.hook.hook_search import HookCandidate, HookCode, HookSearcher, HookSearchError
+from src.hook.hook_search import (
+    HookCandidate, HookCode, HookSearcher, HookSearchError, score_candidate,
+)
 from .window_picker import WindowPicker
 
 
@@ -585,6 +587,13 @@ class DebugWindow(QMainWindow):
 
         self._picker: WindowPicker | None = None
 
+        # Hook search state (auto-starts on pick window)
+        self._searcher: HookSearcher | None = None
+        self._search_timer = QTimer(self)
+        self._search_timer.setInterval(500)
+        self._search_timer.timeout.connect(self._refresh_candidates)
+        self._last_cand_count: int = -1
+
         self._install_proc_handle: int | None = None
         self._install_timer = QTimer(self)
         self._install_timer.setInterval(500)
@@ -648,12 +657,12 @@ class DebugWindow(QMainWindow):
         act_diag.triggered.connect(self._diagnose)
         tb.addAction(act_diag)
 
-        act_search = QAction("🧲 Search Hooks", self)
+        act_search = QAction("⟳ Re-search", self)
         act_search.setToolTip(
-            "Scan the game process for functions that pass CJK text. "
-            "Play the game for ~30 s then pick the best result."
+            "Re-run hook search for the current target.  "
+            "Search starts automatically when you pick a window."
         )
-        act_search.triggered.connect(self._search_hooks)
+        act_search.triggered.connect(self._start_search)
         tb.addAction(act_search)
 
         tb.addSeparator()
@@ -707,10 +716,9 @@ class DebugWindow(QMainWindow):
         self._preview = _PreviewLabel(self)
         splitter.addWidget(self._preview)
 
-        right = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        # ── Middle column: OCR / hook output panels ─────────────────────────
+        mid = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(mid)
 
         grp_wocr, self._te_wocr = _make_panel("Windows OCR")
         grp_region, self._te_region = _make_panel("Detected Region")
@@ -721,11 +729,38 @@ class DebugWindow(QMainWindow):
         self._te_hook.setPlaceholderText("Hook will attach automatically when pipeline starts.")
         self._te_tl.setPlaceholderText("Translation plugin not yet implemented.")
 
-        right.addWidget(grp_wocr)
-        right.addWidget(grp_region)
-        right.addWidget(grp_hook)
-        right.addWidget(grp_tl)
-        right.setSizes([280, 160, 160, 120])
+        mid.addWidget(grp_wocr)
+        mid.addWidget(grp_region)
+        mid.addWidget(grp_hook)
+        mid.addWidget(grp_tl)
+        mid.setSizes([280, 160, 160, 120])
+
+        # ── Right column: hook candidates ────────────────────────────────────
+        grp_cands = QGroupBox("Hook Candidates  (auto-starts on Pick Window)")
+        _cands_lay = QVBoxLayout(grp_cands)
+        _cands_lay.setContentsMargins(3, 3, 3, 3)
+        self._lbl_search_status = QLabel("No active search — pick a window first.")
+        self._lbl_search_status.setWordWrap(True)
+        _cands_lay.addWidget(self._lbl_search_status)
+        self._lst_candidates = QListWidget()
+        self._lst_candidates.setFont(QFont("Consolas", 9))
+        self._lst_candidates.itemDoubleClicked.connect(self._confirm_candidate)
+        _cands_lay.addWidget(self._lst_candidates, 1)
+        self._te_search_diag = QTextEdit()
+        self._te_search_diag.setReadOnly(True)
+        self._te_search_diag.setFont(QFont("Consolas", 8))
+        self._te_search_diag.setFixedHeight(56)
+        self._te_search_diag.setPlaceholderText("DLL diagnostic output…")
+        _cands_lay.addWidget(self._te_search_diag)
+        _btn_confirm = QPushButton("✓  Confirm selected candidate")
+        _btn_confirm.clicked.connect(self._confirm_candidate)
+        _cands_lay.addWidget(_btn_confirm)
+        splitter.addWidget(grp_cands)
+
+        # preview : mid-col : candidates  →  5 : 3 : 2
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
 
         # ── Status bar ─────────────────────────────────────────────────
         self.setStatusBar(QStatusBar(self))
@@ -937,6 +972,8 @@ class DebugWindow(QMainWindow):
             f"  output_idx={target.dxcam_output_idx}",
             5000,
         )
+        # Auto-start hook search so candidates accumulate while the user plays.
+        self._start_search()
 
     # ------------------------------------------------------------------
     # Pipeline run / stop
@@ -981,20 +1018,85 @@ class DebugWindow(QMainWindow):
         """Start the pipeline in diagnostic mode."""
         self._run(diagnostic=True)
 
-    def _search_hooks(self) -> None:
-        """Open the hook-search dialog."""
+    def _start_search(self) -> None:
+        """Start or restart the hook search for the current target."""
+        self._stop_search()
         if self._target is None:
             self.statusBar().showMessage("Pick a window first.", 3000)
             return
-        dlg = _HookSearchDialog(self._target, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_code is not None:
-            code = dlg.selected_code
-            _cfg.hook_code = code.to_str()
-            self._lbl_hook_code.setText(f"+{code.rva:#x}:{code.access_pattern} ({code.encoding})")
-            self._lbl_hook_code.setToolTip(code.to_str())
-            self.statusBar().showMessage(
-                f"Hook code saved: {code.to_str()}  — press ▶ Run to use it.", 6000
+        try:
+            self._searcher = HookSearcher(self._target.pid)
+            self._searcher.start()
+            self._lbl_search_status.setText(
+                "Scanning…  play the game — candidates appear as dialogue fires."
             )
+            self._last_cand_count = -1
+            self._search_timer.start()
+        except HookSearchError as exc:
+            self._lbl_search_status.setText(f"⚠ Search failed: {exc}")
+            self.statusBar().showMessage(f"Hook search failed: {exc}", 8000)
+
+    def _stop_search(self) -> None:
+        """Stop and clean up the active HookSearcher."""
+        self._search_timer.stop()
+        if self._searcher is not None:
+            self._searcher.stop()
+            self._searcher = None
+
+    @Slot()
+    def _refresh_candidates(self) -> None:
+        """Refresh the candidates list from the active HookSearcher (500 ms tick)."""
+        if self._searcher is None:
+            return
+        diags = self._searcher.diags()
+        if diags:
+            self._te_search_diag.setPlainText("\n".join(diags))
+        if self._searcher.scan_complete:
+            self._lbl_search_status.setText(
+                "Scan complete.  Play the game \u2014 candidates update automatically.  "
+                "Double-click or select + Confirm."
+            )
+        candidates = self._searcher.ranked_candidates()  # sorted by RVA ascending
+        visible = [c for c in candidates if score_candidate(c.text) > 0]
+        if len(visible) == self._last_cand_count:
+            return
+        self._last_cand_count = len(visible)
+        cur_key = (
+            self._lst_candidates.currentItem().data(32)
+            if self._lst_candidates.currentItem()
+            else None
+        )
+        self._lst_candidates.clear()
+        for c in visible:
+            item = QListWidgetItem(c.display_label())
+            item.setData(32, c.to_hook_code().to_str())
+            self._lst_candidates.addItem(item)
+            if item.data(32) == cur_key:
+                self._lst_candidates.setCurrentItem(item)
+        if visible and self._lst_candidates.currentItem() is None:
+            self._lst_candidates.setCurrentRow(0)
+
+    @Slot()
+    def _confirm_candidate(self) -> None:
+        """Confirm the selected candidate as the active hook code and start pipeline."""
+        item = self._lst_candidates.currentItem()
+        if item is None and self._lst_candidates.count() > 0:
+            item = self._lst_candidates.item(0)
+        if item is None:
+            self.statusBar().showMessage("No candidate selected.", 3000)
+            return
+        try:
+            code = HookCode.from_str(item.data(32))
+        except ValueError as exc:
+            self.statusBar().showMessage(f"Invalid hook code: {exc}", 5000)
+            return
+        _cfg.hook_code = code.to_str()
+        self._lbl_hook_code.setText(f"+{code.rva:#x}:{code.access_pattern} ({code.encoding})")
+        self._lbl_hook_code.setToolTip(code.to_str())
+        self._lbl_search_status.setText(f"Confirmed: +{code.rva:#x}:{code.access_pattern}")
+        self._stop_search()
+        self.statusBar().showMessage(f"Hook confirmed: {code.to_str()} \u2014 starting pipeline\u2026", 6000)
+        self._run(hook_code=code)
 
     def _stop(self) -> None:
         self._run_timer.stop()
@@ -1059,6 +1161,7 @@ class DebugWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._stop()
+        self._stop_search()
         # Persist interval so it survives restarts.
         _cfg.interval_ms = self._spn_interval.value()
         super().closeEvent(event)
