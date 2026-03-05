@@ -16,7 +16,7 @@
 
 #define MODE_SEARCH   0
 #define MODE_HOOK     1
-#define MAX_HOOKS     60000
+#define MAX_HOOKS     10000
 #define MAX_STR_LEN   400
 #define MIN_STR_LEN   2
 #define SEND_REG_LO   16
@@ -57,6 +57,20 @@ static volatile LONG g_ring_seq = 0;
 /* ---- sig dedup ---- */
 #define SIG_CACHE_SIZE 65521u
 static volatile LONG g_sig_cache[SIG_CACHE_SIZE];
+
+/* ---- per-address call-rate suppressor ----
+ * Each entry counts raw invocations of a given address (hashed).
+ * Once the count exceeds SEND_CALL_LIMIT the slot is marked
+ * SUPPRESSED (0x7FFFFFFF) and Send() returns immediately without
+ * doing any memory scanning.  No thread suspension required.
+ * Hash collisions can silence a second address that shares the
+ * slot -- acceptable: a slot holds ~7000 unique addresses on
+ * average across 60000 hooks, so collisions are rare.
+ */
+#define CALL_RATE_SIZE   65521u
+#define SEND_CALL_LIMIT  150        /* raw calls before suppression  */
+#define SUPPRESSED       0x7FFFFFFF
+static volatile LONG g_call_rate[CALL_RATE_SIZE];
 
 /* ================================================================
  * pipe helpers (worker thread only -- no concurrency)
@@ -135,6 +149,17 @@ static bool has_cjk(const WCHAR *p, int n) {
  *     to the trampoline frame (which has no .pdata).
  * ============================================================= */
 void __cdecl Send(char **stack, uintptr_t address) {
+    /* ---- 0. per-address call-rate gate ---- */
+    {
+        ULONG ci = (ULONG)((address * 2654435761ULL) % CALL_RATE_SIZE);
+        /* Fetch-then-increment: if already >= limit, bail out without
+         * incrementing (avoids wrapping past SUPPRESSED on busy slots). */
+        LONG cur = g_call_rate[ci];
+        if (cur >= SEND_CALL_LIMIT) return;
+        LONG nxt = InterlockedIncrement(&g_call_rate[ci]);
+        if (nxt >= SEND_CALL_LIMIT) return;
+    }
+
     for (int i=-(int)SEND_REG_LO; i<(int)SEND_STK_HI; i++) {
 
         /* ---- 1. read the candidate pointer ---- */

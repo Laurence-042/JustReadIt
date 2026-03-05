@@ -348,7 +348,7 @@ class HookSearcher:
         pid: int,
         *,
         max_candidates: int = 50,
-        max_hooks: int = 60_000,
+        max_hooks: int = 10_000,
     ) -> None:
         self._pid        = pid
         self._max_c      = max_candidates
