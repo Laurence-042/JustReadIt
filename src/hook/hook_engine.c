@@ -84,6 +84,24 @@ static volatile LONG g_sig_cache[SIG_CACHE_SIZE];
 static volatile LONG g_call_rate[CALL_RATE_SIZE];
 static volatile LONG g_need_apply = 0; /* set in Send(), consumed in ring_drain() */
 
+/* ---- pending-disable queue (game threads → worker thread only) ----------
+ *
+ * CRITICAL: MH_QueueDisableHook / MH_ApplyQueued are NOT thread-safe.
+ * Game threads must NEVER call them directly.  Instead they write the
+ * target VA into g_pdisable[], and the worker thread (ring_drain) drains
+ * the buffer and calls the MinHook APIs single-threadedly.
+ *
+ * Sizing: PDISABLE_SLOTS must be a power of 2.  4096 slots × 8 B = 32 kB.
+ * In the worst case a full batch of 500 addresses hits the limit between
+ * two consecutive ring_drain() calls (10 ms apart) -- comfortably fits.
+ * Overflow is safe: the producer wraps around and overwrites an already-
+ * queued (non-zero) slot, which is just a harmless duplicate disable.
+ */
+#define PDISABLE_SLOTS   4096u      /* must be power of 2                  */
+#define PDISABLE_MASK    (PDISABLE_SLOTS - 1)
+static volatile LONG64 g_pdisable[PDISABLE_SLOTS]; /* 0 = empty, else VA  */
+static volatile LONG   g_pdisable_seq = 0;         /* rolling producer idx */
+
 /* ================================================================
  * pipe helpers (worker thread only -- no concurrency)
  * ============================================================= */
@@ -125,20 +143,36 @@ static void ring_push(uintptr_t va, int slot, int enc,
 
 static void ring_drain(void) {
     if (g_pipe==INVALID_HANDLE_VALUE) return;
-    /* Apply any queued disables first (queued by Send() on game threads). */
+    /* Apply any queued disables.
+     * All MinHook API calls happen HERE, on the worker thread only.
+     * Game threads only write addresses into g_pdisable[]; they never
+     * touch MinHook directly.  This eliminates the MinHook thread-safety
+     * issue that caused game crashes under heavy concurrent hook firing.
+     */
     if (g_trampolines &&
         InterlockedCompareExchange(&g_need_apply, 0, 1) == 1) {
-        /* Re-protect trampoline buffer as RWX briefly so MinHook can patch
-         * the target prologues (it calls VirtualProtect internally on the
-         * target, but our buffer is EXECUTE_READ and must stay consistent). */
-        DWORD dummy;
-        VirtualProtect(g_trampolines,
-                       (size_t)g_mh * TRAMPOLINE_SIZE,
-                       PAGE_EXECUTE_READWRITE, &dummy);
-        MH_ApplyQueued();
-        VirtualProtect(g_trampolines,
-                       (size_t)g_mh * TRAMPOLINE_SIZE,
-                       PAGE_EXECUTE_READ, &dummy);
+        /* Drain the pending-disable ring: call MH_QueueDisableHook for
+         * every non-zero slot, then clear it. */
+        bool any = false;
+        for (ULONG i = 0; i < PDISABLE_SLOTS; i++) {
+            LONG64 va = InterlockedExchange64(&g_pdisable[i], 0);
+            if (va) {
+                MH_QueueDisableHook((LPVOID)(uintptr_t)va);
+                any = true;
+            }
+        }
+        if (any) {
+            /* Re-protect trampoline buffer as RWX briefly so MinHook can
+             * patch the target prologues consistently with our buffer. */
+            DWORD dummy;
+            VirtualProtect(g_trampolines,
+                           (size_t)g_mh * TRAMPOLINE_SIZE,
+                           PAGE_EXECUTE_READWRITE, &dummy);
+            MH_ApplyQueued();
+            VirtualProtect(g_trampolines,
+                           (size_t)g_mh * TRAMPOLINE_SIZE,
+                           PAGE_EXECUTE_READ, &dummy);
+        }
     }
     /* Cap iterations per call so the command-check loop stays responsive
      * even when many hooks are firing.  Unflushed slots are picked up on
@@ -188,8 +222,16 @@ void __cdecl Send(char **stack, uintptr_t address) {
         if (cur >= SEND_CALL_LIMIT) return;
         LONG nxt = InterlockedIncrement(&g_call_rate[ci]);
         if (nxt == SEND_CALL_LIMIT) {
-            /* First thread to hit the limit: queue disable on worker thread. */
-            MH_QueueDisableHook((LPVOID)(uintptr_t)address);
+            /* First thread to hit the limit for this slot.
+             * DO NOT call MH_QueueDisableHook here -- MinHook is NOT
+             * thread-safe and multiple game threads may reach this
+             * branch concurrently for different addresses, corrupting
+             * MinHook's internal state.  Instead, post the VA into the
+             * lock-free pending-disable ring; the worker thread drains
+             * it and calls MinHook APIs single-threadedly.
+             */
+            LONG slot = InterlockedIncrement(&g_pdisable_seq) & (LONG)PDISABLE_MASK;
+            InterlockedExchange64(&g_pdisable[slot], (LONG64)(uintptr_t)address);
             InterlockedExchange(&g_need_apply, 1);
         }
         if (nxt >= SEND_CALL_LIMIT) return;
