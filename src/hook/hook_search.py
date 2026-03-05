@@ -20,7 +20,6 @@ import logging
 import math
 import re
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,7 +31,6 @@ from src.hook._win32 import (
     connect_pipe,
     create_pipe_server,
     inject_dll,
-    pack_disable_command,
     pack_scan_next_command,
     pack_search_config,
     read_pipe_exact,
@@ -46,24 +44,17 @@ log = logging.getLogger(__name__)
 _DLL_PATH = Path(__file__).parent / "hook_engine.dll"
 
 # ---------------------------------------------------------------------------
-# Frequency-cull parameters
-# ---------------------------------------------------------------------------
-# A hook that fires >= _CULL_THRESHOLD times within _CULL_WINDOW_S seconds is
-# considered a high-frequency non-text function and is disabled in the DLL to
-# reduce game overhead.  Dialogue functions in a Light.VN game fire at most a
-# few times per text-advance event; game-loop helpers fire hundreds of times
-# per second.
-_CULL_WINDOW_S:  float = 3.0   # sliding window length in seconds
-_CULL_THRESHOLD: int   = 30    # hits within window that trigger cull
-
-# ---------------------------------------------------------------------------
 # Batch-advance parameters
 # ---------------------------------------------------------------------------
-# After each batch completes the DLL drains fire events for _BATCH_SETTLE_S
-# seconds.  HookSearcher then flushes pending CMD_DISABLEs and sends
-# CMD_SCAN_NEXT to hook the next batch.
-_BATCH_SETTLE_S:    float = 5.0   # settle time before advancing to next batch
-_DEFAULT_BATCH_SIZE: int  = 2000  # functions per incrementally-hooked batch
+# During the scan phase Python advances batches as fast as the DLL can process
+# them.  _BATCH_ADVANCE_DELAY_S is only a tiny inter-thread yield so
+# _send_next_batch runs on a worker thread rather than the pipe reader thread.
+# High-frequency functions are suppressed at the C level (SEND_CALL_LIMIT=150)
+# within milliseconds; no artificial settle window is needed.
+# Once all pdata is covered the player simply plays the game — dialogue
+# functions fire and appear in ranked_candidates().
+_BATCH_ADVANCE_DELAY_S: float = 0.05  # inter-thread yield only; not a settle
+_DEFAULT_BATCH_SIZE:    int   = 500   # functions per batch (smaller = less thread suspension per step)
 
 # ---------------------------------------------------------------------------
 # HookCode — serialisable reference to a confirmed hook site
@@ -358,7 +349,7 @@ class HookSearcher:
         pid: int,
         *,
         max_candidates: int = 50,
-        max_hooks: int = 10_000,
+        max_hooks: int = 0,  # 0 = scan all pdata entries
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> None:
         self._pid        = pid
@@ -374,14 +365,9 @@ class HookSearcher:
         self._lock       = threading.Lock()
         self._write_lock = threading.Lock()  # guards pipe writes (any thread)
         self._reader:     threading.Thread | None  = None
-        # Frequency-cull state (all guarded by _lock)
-        # _va_rate: va → [first_seen: float, hit_count: int]
-        self._va_rate:     dict[int, list]  = {}
-        self._culled_vas:  set[int]         = set()
-        self._pending_culls: list[int]      = []  # VAs queued to send CMD_DISABLE
-        # Batch-advance state
+        # Batch-advance state (no settle timer — advance fires immediately)
         self._batch_exhausted: bool              = False
-        self._settle_timer:    threading.Timer | None = None
+        self._advance_thread:  threading.Timer | None = None
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -430,10 +416,10 @@ class HookSearcher:
     def stop(self) -> None:
         """Close the pipe and stop the reader thread.  Safe to call many times."""
         self._stop.set()
-        # Cancel any pending settle timer before closing the pipe
+        # Cancel any pending advance thread before closing the pipe
         with self._lock:
-            t = self._settle_timer
-            self._settle_timer = None
+            t = self._advance_thread
+            self._advance_thread = None
         if t is not None:
             t.cancel()
         if self._h_pipe:
@@ -532,7 +518,8 @@ class HookSearcher:
                 continue
 
             self._handle_hit(hook_va, slot_i, encoding, text)
-            self._flush_culls()  # send any newly-culled VAs to DLL immediately
+            # Culls are flushed in bulk by the batch-settle timer (_send_next_batch)
+            # rather than per-hit, to avoid starving the timer thread of _write_lock.
 
         log.debug("HookSearcher reader loop exiting")
 
@@ -575,99 +562,58 @@ class HookSearcher:
                 self._diags.append(text)
 
     def _schedule_next_batch(self) -> None:
-        """Schedule CMD_SCAN_NEXT to fire after the settle period."""
+        """Immediately schedule CMD_SCAN_NEXT on a worker thread (tiny yield only)."""
         if self._stop.is_set() or self._batch_exhausted:
+            with self._lock:
+                self._diags.append(
+                    f"_schedule_next_batch skipped: stop={self._stop.is_set()} "
+                    f"exhausted={self._batch_exhausted}"
+                )
             return
-        t = threading.Timer(_BATCH_SETTLE_S, self._send_next_batch)
+        t = threading.Timer(_BATCH_ADVANCE_DELAY_S, self._send_next_batch)
         t.daemon = True
         with self._lock:
-            old = self._settle_timer
-            self._settle_timer = t
+            old = self._advance_thread
+            self._advance_thread = t
         if old is not None:
-            old.cancel()  # cancel previous timer if still pending
+            old.cancel()
         t.start()
-        log.debug("HookSearcher: next batch in %.0fs", _BATCH_SETTLE_S)
 
     def _send_next_batch(self) -> None:
-        """Called by settle timer: flush pending culls, then send CMD_SCAN_NEXT."""
+        """Called by advance thread: send CMD_SCAN_NEXT."""
+        with self._lock:
+            self._diags.append(
+                f"Advancing: stop={self._stop.is_set()} pipe={self._h_pipe}"
+            )
         if self._stop.is_set() or not self._h_pipe:
             return
-        self._flush_culls()
         with self._write_lock:
             if self._stop.is_set() or not self._h_pipe:
+                with self._lock:
+                    self._diags.append("CMD_SCAN_NEXT aborted (pipe closed)")
                 return
             try:
                 write_pipe(self._h_pipe, pack_scan_next_command(self._batch_size))
                 log.info("HookSearcher: sent CMD_SCAN_NEXT batch_size=%d", self._batch_size)
             except (PipeError, OSError) as exc:
+                with self._lock:
+                    self._diags.append(f"CMD_SCAN_NEXT write failed: {exc}")
                 log.warning("Failed to send CMD_SCAN_NEXT: %s", exc)
 
     def _flush_culls(self) -> None:
-        """Send a CMD_DISABLE command for any pending high-frequency VAs."""
-        with self._lock:
-            pending = self._pending_culls[:]
-            self._pending_culls.clear()
-        if not pending or not self._h_pipe:
-            return
-        with self._write_lock:
-            try:
-                write_pipe(self._h_pipe, pack_disable_command(pending))
-                log.info(
-                    "Sent CMD_DISABLE for %d hook(s): %s",
-                    len(pending),
-                    ", ".join(f"0x{va:x}" for va in pending),
-                )
-            except (PipeError, OSError) as exc:
-                log.warning("Failed to send CMD_DISABLE: %s", exc)
+        """No-op: high-frequency culling is now handled entirely by the DLL.
+        Kept for API compatibility; CMD_DISABLE may still be used for manual
+        disabling in future.
+        """
 
     def _handle_hit(self, hook_va: int, slot_i: int,
                      encoding: int, text: str) -> None:
         """Build / update a HookCandidate from a single pipe result.
 
-        slot_i values come from the trampoline's ``i`` counter, which reflects
-        the position of the value in the saved-register + caller-stack window::
-
-            -16 = rax    -15 = rbx    -14 = rcx (arg0)  -13 = rdx (arg1)
-            -12 = rsp    -11 = rbp    -10 = rsi  -9 = rdi
-             -8 = r8 (arg2)   -7 = r9 (arg3)   -6...-1 = r10-r15
-              0 = return addr   1..N = caller stack slots
-
-        High-frequency VAs (fires >= _CULL_THRESHOLD times in _CULL_WINDOW_S
-        seconds) are queued for removal and silently dropped from candidates.
+        High-frequency functions are suppressed and auto-disabled by the DLL
+        (SEND_CALL_LIMIT).  Python only sees results that passed the C-level
+        gate, so no additional frequency filtering is needed here.
         """
-        # --- frequency guard (before expensive score_candidate) ---
-        #
-        # We anchor on the *first* observed time for each VA and count every
-        # subsequent hit accumulating from that moment.  The window is never
-        # reset: if a VA fires >= _CULL_THRESHOLD times within the first
-        # _CULL_WINDOW_S seconds of observation it is a high-frequency helper
-        # and is culled.  Resetting the window on each timeout was the bug
-        # that let steady-rate functions (e.g. 29 hits / 3 s) slip through.
-        #
-        # Once _CULL_WINDOW_S has elapsed without hitting the threshold the
-        # VA is considered benign (slow-firing dialogue function) and is
-        # allowed through forever without further counting.
-        now = time.monotonic()
-        with self._lock:
-            if hook_va in self._culled_vas:
-                return
-            entry = self._va_rate.get(hook_va)
-            if entry is None:
-                # [first_seen, count]
-                self._va_rate[hook_va] = [now, 1]
-            else:
-                elapsed = now - entry[0]
-                if elapsed < _CULL_WINDOW_S:
-                    entry[1] += 1
-                    if entry[1] >= _CULL_THRESHOLD:
-                        self._culled_vas.add(hook_va)
-                        self._pending_culls.append(hook_va)  # queued for CMD_DISABLE
-                        log.debug(
-                            "VA 0x%x culled (%d hits in %.1fs)",
-                            hook_va, entry[1], elapsed,
-                        )
-                        return
-                # elapsed >= _CULL_WINDOW_S and not yet culled → benign, fall through
         s = score_candidate(text)
         if s <= 0:
             return

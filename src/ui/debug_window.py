@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QGroupBox,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
@@ -593,6 +593,7 @@ class DebugWindow(QMainWindow):
         self._search_timer.setInterval(500)
         self._search_timer.timeout.connect(self._refresh_candidates)
         self._last_cand_count: int = -1
+        self._last_diag_count: int = 0
 
         self._install_proc_handle: int | None = None
         self._install_timer = QTimer(self)
@@ -742,6 +743,11 @@ class DebugWindow(QMainWindow):
         self._lbl_search_status = QLabel("No active search — pick a window first.")
         self._lbl_search_status.setWordWrap(True)
         _cands_lay.addWidget(self._lbl_search_status)
+        self._cands_search = QLineEdit()
+        self._cands_search.setPlaceholderText("Filter by text content…")
+        self._cands_search.setClearButtonEnabled(True)
+        self._cands_search.textChanged.connect(self._apply_cands_filter)
+        _cands_lay.addWidget(self._cands_search)
         self._lst_candidates = QListWidget()
         self._lst_candidates.setFont(QFont("Consolas", 9))
         self._lst_candidates.itemDoubleClicked.connect(self._confirm_candidate)
@@ -1031,6 +1037,9 @@ class DebugWindow(QMainWindow):
                 "Scanning…  play the game — candidates appear as dialogue fires."
             )
             self._last_cand_count = -1
+            self._last_diag_count = 0
+            self._te_search_diag.clear()
+            self._lst_candidates.clear()
             self._search_timer.start()
         except HookSearchError as exc:
             self._lbl_search_status.setText(f"⚠ Search failed: {exc}")
@@ -1048,9 +1057,22 @@ class DebugWindow(QMainWindow):
         """Refresh the candidates list from the active HookSearcher (500 ms tick)."""
         if self._searcher is None:
             return
+        # Append only new diag lines (preserves scroll position)
         diags = self._searcher.diags()
-        if diags:
-            self._te_search_diag.setPlainText("\n".join(diags))
+        new_lines = diags[self._last_diag_count:]
+        if new_lines:
+            self._last_diag_count = len(diags)
+            sb = self._te_search_diag.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 4
+            cursor = self._te_search_diag.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self._te_search_diag.setTextCursor(cursor)
+            self._te_search_diag.insertPlainText(
+                ("\n" if self._te_search_diag.toPlainText() else "") +
+                "\n".join(new_lines)
+            )
+            if at_bottom:
+                sb.setValue(sb.maximum())
         if self._searcher.scan_complete:
             self._lbl_search_status.setText(
                 "Scan complete.  Play the game \u2014 candidates update automatically.  "
@@ -1067,14 +1089,27 @@ class DebugWindow(QMainWindow):
             else None
         )
         self._lst_candidates.clear()
+        filt = self._cands_search.text().lower()
         for c in visible:
             item = QListWidgetItem(c.display_label())
             item.setData(32, c.to_hook_code().to_str())
             self._lst_candidates.addItem(item)
+            if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
+                item.setHidden(True)
             if item.data(32) == cur_key:
                 self._lst_candidates.setCurrentItem(item)
-        if visible and self._lst_candidates.currentItem() is None:
+        if self._lst_candidates.count() > 0 and self._lst_candidates.currentItem() is None:
             self._lst_candidates.setCurrentRow(0)
+
+    def _apply_cands_filter(self) -> None:
+        """Re-apply text filter to existing list items without a full rebuild."""
+        filt = self._cands_search.text().lower()
+        for i in range(self._lst_candidates.count()):
+            item = self._lst_candidates.item(i)
+            if item is None:
+                continue
+            label = item.text().lower()
+            item.setHidden(bool(filt) and filt not in label)
 
     @Slot()
     def _confirm_candidate(self) -> None:

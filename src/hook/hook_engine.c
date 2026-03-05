@@ -16,7 +16,7 @@
 
 #define MODE_SEARCH   0
 #define MODE_HOOK     1
-#define MAX_HOOKS     10000
+#define MAX_HOOKS     200000  /* hard safety ceiling; 0 in config means scan all pdata */
 #define MAX_STR_LEN   400
 #define MIN_STR_LEN   2
 #define SEND_REG_LO   16
@@ -79,9 +79,10 @@ static volatile LONG g_sig_cache[SIG_CACHE_SIZE];
  * average across 60000 hooks, so collisions are rare.
  */
 #define CALL_RATE_SIZE   65521u
-#define SEND_CALL_LIMIT  150        /* raw calls before suppression  */
+#define SEND_CALL_LIMIT  150        /* raw calls before auto-disable        */
 #define SUPPRESSED       0x7FFFFFFF
 static volatile LONG g_call_rate[CALL_RATE_SIZE];
+static volatile LONG g_need_apply = 0; /* set in Send(), consumed in ring_drain() */
 
 /* ================================================================
  * pipe helpers (worker thread only -- no concurrency)
@@ -124,7 +125,26 @@ static void ring_push(uintptr_t va, int slot, int enc,
 
 static void ring_drain(void) {
     if (g_pipe==INVALID_HANDLE_VALUE) return;
-    for (int i=0;i<RING_SLOTS;i++) {
+    /* Apply any queued disables first (queued by Send() on game threads). */
+    if (g_trampolines &&
+        InterlockedCompareExchange(&g_need_apply, 0, 1) == 1) {
+        /* Re-protect trampoline buffer as RWX briefly so MinHook can patch
+         * the target prologues (it calls VirtualProtect internally on the
+         * target, but our buffer is EXECUTE_READ and must stay consistent). */
+        DWORD dummy;
+        VirtualProtect(g_trampolines,
+                       (size_t)g_mh * TRAMPOLINE_SIZE,
+                       PAGE_EXECUTE_READWRITE, &dummy);
+        MH_ApplyQueued();
+        VirtualProtect(g_trampolines,
+                       (size_t)g_mh * TRAMPOLINE_SIZE,
+                       PAGE_EXECUTE_READ, &dummy);
+    }
+    /* Cap iterations per call so the command-check loop stays responsive
+     * even when many hooks are firing.  Unflushed slots are picked up on
+     * the next call (next Sleep(10) tick). */
+    int limit = 256;
+    for (int i=0;i<RING_SLOTS && limit>0;i++) {
         RingSlot *s=&g_ring[i];
         if (s->state!=2) continue;
         if (InterlockedCompareExchange(&s->state,3,2)!=2) continue;
@@ -134,6 +154,7 @@ static void ring_drain(void) {
         DWORD wr=0;
         WriteFile(g_pipe,buf,(DWORD)(sizeof(ResultHdr)+s->hdr.text_len),&wr,NULL);
         _WriteBarrier(); s->state=0;
+        limit--;
     }
 }
 
@@ -163,11 +184,14 @@ void __cdecl Send(char **stack, uintptr_t address) {
     /* ---- 0. per-address call-rate gate ---- */
     {
         ULONG ci = (ULONG)((address * 2654435761ULL) % CALL_RATE_SIZE);
-        /* Fetch-then-increment: if already >= limit, bail out without
-         * incrementing (avoids wrapping past SUPPRESSED on busy slots). */
         LONG cur = g_call_rate[ci];
         if (cur >= SEND_CALL_LIMIT) return;
         LONG nxt = InterlockedIncrement(&g_call_rate[ci]);
+        if (nxt == SEND_CALL_LIMIT) {
+            /* First thread to hit the limit: queue disable on worker thread. */
+            MH_QueueDisableHook((LPVOID)(uintptr_t)address);
+            InterlockedExchange(&g_need_apply, 1);
+        }
         if (nxt >= SEND_CALL_LIMIT) return;
     }
 
@@ -455,11 +479,24 @@ static void do_search(const Config *cfg) {
             { g_ts_base=g_img_base+sec[i].VirtualAddress; g_ts_size=sec[i].Misc.VirtualSize; break; }
     if (!g_ts_base) { g_ts_base=g_img_base; g_ts_size=mi.SizeOfImage; }
 
-    /* Total hook capacity (pre-allocated once for all batches) */
-    g_mh = cfg->max_hooks ? cfg->max_hooks : MAX_HOOKS;
+    /* Load pdata early so g_pdata_count can drive capacity (must precede alloc) */
+    IMAGE_DATA_DIRECTORY *edir =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!edir->VirtualAddress || !edir->Size) {
+        pipe_write(0,0,1,"ERROR:no .pdata section",23);
+        log_phase("ERROR:no .pdata section");
+        MH_Uninitialize(); return;
+    }
+    g_pdata       = (RUNTIME_FUNCTION *)(g_img_base + edir->VirtualAddress);
+    g_pdata_count = edir->Size / sizeof(RUNTIME_FUNCTION);
+
+    /* Total hook capacity:
+     *   cfg->max_hooks == 0  → scan ALL pdata (up to hard ceiling MAX_HOOKS)
+     *   cfg->max_hooks >  0  → limit to that count                           */
+    g_mh = cfg->max_hooks ? cfg->max_hooks : g_pdata_count;
     if (g_mh > MAX_HOOKS) g_mh = MAX_HOOKS;
 
-    /* First-batch size (0 in config → use full capacity, i.e. scan all at once) */
+    /* First-batch size (0 in config → one big batch covering full capacity)  */
     DWORD first_batch = cfg->batch_size ? cfg->batch_size : g_mh;
     if (first_batch > g_mh) first_batch = g_mh;
 
@@ -486,24 +523,13 @@ static void do_search(const Config *cfg) {
     pipe_write(0,0,1,"phase:scan_start",16);
     log_phase("phase:scan_start");
     {
-        char gb_msg[80];
+        char gb_msg[96];
         _snprintf_s(gb_msg, sizeof(gb_msg), _TRUNCATE,
-            "game_base=0x%llX", (unsigned long long)g_img_base);
+            "game_base=0x%llX pdata_count=%lu cap=%lu",
+            (unsigned long long)g_img_base,
+            (unsigned long)g_pdata_count, (unsigned long)g_mh);
         log_phase(gb_msg);
     }
-
-    IMAGE_DATA_DIRECTORY *edir =
-        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-    if (!edir->VirtualAddress || !edir->Size) {
-        pipe_write(0,0,1,"ERROR:no .pdata section",23);
-        log_phase("ERROR:no .pdata section");
-        HeapFree(GetProcessHeap(),0,addrs);
-        VirtualFree(trampolines,0,MEM_RELEASE);
-        g_hook_addrs=NULL; g_trampolines=NULL;
-        MH_Uninitialize(); return;
-    }
-    g_pdata       = (RUNTIME_FUNCTION *)(g_img_base + edir->VirtualAddress);
-    g_pdata_count = edir->Size / sizeof(RUNTIME_FUNCTION);
 
     /* Pre-allocate unwind table for FULL capacity so incremental batches
      * only need update_seh_registration(new_count)                        */
