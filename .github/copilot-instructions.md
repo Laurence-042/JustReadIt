@@ -15,7 +15,7 @@ Mouse hover / Freeze hotkey
         → cache hit → show overlay
         → cache miss:
             → full-screen Windows OCR → range detection (src/ocr/range_detectors.py)
-            → Levenshtein cross-match with Frida hook output (src/correction.py)
+            → Levenshtein cross-match with DLL hook output (src/correction.py)
               → match success → use cleaned hook text
               → match failure → fall back to OCR text
             → translate (src/translators/) → cache → show overlay (src/overlay.py)
@@ -29,13 +29,13 @@ Mouse hover / Freeze hotkey
 | Screen capture | `src/capture.py` | DXGI Desktop Duplication via dxcam. Context-manager protocol. **Never** `BitBlt`/`PrintWindow` (black frames on DirectX) |
 | OCR engine | `src/ocr/windows_ocr.py` | `WindowsOcr` — sole OCR engine (no manga-ocr). Upscale-then-downscale for small fonts; PIL ↔ WinRT bitmap bridge |
 | Range detection | `src/ocr/range_detectors.py` | `RangeDetector` ABC + chain runner `run_detectors()`. Built-ins: `ParagraphDetector`, `TableRowDetector`, `SingleBoxDetector` |
-| Hook + cleaner | `src/hook/` | Frida-based text hook + `Cleaner` ABC rule chain. Built-ins: strip control chars, deduplicate, trim |
-| Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results (stub) |
-| Cache | `src/cache.py` | phash of translated-region screenshot as key (stub) |
+| Hook + cleaner | `src/hook/` | Native Win32 DLL injection (`hook_engine.dll` + `_win32.py`). `TextHook` context-manager; `Cleaner` ABC rule chain. Built-ins: `StripControlChars`, `DeduplicateLines`, `TrimWhitespace` |
+| Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results — **stub** (`# TODO: implement match_ocr_to_hook`) |
+| Cache | `src/cache.py` | phash of translated-region screenshot as key — **stub** (`# TODO: implement PhashCache`) |
 | Translation | `src/translators/` | `Translator` ABC in `base.py`. Planned: Cloud Translation API + OpenAI (with rolling summary agent) |
 | Config | `src/config.py` | `AppConfig` — typed wrapper over `QSettings`, INI at `%APPDATA%\JustReadIt\config.ini` |
 | Debug UI | `src/ui/` | PySide6 debug window + window picker. Launch: `main.py --debug` |
-| Overlay | `src/overlay.py` | Topmost transparent window, handles Freeze mode (stub) |
+| Overlay | `src/overlay.py` | Topmost transparent window, handles Freeze mode — **stub** (`# TODO: implement TranslationOverlay`) |
 
 ### Workflows
 
@@ -96,13 +96,21 @@ class Translator(ABC):
 
 Two planned built-ins: Cloud Translation API (short text) and OpenAI (dialogue/plot, with rolling summary agent + configurable system prompt).
 
-### GameTarget — immutable value object
+### Value objects — frozen dataclasses
 
-Frozen dataclass constructed only via `@classmethod` factories (`from_pid`, `from_name`), never directly. `refresh()` returns a new instance. Lazy DPI-awareness setup to avoid conflicts with Qt.
+- `GameTarget` (`src/target.py`) — `pid`, `hwnd`, `hmonitor`, `window_rect`, `capture_rect`, `dxcam_output_idx`, `process_name`. Constructed only via `from_pid(pid)` or `from_name(name)` classmethods. `refresh()` returns a new instance.
+- `Rect` (`src/target.py`) — `left, top, right, bottom: int`; properties `width`, `height`, `area`; `as_tuple()`.
+- `BoundingBox` (`src/ocr/range_detectors.py`) — `x, y, w, h: int`, `text: str = ""`; properties `right`, `bottom`, `center_x`, `center_y`; `contains(px, py)`, `distance_to_point(px, py)`.
+
+All are decorated `@dataclass(frozen=True)`. Lazy DPI-awareness (`_ensure_dpi_aware()`) to avoid conflicts with Qt.
 
 ### Win32 API: ctypes only (core modules)
 
-Use `ctypes.WinDLL` with `use_last_error=True`. Win32 structs as `ctypes.Structure`. Callbacks via `WINFUNCTYPE`. `DwmGetWindowAttribute` preferred over `GetWindowRect`. The **only** exception is `src/ui/window_picker.py` which uses pywin32 for brevity.
+Use `ctypes.WinDLL` with `use_last_error=True`. Win32 structs as `ctypes.Structure`. Callbacks via `WINFUNCTYPE`. `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS=9)` preferred over `GetWindowRect`. The **only** exception is `src/ui/window_picker.py` which uses pywin32 for brevity.
+
+### Native DLL text hook
+
+`TextHook` (`src/hook/text_hook.py`) injects `hook_engine.dll` via `src/hook/_win32.py` Win32 helpers (`inject_dll`, `get_module_base`, `create_pipe_server`). Hook target is a `HookCode` (from `src/hook/hook_search.py`) specifying `module` name + RVA. Background `threading.Thread` reads results from a Named Pipe. `frida` is a listed dependency but **not yet used** in the current implementation — reserved for future hook-search automation.
 
 ### Resource management
 
@@ -122,11 +130,13 @@ Key exceptions: `ProcessNotFoundError`, `WindowNotFoundError`, `AmbiguousProcess
 
 ### Configuration
 
-`AppConfig` wraps `QSettings` — each setting is a `@property` with getter/setter, coercion, and default. Fresh `QSettings` handle per access; `.sync()` after every write.
+`AppConfig` wraps `QSettings` (INI, `%APPDATA%\JustReadIt\config.ini`) — each setting is a `@property` with getter/setter, coercion, and default. Fresh `QSettings` handle per access via `_make_qsettings()`; `.sync()` after every write.
+
+Current settings: `ocr_language: str = "ja"`, `interval_ms: int = 1500`, `hook_code: str = ""`.
 
 ### Stubs
 
-Unimplemented modules (`cache.py`, `correction.py`, `overlay.py`) contain only a module docstring + TODO comment — no placeholder classes.
+Unimplemented modules (`cache.py`, `correction.py`, `overlay.py`) contain **only** a module docstring + one `# TODO` comment. Do not add placeholder classes or `pass`-only methods.
 
 ## Build & Test
 
@@ -135,6 +145,10 @@ Unimplemented modules (`cache.py`, `correction.py`, `overlay.py`) contain only a
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e ".[dev,ui]"
+
+# Build native hook DLL (requires MSVC / VS Build Tools — uses VS Code task or:
+powershell -File src/hook/build.ps1
+# Or run the "Build hook_engine.dll" VS Code build task (Ctrl+Shift+B)
 
 # Install Windows OCR Japanese language pack (admin, ~6 MB, no reboot)
 powershell -ExecutionPolicy Bypass -File scripts\install_ja_ocr.ps1
@@ -146,18 +160,21 @@ pytest tests/
 python main.py --debug
 ```
 
+`hook_engine.dll` must exist at `src/hook/hook_engine.dll` before using `TextHook`. The build also copies `MinHook.x64.dll` alongside it.
+
 ### Testing conventions
 
-- Framework: pytest (no unittest). Tests grouped into classes by feature.
-- Module-level `pytestmark = pytest.mark.skipif(...)` for hardware-dependent tests (GPU, display).
-- Custom skip decorators for live-process tests. Test factories build synthetic layouts (`_make_paragraph_boxes`, `_make_table_row`).
+- Framework: pytest (no unittest). Tests grouped into classes by feature; `setup_method(self)` for per-test setup.
+- Hardware-dependent tests are **not yet written** — they are skipped by omission. When added, use `pytestmark = pytest.mark.skipif(...)` at module level.
 - No mocking — tests run against real hardware or are skipped. Pure unit tests use synthetic data.
-- `pytest.approx()` for floats, `pytest.raises(match=...)` for errors.
+- Factory functions build synthetic layouts: `_make_paragraph_boxes(n_lines, n_words, ...)` in `test_ocr.py`.
+- `pytest.approx()` for float geometry; `pytest.raises(ExcType, match=r"...")` for error assertions.
+- White-box testing of internal helpers (e.g. `_group_into_lines`) is acceptable.
 
 ## Key Constraints
 
 - Screen capture **must** use DXGI Desktop Duplication API — never `BitBlt`/`PrintWindow`.
-- Hook implemented with **Frida** (not Textractor/LunaTranslator — both GPL-3.0).
+- Hook is native Win32 DLL injection (`hook_engine.dll`), **not** Textractor/LunaTranslator (both GPL-3.0). `frida` dependency is reserved for future hook-search automation.
 - License: **MPL-2.0** (file-level weak copyleft). Frida uses wxWindows Licence 3.1 — distributing binaries requires providing source or build toolchain.
 - Windows-only; Python ≥ 3.11.
 - OCR: Windows OCR only — no GPU dependency, no manga-ocr.
