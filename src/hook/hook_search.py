@@ -1,17 +1,18 @@
-"""Automatic hook-site discovery for JustReadIt.
+"""Hook-site discovery for JustReadIt.
 
-Attaches a broad-net Frida instrumentation script to the target process,
-intercepts candidate functions that pass CJK text through argument registers,
-and returns a ranked list of :class:`HookCandidate` instances.
+Injects ``hook_engine.dll`` into the target process, which bulk-hooks all
+function prologues in the game EXE using custom x64 trampolines.  Each
+trampoline scans the call-stack frame for CJK UTF-16LE strings.  Results are
+forwarded via Named Pipe and ranked by :func:`score_candidate`.
 
 Typical workflow
 ----------------
 1.  Create a :class:`HookSearcher` and call :meth:`~HookSearcher.start`.
-2.  Let the user play the game for ~30 s so text passes through the hooks.
+2.  Let the user play the game for ~30 s so dialogue functions fire.
 3.  Call :meth:`~HookSearcher.ranked_candidates` to get filtered, ranked hits.
-4.  Present the list to the user; they pick the best one.
+4.  Present the list to the user; they pick the best candidate.
 5.  Store it as a :class:`HookCode` in ``AppConfig.hook_code``.
-6.  Pass the :class:`HookCode` to :meth:`TextHook.attach` for future runs.
+6.  Pass the :class:`HookCode` to :class:`~src.hook.text_hook.TextHook`.
 """
 from __future__ import annotations
 
@@ -19,63 +20,31 @@ import logging
 import math
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import frida
-import frida.core
+from src.hook._win32 import (
+    InjectionError,
+    PipeError,
+    close_pipe,
+    connect_pipe,
+    create_pipe_server,
+    inject_dll,
+    pack_search_config,
+    read_pipe_exact,
+    unpack_result_hdr,
+    write_pipe,
+    _RESULT_HDR_SIZE,
+)
 
 log = logging.getLogger(__name__)
 
-_SEARCH_SCRIPT_JS: str = (Path(__file__).parent / "hook_search.js").read_text(
-    encoding="utf-8"
-)
+_DLL_PATH = Path(__file__).parent / "hook_engine.dll"
 
 # ---------------------------------------------------------------------------
 # HookCode — serialisable reference to a confirmed hook site
 # ---------------------------------------------------------------------------
-
-
-def _access_expr_to_js(pattern: str, read_fn: str) -> str:
-    """Translate an *access_pattern* string to a Frida JS read-expression.
-
-    Pattern syntax (mirrors what ``hook_search.js`` sends):
-
-    =========== =============================================
-    Pattern     Frida expression produced
-    =========== =============================================
-    ``r0``      ``args[0].readUtf16String(1024)``
-    ``*r1``     ``args[1].readPointer().readUtf16String(1024)``
-    ``r2+0x14`` ``args[2].add(0x14).readUtf16String(1024)``
-    ``*(r3+0x14)`` ``args[3].add(0x14).readPointer().readUtf16String(1024)``
-    ``*(s+0x28)`` ``this.context.rsp.add(0x28).readPointer().readUtf16String(1024)``
-    =========== =============================================
-    """
-    p = pattern.strip()
-    # Normalise "*(base+off)" → "*base+off" so the generic parser handles it.
-    if p.startswith("*(") and p.endswith(")"):
-        p = "*" + p[2:-1]
-
-    deref = p.startswith("*")
-    if deref:
-        p = p[1:]
-
-    base_part, _, offset_part = p.partition("+")
-
-    if base_part.startswith("r") and base_part[1:].isdigit():
-        expr = f"args[{int(base_part[1:])}]"
-    elif base_part == "s":
-        expr = "this.context.rsp"
-    else:
-        raise ValueError(f"Unrecognised base in access_pattern {pattern!r}: {base_part!r}")
-
-    if offset_part:
-        expr += f".add({offset_part})"
-    if deref:
-        expr += ".readPointer()"
-    expr += f".{read_fn}(1024)"
-    return expr
 
 
 @dataclass(frozen=True)
@@ -146,45 +115,41 @@ class HookCode:
         except Exception as exc:
             raise ValueError(f"Malformed HookCode string {s!r}: {exc}") from exc
 
-    def to_js(self) -> str:
-        """Generate a standalone Frida script that hooks this site only."""
-        read_fn = "readUtf16String" if self.encoding == "utf16" else "readUtf8String"
-        read_expr = _access_expr_to_js(self.access_pattern, read_fn)
-        return _ADDRESS_HOOK_TEMPLATE.format(
-            module=self.module,
-            rva=self.rva,
-            read_expr=read_expr,
-            encoding=self.encoding,
-            access_pattern=self.access_pattern,
-        )
+    def to_hook_config_fields(self) -> tuple[int, int, int, int]:
+        """Parse *access_pattern* into ``(arg_idx, deref, byte_offset, encoding_int)``.
 
+        Used to build the C DLL ``Config`` struct for ``MODE_HOOK``.
 
-# Frida script template used when a confirmed HookCode is already known.
-# Placeholders: {module}, {rva} (integer), {read_expr} (full JS read expression),
-# {encoding}, {access_pattern}.
-_ADDRESS_HOOK_TEMPLATE = """\
-'use strict';
-var _lastText = '';
-function _onText(str) {{
-    if (!str || str.length === 0) return;
-    var t = str.replace(/^\\s+|\\s+$/g, '');
-    if (t.length === 0) return;
-    if (t === _lastText) return;
-    _lastText = t;
-    send({{ type: 'text', value: t }});
-}}
-var _mod = Process.getModuleByName('{module}');
-var _addr = _mod.base.add({rva:d});
-Interceptor.attach(_addr, {{
-    onEnter: function(args) {{
-        try {{
-            var s = {read_expr};
-            if (s) _onText(s);
-        }} catch(e) {{}}
-    }}
-}});
-send({{ type: 'diag', value: 'address-hook attached: {module}+{rva:#x} {access_pattern} ({encoding})' }});
-"""
+        Supported patterns
+        ------------------
+        ``r0``           → (0, 0, 0, enc)
+        ``r2``           → (2, 0, 0, enc)
+        ``*(r0+0x14)``   → (0, 1, 0x14, enc)
+        ``*(r1)``        → (1, 1, 0, enc)
+        ``*(s+0x28)``    → (0xFF, 1, 0x28, enc)  stack-relative
+        """
+        enc_int = 0 if self.encoding == "utf16" else 1
+        p = self.access_pattern.strip()
+
+        # Normalise "*(base+off)" → "*base+off"
+        if p.startswith("*(") and p.endswith(")"):
+            p = "*" + p[2:-1]
+
+        deref = 1 if p.startswith("*") else 0
+        if deref:
+            p = p[1:]
+
+        base, _, offset_str = p.partition("+")
+        byte_offset = int(offset_str, 16) if offset_str else 0
+
+        if base == "s":
+            arg_idx = 0xFF
+        elif base.startswith("r") and base[1:].isdigit():
+            arg_idx = int(base[1:])
+        else:
+            arg_idx = 0
+
+        return (arg_idx, deref, byte_offset, enc_int)
 
 # ------------------------------------------------------------------
 # HookCandidate
@@ -316,18 +281,26 @@ class HookSearchError(RuntimeError):
 
 @dataclass
 class FoundString:
-    """A CJK string discovered in game process memory during Phase 1."""
-    address: str   # hex string as sent by JS
-    encoding: str  # 'utf16' or 'utf8'
+    """Kept for API compatibility; not populated in the DLL-based search."""
+    address: str
+    encoding: str
     text: str
 
 
 class HookSearcher:
-    """Hook-site discovery via Frida (auto-scan + read-monitor strategy).
+    """Hook-site discovery via native DLL injection (hook_engine.dll).
 
-    Phase 1 (starts immediately on :meth:`start`):
-        JS scans rw- memory for UTF-16LE CJK strings.  Results are
-        available via :attr:`found_strings` once :attr:`scan_complete`.
+    Workflow
+    --------
+    1. :meth:`start` injects ``hook_engine.dll`` into the game and starts
+       the bulk prologue scanner.  All threads in the game are briefly
+       suspended while the patches are written.
+    2. As the game runs, hooked functions fire.  Any call-stack slot that
+       contains a valid CJK UTF-16LE pointer is reported back via a Named
+       Pipe and accumulated as a :class:`HookCandidate`.
+    3. Call :meth:`ranked_candidates` to get the current list sorted by
+       score.  The user picks the best candidate and confirms.
+    4. :meth:`stop` unloads the DLL (which restores all patches).
 
     Phase 2 (triggered by calling :meth:`watch`):
         ``MemoryAccessMonitor`` is armed on the selected addresses.
@@ -347,10 +320,8 @@ class HookSearcher:
 
         searcher = HookSearcher(pid=12345)
         searcher.start()
-        searcher.wait_for_scan()
-        # show searcher.found_strings to user, they pick
-        searcher.watch([s.address for s in selected])
-        # render loop fires -> candidates arrive
+        timeot = searcher.wait_for_scan()  # waits for bulk patch to complete
+        # play the game ~30 s …
         candidates = searcher.ranked_candidates()
         searcher.stop()
     """
@@ -360,70 +331,64 @@ class HookSearcher:
         pid: int,
         *,
         max_candidates: int = 50,
-        max_strings: int = 200,
+        max_hooks: int = 60_000,
     ) -> None:
-        self._pid         = pid
-        self._max_c       = max_candidates
-        self._max_strings = max_strings
-        self._session: frida.core.Session | None = None
-        self._script: frida.core.Script | None   = None
+        self._pid        = pid
+        self._max_c      = max_candidates
+        self._max_hooks  = max_hooks
 
+        self._h_pipe: int = 0
+        self._stop       = threading.Event()
         self._candidates: dict[str, HookCandidate] = {}
-        self._diags: list[str] = []
-        self._found_strings: list[FoundString] = []
-        self._scan_done = threading.Event()
-        self._lock = threading.Lock()
+        self._diags:      list[str]                = []
+        self._scan_done  = threading.Event()
+        self._lock       = threading.Lock()
+        self._reader:     threading.Thread | None  = None
 
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Attach Frida and load the search script.
+        """Create Named Pipe, inject hook_engine.dll, begin scanning.
 
         Raises
         ------
         HookSearchError
-            On Frida attach / script load failure.
+            If the DLL is missing, injection fails, or the pipe fails.
         """
         try:
-            self._session = frida.attach(self._pid)
-        except Exception as exc:
-            raise HookSearchError(
-                f"Could not attach Frida to PID {self._pid}: {exc}"
-            ) from exc
+            self._h_pipe = create_pipe_server(self._pid)
+        except OSError as exc:
+            raise HookSearchError(f"Named Pipe creation failed: {exc}") from exc
 
-        # Inject config variables before the scan script body
-        config_prefix = (
-            f"var config = {{"
-            f"  maxCandidates: {self._max_c},"
-            f"  maxStrings: {self._max_strings}"
-            f"}};"
-        )
         try:
-            self._script = self._session.create_script(
-                config_prefix + _SEARCH_SCRIPT_JS
-            )
-            self._script.on("message", self._on_message)
-            self._script.load()
-        except Exception as exc:
-            self._detach_silently()
-            raise HookSearchError(
-                f"Failed to load hook-search script: {exc}"
-            ) from exc
+            inject_dll(self._pid, _DLL_PATH)
+        except InjectionError as exc:
+            close_pipe(self._h_pipe)
+            self._h_pipe = 0
+            raise HookSearchError(str(exc)) from exc
 
+        self._reader = threading.Thread(
+            target=self._reader_loop, name="hook-search-reader", daemon=True
+        )
+        self._reader.start()
         log.info("HookSearcher started for PID %d", self._pid)
 
     def stop(self) -> None:
-        """Detach Frida.  Safe to call multiple times."""
-        self._detach_silently()
+        """Close the pipe and stop the reader thread.  Safe to call many times."""
+        self._stop.set()
+        if self._h_pipe:
+            try:
+                close_pipe(self._h_pipe)
+            except Exception:
+                pass
+            self._h_pipe = 0
         log.info("HookSearcher stopped")
 
-    def wait_for_scan(self, timeout: float = 10.0) -> bool:
-        """Block until the initial code scan completes (or *timeout* seconds).
-
-        Returns ``True`` if scan completed within the timeout.
-        """
+    def wait_for_scan(self, timeout: float = 30.0) -> bool:
+        """Block until the bulk-patch phase completes (or *timeout* seconds)."""
         return self._scan_done.wait(timeout)
 
     # ------------------------------------------------------------------
@@ -431,18 +396,11 @@ class HookSearcher:
     # ------------------------------------------------------------------
 
     def ranked_candidates(self) -> list[HookCandidate]:
-        """Return candidates sorted best-first.
-
-        The list is a snapshot; call again after more game interaction for
-        updated scores.
-        """
+        """Return candidates sorted best-first (snapshot)."""
         with self._lock:
             candidates = list(self._candidates.values())
-
-        # Re-score with hit_count bonus then sort
         for c in candidates:
             c.score = score_candidate(c.text) * (1.0 + 0.1 * c.hit_count)
-
         return sorted(candidates, key=lambda c: -c.score)
 
     def diags(self) -> list[str]:
@@ -452,115 +410,204 @@ class HookSearcher:
 
     @property
     def scan_complete(self) -> bool:
-        """``True`` once the Phase 1 memory scan has finished."""
+        """``True`` once the DLL has finished installing all patches."""
         return self._scan_done.is_set()
 
     @property
     def found_strings(self) -> list[FoundString]:
-        """CJK strings found in process memory during Phase 1."""
-        with self._lock:
-            return list(self._found_strings)
+        """Not used in DLL-based search; always returns empty list."""
+        return []
 
-    def watch(self, addresses: list[str]) -> None:
-        """Start Phase 2: arm MemoryAccessMonitor on *addresses*.
-
-        Parameters
-        ----------
-        addresses:
-            Hex-string addresses as returned by :attr:`found_strings`.
-            Pass the ones whose text is currently on screen.
-        """
-        if self._script is None:
-            raise HookSearchError("Cannot watch: script not loaded.")
-        self._script.post({"type": "watch", "addresses": addresses})
-        log.info("Posted watch for %d address(es)", len(addresses))
+    def watch(self, addresses: list[str]) -> None:  # noqa: ARG002
+        """No-op: watch phase not applicable with bulk-hook search."""
 
     # ------------------------------------------------------------------
-    # Frida callbacks
+    # Pipe reader loop (background thread)
     # ------------------------------------------------------------------
 
-    def _on_message(self, message: dict[str, Any], _data: Any) -> None:
-        if message.get("type") != "send":
-            if message.get("type") == "error":
-                log.warning("Frida search error: %s", message.get("description", ""))
-            return
-
-        payload = message.get("payload") or {}
-        kind = payload.get("type")
-
-        if kind == "candidate":
-            self._handle_candidate(payload)
-        elif kind == "diag":
-            value = payload.get("value", "")
-            with self._lock:
-                self._diags.append(value)
-            log.debug("Search diag: %s", value)
-        elif kind == "string_found":
-            addr = str(payload.get("address", ""))
-            enc  = str(payload.get("encoding", "utf16"))
-            text = str(payload.get("text", ""))
-            with self._lock:
-                self._found_strings.append(FoundString(addr, enc, text))
-            log.debug("String found at %s: %.30r", addr, text)
-        elif kind == "scan_done":
-            count = int(payload.get("count", 0))
-            with self._lock:
-                self._diags.append(f"Scan complete — {count} CJK string(s) found")
-            self._scan_done.set()
-            log.info("Phase 1 scan complete: %d strings", count)
-
-    def _handle_candidate(self, payload: dict[str, Any]) -> None:
-        module   = str(payload.get("module", ""))
-        rva_str  = str(payload.get("rva", "0x0"))
-        pattern  = str(payload.get("pattern", "r0"))
-        encoding = str(payload.get("encoding", "utf16"))
-        text     = str(payload.get("text", ""))
-
-        if not text:
-            return
-
+    def _reader_loop(self) -> None:
+        """Connect pipe, send config, then read result messages until closed."""
         try:
-            rva = int(rva_str, 16)
-        except ValueError:
+            connect_pipe(self._h_pipe)
+        except (PipeError, OSError) as exc:
+            with self._lock:
+                self._diags.append(f"Pipe connect failed: {exc}")
+            log.error("HookSearcher pipe connect failed: %s", exc)
             return
 
+        # Send search config to DLL
+        try:
+            write_pipe(self._h_pipe, pack_search_config(self._max_hooks))
+        except (PipeError, OSError) as exc:
+            with self._lock:
+                self._diags.append(f"Config write failed: {exc}")
+            return
+
+        # Read result messages until pipe closes or stop is signalled
+        while not self._stop.is_set():
+            hdr_bytes = read_pipe_exact(self._h_pipe, _RESULT_HDR_SIZE)
+            if hdr_bytes is None:
+                break
+
+            hook_va, slot_i, encoding, text_len = unpack_result_hdr(hdr_bytes)
+
+            if text_len == 0:
+                continue
+            text_bytes = read_pipe_exact(self._h_pipe, text_len)
+            if text_bytes is None:
+                break
+
+            try:
+                text = (
+                    text_bytes.decode("utf-16-le", errors="ignore")
+                    if encoding == 0
+                    else text_bytes.decode("utf-8", errors="ignore")
+                )
+            except Exception:
+                continue
+
+            # hook_va == 0 → control message (not a text hit)
+            if hook_va == 0:
+                self._handle_control(text)
+                continue
+
+            self._handle_hit(hook_va, slot_i, encoding, text)
+
+        log.debug("HookSearcher reader loop exiting")
+
+    def _handle_control(self, text: str) -> None:
+        if text.startswith("scan_done:"):
+            try:
+                count = int(text.split(":", 1)[1])
+            except ValueError:
+                count = 0
+            with self._lock:
+                self._diags.append(f"Bulk patch complete — {count} function(s) hooked")
+            self._scan_done.set()
+            log.info("HookSearcher scan done: %d hooks installed", count)
+        elif text.startswith("ERROR:"):
+            with self._lock:
+                self._diags.append(text)
+            log.error("DLL error: %s", text)
+        else:
+            with self._lock:
+                self._diags.append(text)
+
+    def _handle_hit(self, hook_va: int, slot_i: int,
+                     encoding: int, text: str) -> None:
+        """Build / update a HookCandidate from a single pipe result."""
         s = score_candidate(text)
         if s <= 0:
-            return  # pre-filter low-quality hits
+            return
+
+        # Determine access_pattern label from slot index:
+        #   slot_i < 0 → saved register copy (arg = slot_i + 4)  e.g. slot -4 = arg0
+        #   slot_i >= 0 → return addr (0) or caller stack slot
+        if -4 <= slot_i < 0:
+            arg_idx = slot_i + 4         # -4→0, -3→1, -2→2, -1→3
+            pattern = f"r{arg_idx}"
+        elif slot_i < -4:
+            pattern = "rax"              # saved rax, rarely useful
+        else:
+            pattern = f"s+{slot_i * 8:#x}"
+
+        enc_str = "utf16" if encoding == 0 else "utf8"
+
+        # Module / RVA: we don't know the module from the VA alone in Python.
+        # Use the VA directly; the module field is filled as best-effort.
+        module = _resolve_module(hook_va, self._pid)
+        if module is None:
+            return  # not in any known module
+        base, name = module
+        rva = hook_va - base
 
         key = f"{rva:#x}:{pattern}"
         with self._lock:
             if key in self._candidates:
                 c = self._candidates[key]
                 c.hit_count += 1
-                # Keep the longest representative text seen at this site
                 if len(text) > len(c.text):
                     c.text = text
             else:
                 self._candidates[key] = HookCandidate(
-                    module=module,
+                    module=name,
                     rva=rva,
                     access_pattern=pattern,
-                    encoding=encoding,
+                    encoding=enc_str,
                     text=text,
                     hit_count=1,
                     score=s,
                 )
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
 
-    def _detach_silently(self) -> None:
-        if self._script is not None:
-            try:
-                self._script.unload()
-            except Exception:
-                pass
-            self._script = None
-        if self._session is not None:
-            try:
-                self._session.detach()
-            except Exception:
-                pass
-            self._session = None
+# ---------------------------------------------------------------------------
+# Module resolver (VA → module name + base)
+# ---------------------------------------------------------------------------
+
+import ctypes as _ctypes
+import ctypes.wintypes as _wt
+
+_psapi = _ctypes.WinDLL("psapi", use_last_error=True)
+_psapi.EnumProcessModules.restype  = _wt.BOOL
+_psapi.EnumProcessModules.argtypes = [_wt.HANDLE, _ctypes.POINTER(_wt.HMODULE),
+                                       _wt.DWORD, _ctypes.POINTER(_wt.DWORD)]
+_psapi.GetModuleFileNameExW.restype  = _wt.DWORD
+_psapi.GetModuleFileNameExW.argtypes = [_wt.HANDLE, _wt.HMODULE, _wt.LPWSTR, _wt.DWORD]
+
+_k32p = _ctypes.WinDLL("kernel32", use_last_error=True)
+_k32p.OpenProcess.restype  = _wt.HANDLE
+_k32p.OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+_k32p.CloseHandle.restype  = _wt.BOOL
+_k32p.CloseHandle.argtypes = [_wt.HANDLE]
+
+_PROCESS_QUERY_INFORMATION = 0x0400
+_PROCESS_VM_READ           = 0x0010
+# pid → [(base, end_exclusive, name), ...]  sorted by base
+_module_cache: dict[int, list[tuple[int, int, str]]] = {}
+
+
+def _resolve_module(va: int, pid: int) -> tuple[int, str] | None:
+    """Return ``(base, module_name)`` for a VA in the given process.
+
+    Results are cached per PID.  Returns ``None`` if the VA is not inside
+    any loaded module.
+    """
+    if pid not in _module_cache:
+        entries: list[tuple[int, int, str]] = []
+        h = _k32p.OpenProcess(_PROCESS_QUERY_INFORMATION | _PROCESS_VM_READ,
+                               False, pid)
+        if not h:
+            _module_cache[pid] = entries
+            return None
+        try:
+            needed = _wt.DWORD(0)
+            _psapi.EnumProcessModules(h, None, 0, _ctypes.byref(needed))
+            count = needed.value // _ctypes.sizeof(_wt.HMODULE)
+            mods  = (_wt.HMODULE * count)()
+            _psapi.EnumProcessModules(h, mods, needed, _ctypes.byref(needed))
+
+            class _MI(_ctypes.Structure):
+                _fields_ = [("lpBaseOfDll", _ctypes.c_void_p),
+                            ("SizeOfImage",  _wt.DWORD),
+                            ("EntryPoint",   _ctypes.c_void_p)]
+
+            _psapi2 = _ctypes.WinDLL("psapi")
+            buf = _ctypes.create_unicode_buffer(260)
+            for mod in mods:
+                mi = _MI()
+                if _psapi2.GetModuleInformation(h, mod, _ctypes.byref(mi),
+                                                _ctypes.sizeof(mi)):
+                    base = mi.lpBaseOfDll or 0
+                    end  = base + mi.SizeOfImage  # exclusive upper bound
+                    _psapi.GetModuleFileNameExW(h, mod, buf, 260)
+                    name = Path(buf.value).name
+                    entries.append((base, end, name))
+        finally:
+            _k32p.CloseHandle(h)
+        entries.sort()  # sort by base for determinism
+        _module_cache[pid] = entries
+
+    for base, end, name in _module_cache[pid]:
+        if base <= va < end:
+            return (base, name)
+    return None

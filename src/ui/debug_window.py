@@ -389,79 +389,58 @@ def _make_panel(title: str) -> tuple[QGroupBox, QTextEdit]:
 # ---------------------------------------------------------------------------
 
 class _HookSearchDialog(QDialog):
-    """Three-phase dialog for discovering engine-specific hook sites.
+    """Two-phase dialog for discovering engine-specific hook sites.
 
-    Phase 1 -- Auto scan  (starts immediately)
-        Frida scans rw- memory for UTF-16LE CJK strings and populates the
-        top list.  No user input required.
+    Phase 1 -- DLL injection + bulk patch  (starts immediately)
+        ``hook_engine.dll`` is injected into the game, functions are scanned
+        for prologues and patched.  The status label shows progress; the
+        progress bar becomes determinate once patching is complete.
 
-    Phase 2 -- String selection
-        The user sees all CJK strings found in memory.  They select the
-        ones that match what is currently on screen, then click "Watch".
-
-    Phase 3 -- Candidate collection  (automatic)
-        MemoryAccessMonitor fires on the next render-loop read (within one
-        frame).  The enclosing function is identified and its argument
-        access pattern is reported in the bottom list.
-        The user selects the best candidate and clicks OK.
+    Phase 2 -- Candidate collection  (automatic, while user plays the game)
+        Each time the game calls a patched function with a CJK string on its
+        call stack, a candidate appears in the list.  The user simply plays
+        the game for ~30 s, then selects the best candidate and clicks OK.
     """
 
     def __init__(self, target: "GameTarget", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Search Hook Sites")
-        self.resize(860, 640)
+        self.resize(860, 540)
 
         self._target = target
         self._searcher: HookSearcher | None = None
         self.selected_code: HookCode | None = None
-        self._last_str_count = -1
         self._last_cand_count = -1
 
         # ── Layout ──────────────────────────────────────────────────
         root = QVBoxLayout(self)
 
-        # Status label
-        self._lbl_status = QLabel("Scanning game memory for Japanese text…")
+        self._lbl_status = QLabel(
+            "Injecting hook DLL and scanning function prologues…"
+        )
         self._lbl_status.setWordWrap(True)
         root.addWidget(self._lbl_status)
 
-        # Indeterminate progress bar
         self._prog = QProgressBar()
-        self._prog.setRange(0, 0)
+        self._prog.setRange(0, 0)   # indeterminate spinner
         self._prog.setFixedHeight(14)
         root.addWidget(self._prog)
 
-        # ── Top: strings found in memory ───────────────────────────
-        root.addWidget(QLabel("Strings found in memory — select those currently on screen:"))
-        self._lst_strs = QListWidget()
-        self._lst_strs.setFont(QFont("MS Gothic", 9))
-        self._lst_strs.setSelectionMode(
-            QListWidget.SelectionMode.ExtendedSelection
-        )
-        self._lst_strs.setFixedHeight(180)
-        root.addWidget(self._lst_strs)
-
-        self._btn_watch = QPushButton("Watch Selected →")
-        self._btn_watch.setEnabled(False)
-        self._btn_watch.clicked.connect(self._on_watch_clicked)
-        root.addWidget(self._btn_watch)
-
-        # ── Bottom: hook candidates ─────────────────────────────────
-        root.addWidget(QLabel("Hook candidates (appear after Watch):"))
+        root.addWidget(QLabel(
+            "Hook candidates  (play the game — candidates appear automatically):"
+        ))
         self._lst = QListWidget()
         self._lst.setFont(QFont("Consolas", 9))
         self._lst.itemDoubleClicked.connect(self._accept_selection)
         root.addWidget(self._lst, 1)
 
-        # Diag
         self._te_diag = QTextEdit()
         self._te_diag.setReadOnly(True)
         self._te_diag.setFont(QFont("Consolas", 8))
         self._te_diag.setFixedHeight(80)
-        self._te_diag.setPlaceholderText("Frida diagnostic output…")
+        self._te_diag.setPlaceholderText("DLL diagnostic output…")
         root.addWidget(self._te_diag)
 
-        # Buttons
         self._btn_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -472,7 +451,6 @@ class _HookSearchDialog(QDialog):
         self._btn_ok.setEnabled(False)
         root.addWidget(self._btn_box)
 
-        # ── Refresh timer ──────────────────────────────────────────
         self._timer = QTimer(self)
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._refresh)
@@ -499,34 +477,26 @@ class _HookSearchDialog(QDialog):
         if diags:
             self._te_diag.setPlainText("\n".join(diags))
 
-        # Phase 1 → Phase 2 transition: scan complete
+        # Patching done → stop spinner
         if self._searcher.scan_complete and self._prog.maximum() == 0:
             self._prog.setRange(0, 1)
             self._prog.setValue(1)
+            self._lbl_status.setText(
+                "DLL patching complete.  "
+                "Play the game — candidates appear as dialogue functions fire.  "
+                "Select the best one and click OK."
+            )
 
-        # Populate strings list (Phase 1 results)
-        strings = self._searcher.found_strings
-        if len(strings) != self._last_str_count:
-            self._last_str_count = len(strings)
-            self._lst_strs.clear()
-            for fs in strings:
-                preview = fs.text[:80].replace("\n", " ")
-                item = QListWidgetItem(preview)
-                item.setData(32, fs.address)
-                self._lst_strs.addItem(item)
-            if strings:
-                self._btn_watch.setEnabled(True)
-                self._lbl_status.setText(
-                    f"Found {len(strings)} string(s).  "
-                    "Select those currently shown in-game, then click \"Watch Selected\"."
-                )
-
-        # Populate candidates list (Phase 3 results)
+        # Populate / refresh candidate list
         candidates = self._searcher.ranked_candidates()
         visible = [c for c in candidates if c.score > 0]
         if len(visible) != self._last_cand_count:
             self._last_cand_count = len(visible)
-            cur_key = self._lst.currentItem().data(32) if self._lst.currentItem() else None
+            cur_key = (
+                self._lst.currentItem().data(32)
+                if self._lst.currentItem()
+                else None
+            )
             self._lst.clear()
             for c in visible:
                 item = QListWidgetItem(c.display_label())
@@ -537,26 +507,6 @@ class _HookSearchDialog(QDialog):
             if visible and self._lst.currentItem() is None:
                 self._lst.setCurrentRow(0)
             self._btn_ok.setEnabled(bool(visible))
-
-    def _on_watch_clicked(self) -> None:
-        if self._searcher is None:
-            return
-        selected = self._lst_strs.selectedItems()
-        if not selected:
-            # If nothing explicitly selected, watch all
-            selected = [self._lst_strs.item(i) for i in range(self._lst_strs.count())]
-        addresses = [item.data(32) for item in selected if item.data(32)]
-        try:
-            self._searcher.watch(addresses)
-        except HookSearchError as exc:
-            self._lbl_status.setText(f"⚠ Watch failed: {exc}")
-            return
-        self._btn_watch.setEnabled(False)
-        self._lbl_status.setText(
-            f"Watching {len(addresses)} address(es).  "
-            "The render loop will trigger candidates automatically — "
-            "select the best one below and click OK."
-        )
 
     def _accept_selection(self) -> None:
         item = self._lst.currentItem()
@@ -583,6 +533,9 @@ class _HookSearchDialog(QDialog):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._cleanup()
         super().closeEvent(event)
+
+
+
 
 
 # ---------------------------------------------------------------------------

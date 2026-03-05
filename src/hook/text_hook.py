@@ -1,58 +1,49 @@
-"""Frida-based text hook for Light.VN games.
+"""Native DLL-based text hook for Light.VN games.
 
-Attaches to the target process via Frida and intercepts Win32 text output
-functions to capture rendered text strings.  Captured text is stored in
-per-region sets for later cross-matching with OCR results.
-
-Hooked functions (resolved at runtime from the target process):
-
-    gdi32 : TextOutW, ExtTextOutW
-    user32: DrawTextW, DrawTextExW
-    dwrite: IDWriteFactory::CreateTextLayout
-
-The Frida instrumentation script is kept in the sibling file
-``hook_script.js`` and loaded at import time.  Edit that file to change
-hook targets without touching Python code.
-
-The script communicates with the Python side via Frida's
-``send()`` / ``on('message', …)`` mechanism.
+Injects ``hook_engine.dll`` into the target process and uses MinHook to
+install a single hook at the address stored in :class:`~src.hook.hook_search.HookCode`.
+Captured text is forwarded via Named Pipe and stored in :attr:`TextHook.texts`.
 
 Usage::
 
-    from src.hook.text_hook import TextHook
-
-    hook = TextHook(pid=12345)
-    hook.attach()
-    # … game renders text …
-    print(hook.texts)   # ['こんにちは', '選択肢1', …]
-    hook.detach()
-
-Or as a context manager::
-
-    with TextHook(pid=12345) as hook:
+    code = HookCode.from_str(config.hook_code)
+    with TextHook(pid=12345, hook_code=code) as hook:
         ...
         print(hook.texts)
 
 Thread safety
 -------------
-:attr:`texts` and :meth:`clear` are guarded by a :class:`threading.Lock`.
-Frida's message callback fires on an internal Frida thread, so the lock is
-necessary.
+:attr:`texts` and :meth:`clear` are guarded by :class:`threading.Lock`.
+The Named Pipe reader fires on an internal thread.
 """
 from __future__ import annotations
 
 import logging
 import threading
-from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
-import frida
-import frida.core
+from src.hook._win32 import (
+    InjectionError,
+    PipeError,
+    _RESULT_HDR_SIZE,
+    close_pipe,
+    connect_pipe,
+    create_pipe_server,
+    get_module_base,
+    inject_dll,
+    pack_hook_config,
+    read_pipe_exact,
+    unpack_result_hdr,
+)
+from pathlib import Path
 
 if TYPE_CHECKING:
     from src.hook.hook_search import HookCode
 
 log = logging.getLogger(__name__)
+
+_DLL_PATH = Path(__file__).parent / "hook_engine.dll"
+_MAX_TEXTS = 4096
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -60,52 +51,32 @@ log = logging.getLogger(__name__)
 
 
 class HookAttachError(RuntimeError):
-    """Raised when Frida cannot attach to the target process."""
+    """Raised when the hook DLL cannot be injected or the hook cannot be set."""
 
 
 class HookScriptError(RuntimeError):
-    """Raised when the Frida instrumentation script fails to load."""
+    """Kept for API compatibility; not raised by the native implementation."""
 
 
 # ---------------------------------------------------------------------------
-# Frida JavaScript instrumentation  (loaded from sibling hook_script.js)
+# TextHook
 # ---------------------------------------------------------------------------
-
-_HOOK_SCRIPT_JS: str = (Path(__file__).parent / "hook_script.js").read_text(encoding="utf-8")
-
-
-def _load_diag_script() -> str:
-    """Lazy-load the diagnostic Frida script (avoids import-time crash if missing)."""
-    return (Path(__file__).parent / "diag_script.js").read_text(encoding="utf-8")
-
-# ---------------------------------------------------------------------------
-# Python-side hook manager
-# ---------------------------------------------------------------------------
-
-# Maximum number of texts to keep before oldest entries are dropped.
-_MAX_TEXTS = 4096
 
 
 class TextHook:
-    """Frida-based text hook that captures text output.
+    """Native text hook via ``hook_engine.dll`` + MinHook.
 
     Parameters
     ----------
     pid:
-        Target process ID (usually ``GameTarget.pid``).
+        Target process ID (``GameTarget.pid``).
     diagnostic:
-        When ``True`` loads ``diag_script.js`` instead of the normal hook
-        script.  The diagnostic script enumerates all modules, scans for
-        font/text-related exports, and hooks glyph rendering APIs.
+        Accepted for API compatibility; has no effect in the native
+        implementation.
     hook_code:
-        When provided, use a targeted single-address hook generated from
-        :class:`~src.hook.hook_search.HookCode` instead of the generic
-        Win32 API hooks.  Takes precedence over ``diagnostic``.
-
-    Attributes
-    ----------
-    texts : list[str]
-        Snapshot of captured text strings (newest last).  Thread-safe.
+        A :class:`~src.hook.hook_search.HookCode` previously discovered by
+        :class:`~src.hook.hook_search.HookSearcher`.  Required — attach will
+        raise :exc:`HookAttachError` if this is ``None``.
     """
 
     def __init__(
@@ -115,14 +86,17 @@ class TextHook:
         diagnostic: bool = False,
         hook_code: "HookCode | None" = None,
     ) -> None:
-        self._pid = pid
+        self._pid        = pid
         self._diagnostic = diagnostic
-        self._hook_code = hook_code
-        self._session: frida.core.Session | None = None
-        self._script: frida.core.Script | None = None
-        self._texts: list[str] = []
-        self._diags: list[str] = []
-        self._lock = threading.Lock()
+        self._hook_code  = hook_code
+
+        self._h_pipe: int            = 0
+        self._stop       = threading.Event()
+        self._reader:    threading.Thread | None = None
+
+        self._texts:  list[str] = []
+        self._diags:  list[str] = []
+        self._lock    = threading.Lock()
 
     # ------------------------------------------------------------------
     # Context-manager protocol
@@ -140,149 +114,175 @@ class TextHook:
     # ------------------------------------------------------------------
 
     def attach(self) -> None:
-        """Attach Frida to the target process and install text hooks.
+        """Inject the hook DLL and start capturing text.
 
         Raises
         ------
         HookAttachError
-            If Frida cannot attach (process not found, insufficient
-            privileges, etc.).
-        HookScriptError
-            If the JavaScript instrumentation script fails to load.
+            If *hook_code* is ``None``, the DLL is missing, or injection fails.
         """
-        if self._session is not None:
+        if self._h_pipe:
             return  # already attached
 
-        try:
-            self._session = frida.attach(self._pid)
-        except frida.ProcessNotFoundError:
+        if self._hook_code is None:
             raise HookAttachError(
-                f"Frida could not attach: no process with PID {self._pid}. "
+                "TextHook requires a confirmed HookCode.  "
+                "Run the hook search first to discover one."
+            )
+
+        # Resolve absolute VA from module + RVA
+        hook_va = self._resolve_va()
+        if hook_va is None:
+            raise HookAttachError(
+                f"Module '{self._hook_code.module}' not found in PID {self._pid}.  "
                 "Make sure the game is running."
-            ) from None
-        except frida.PermissionDeniedError:
-            raise HookAttachError(
-                f"Frida could not attach to PID {self._pid}: permission denied. "
-                "Try running as Administrator."
-            ) from None
-        except Exception as exc:
-            raise HookAttachError(
-                f"Frida could not attach to PID {self._pid}: {exc}"
-            ) from exc
+            )
 
-        self._session.on("detached", self._on_session_detached)
-
-        if self._hook_code is not None:
-            js = self._hook_code.to_js()
-        elif self._diagnostic:
-            js = _load_diag_script()
-        else:
-            js = _HOOK_SCRIPT_JS
         try:
-            self._script = self._session.create_script(js)
-            self._script.on("message", self._on_message)
-            self._script.load()
-        except Exception as exc:
-            # Clean up the session if script loading fails.
-            try:
-                self._session.detach()
-            except Exception:
-                pass
-            self._session = None
-            self._script = None
-            raise HookScriptError(
-                f"Failed to load hook script in PID {self._pid}: {exc}"
-            ) from exc
+            self._h_pipe = create_pipe_server(self._pid)
+        except OSError as exc:
+            raise HookAttachError(f"Named Pipe creation failed: {exc}") from exc
 
-        log.info("TextHook attached to PID %d", self._pid)
+        try:
+            inject_dll(self._pid, _DLL_PATH)
+        except InjectionError as exc:
+            close_pipe(self._h_pipe)
+            self._h_pipe = 0
+            raise HookAttachError(str(exc)) from exc
+
+        arg_idx, deref, byte_offset, enc_int = self._hook_code.to_hook_config_fields()
+
+        self._stop.clear()
+        self._reader = threading.Thread(
+            target=self._reader_loop,
+            args=(hook_va, arg_idx, deref, byte_offset, enc_int),
+            name="text-hook-reader",
+            daemon=True,
+        )
+        self._reader.start()
+        log.info("TextHook attached: %s  VA=%#x", self._hook_code.to_str(), hook_va)
 
     def detach(self) -> None:
-        """Detach Frida from the target process.
-
-        Safe to call multiple times or when not attached.
-        """
-        if self._script is not None:
+        """Detach the hook DLL.  Safe to call multiple times."""
+        self._stop.set()
+        if self._h_pipe:
             try:
-                self._script.unload()
+                close_pipe(self._h_pipe)
             except Exception:
                 pass
-            self._script = None
-
-        if self._session is not None:
-            try:
-                self._session.detach()
-            except Exception:
-                pass
-            self._session = None
-
+            self._h_pipe = 0
         log.info("TextHook detached from PID %d", self._pid)
 
     @property
     def attached(self) -> bool:
-        """``True`` if the Frida session is active."""
-        return self._session is not None
+        """``True`` if the hook is currently active."""
+        return bool(self._h_pipe)
 
     # ------------------------------------------------------------------
-    # Collected texts
+    # Captured text
     # ------------------------------------------------------------------
 
     @property
     def texts(self) -> list[str]:
-        """Return a snapshot of all captured text strings (thread-safe)."""
+        """Snapshot of all captured text strings (newest last)."""
         with self._lock:
             return list(self._texts)
 
-    @property
-    def diagnostic(self) -> bool:
-        """``True`` if this hook was created in diagnostic mode."""
-        return self._diagnostic
-
-    @property
-    def hook_code(self) -> "HookCode | None":
-        """The :class:`~src.hook.hook_search.HookCode` used for this hook, if any."""
-        return self._hook_code
-
-    @property
-    def diag(self) -> str:
-        """All diagnostic messages joined as a single string.
-
-        In normal mode this is the startup diagnostic (attached hooks,
-        relevant modules).  In diagnostic mode it accumulates module
-        enumeration, export scans, and live glyph/font hook results.
-        """
-        with self._lock:
-            return "\n\n".join(self._diags)
-
     def clear(self) -> None:
-        """Discard all captured text strings."""
+        """Discard all captured text."""
         with self._lock:
             self._texts.clear()
 
+    @property
+    def diag(self) -> str:
+        """Diagnostic messages from the DLL, joined as a single string."""
+        with self._lock:
+            return "\n".join(self._diags)
+
+    @property
+    def diagnostic(self) -> bool:
+        """Always ``False`` in the native implementation."""
+        return False
+
+    @property
+    def hook_code(self) -> "HookCode | None":
+        """The :class:`~src.hook.hook_search.HookCode` used for this hook."""
+        return self._hook_code
+
     # ------------------------------------------------------------------
-    # Frida callbacks (called on Frida's internal thread)
+    # Pipe reader loop
     # ------------------------------------------------------------------
 
-    def _on_message(self, message: dict[str, Any], _data: Any) -> None:
-        """Handle a message from the Frida script."""
-        if message.get("type") == "send":
-            payload = message.get("payload")
-            if isinstance(payload, dict):
-                kind = payload.get("type")
-                value = payload.get("value", "")
-                if kind == "text" and value:
-                    with self._lock:
-                        self._texts.append(value)
-                        if len(self._texts) > _MAX_TEXTS:
-                            self._texts = self._texts[-_MAX_TEXTS:]
-                elif kind == "diag" and value:
-                    with self._lock:
-                        self._diags.append(value)
-                    log.info("Hook diag: %s", value)
-        elif message.get("type") == "error":
-            log.warning("Frida script error: %s", message.get("description", ""))
+    def _reader_loop(self, hook_va: int, arg_idx: int, deref: int,
+                      byte_offset: int, enc_int: int) -> None:
+        try:
+            connect_pipe(self._h_pipe)
+        except (PipeError, OSError) as exc:
+            with self._lock:
+                self._diags.append(f"Pipe connect failed: {exc}")
+            log.error("TextHook pipe connect failed: %s", exc)
+            return
 
-    def _on_session_detached(self, reason: str, *_: object) -> None:
-        """Called when the Frida session is detached (e.g. process exit)."""
-        log.warning("Frida session detached (reason: %s)", reason)
-        self._session = None
-        self._script = None
+        try:
+            from src.hook._win32 import write_pipe
+            write_pipe(
+                self._h_pipe,
+                pack_hook_config(hook_va, arg_idx, deref, byte_offset, enc_int),
+            )
+        except (PipeError, OSError) as exc:
+            with self._lock:
+                self._diags.append(f"Config write failed: {exc}")
+            return
+
+        last_text = ""
+
+        while not self._stop.is_set():
+            hdr = read_pipe_exact(self._h_pipe, _RESULT_HDR_SIZE)
+            if hdr is None:
+                break
+
+            _, _, encoding, text_len = unpack_result_hdr(hdr)
+            if text_len == 0:
+                continue
+
+            text_bytes = read_pipe_exact(self._h_pipe, text_len)
+            if text_bytes is None:
+                break
+
+            try:
+                text = (
+                    text_bytes.decode("utf-16-le", errors="ignore")
+                    if encoding == 0
+                    else text_bytes.decode("utf-8", errors="ignore")
+                ).strip()
+            except Exception:
+                continue
+
+            if not text or text == last_text:
+                continue
+
+            # Control messages (hook_va == 0) go to diags, not texts
+            hook_va_result = int.from_bytes(hdr[:8], "little")
+            if hook_va_result == 0:
+                with self._lock:
+                    self._diags.append(text)
+                log.debug("TextHook DLL msg: %s", text)
+                continue
+
+            last_text = text
+            with self._lock:
+                self._texts.append(text)
+                if len(self._texts) > _MAX_TEXTS:
+                    self._texts = self._texts[-_MAX_TEXTS:]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_va(self) -> int | None:
+        """Return the absolute VA of the hook site in the target process."""
+        assert self._hook_code is not None
+        base = get_module_base(self._pid, self._hook_code.module)
+        if base is None:
+            return None
+        return base + self._hook_code.rva

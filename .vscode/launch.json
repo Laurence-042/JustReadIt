@@ -5,6 +5,7 @@
             "name": "Debug UI",
             "type": "debugpy",
             "request": "launch",
+            "preLaunchTask": "Build hook_engine.dll",
             "program": "${workspaceFolder}/main.py",
             "args": ["--debug"],
             "console": "integratedTerminal",
