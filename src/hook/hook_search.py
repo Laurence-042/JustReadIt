@@ -433,9 +433,11 @@ def score_candidate(text: str, ocr_lang: str = "") -> float:
 
 
 # Minimum score for a candidate to appear in the "Recommended" tab.
-# Calibrated so that Japanese dialogue lines (≥8 chars, ≥1 particle) pass
-# while short menu labels (≤6 chars, no particles) are filtered out.
 _RECOMMEND_SCORE_THRESHOLD: float = 60.0
+
+# How long to wait for the injected DLL to connect before assuming it is a
+# stale leftover from a previous session (20 s is generous; normally < 1 s).
+_CONNECT_TIMEOUT_S: float = 20.0
 
 
 class HookSearchError(RuntimeError):
@@ -518,6 +520,10 @@ class HookSearcher:
         # Confirmed-address live feed (populated after filter_to())
         self._confirmed_vas: set[int] = set()
         self._live_feed:     list[str] = []
+        # Process-exit / connect-timeout detection
+        self._pipe_connected  = threading.Event()
+        self._process_died:  bool                   = False
+        self._connect_watchdog: threading.Timer | None = None
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -561,28 +567,56 @@ class HookSearcher:
             target=self._reader_loop, name="hook-search-reader", daemon=True
         )
         self._reader.start()
+
+        # Watchdog: if the DLL hasn't connected within _CONNECT_TIMEOUT_S the
+        # game likely already has a stale DLL from a previous session whose
+        # worker thread is dead.  Close the pipe so _reader_loop unblocks.
+        self._connect_watchdog = threading.Timer(
+            _CONNECT_TIMEOUT_S, self._on_connect_timeout
+        )
+        self._connect_watchdog.daemon = True
+        self._connect_watchdog.start()
         log.info("HookSearcher started for PID %d", self._pid)
 
     def stop(self) -> None:
         """Close the pipe and stop the reader thread.  Safe to call many times."""
         self._stop.set()
-        # Cancel any pending advance thread before closing the pipe
+        # Cancel watchdog and advance threads before closing the pipe.
+        wdog = None
         with self._lock:
             t = self._advance_thread
             self._advance_thread = None
+            wdog = self._connect_watchdog
+            self._connect_watchdog = None
         if t is not None:
             t.cancel()
+        if wdog is not None:
+            wdog.cancel()
         if self._h_pipe:
             try:
                 close_pipe(self._h_pipe)
             except Exception:
                 pass
             self._h_pipe = 0
+        # Evict the module cache for this PID so a fresh attach gets current
+        # module layout (guards against PID reuse and stale ASLR bases).
+        _module_cache.pop(self._pid, None)
         log.info("HookSearcher stopped")
 
     def wait_for_scan(self, timeout: float = 30.0) -> bool:
         """Block until the bulk-patch phase completes (or *timeout* seconds)."""
         return self._scan_done.wait(timeout)
+
+    @property
+    def process_died(self) -> bool:
+        """``True`` if the game process closed unexpectedly while the searcher
+        was active (pipe broken without an explicit :meth:`stop` call)."""
+        return self._process_died
+
+    @property
+    def pipe_connected(self) -> bool:
+        """``True`` once the injected DLL has connected to the Named Pipe."""
+        return self._pipe_connected.is_set()
 
     # ------------------------------------------------------------------
     # Results
@@ -630,10 +664,22 @@ class HookSearcher:
         try:
             connect_pipe(self._h_pipe)
         except (PipeError, OSError) as exc:
-            with self._lock:
-                self._diags.append(f"Pipe connect failed: {exc}")
+            if not self._stop.is_set():
+                # Pipe closed before connect — most likely the connect watchdog
+                # fired because the DLL is a stale leftover from a previous
+                # session.  The watchdog already logged the message.
+                with self._lock:
+                    self._diags.append(f"Pipe connect failed: {exc}")
             log.error("HookSearcher pipe connect failed: %s", exc)
             return
+
+        # DLL connected — cancel the watchdog so it doesn't fire.
+        self._pipe_connected.set()
+        with self._lock:
+            wdog = self._connect_watchdog
+            self._connect_watchdog = None
+        if wdog is not None:
+            wdog.cancel()
 
         # Send search config to DLL
         try:
@@ -675,7 +721,38 @@ class HookSearcher:
             # Culls are flushed in bulk by the batch-settle timer (_send_next_batch)
             # rather than per-hit, to avoid starving the timer thread of _write_lock.
 
+        # Distinguish intentional stop from unexpected pipe break (game exit).
+        if not self._stop.is_set():
+            self._process_died = True
+            with self._lock:
+                self._diags.append(
+                    "\u26a0 Game process closed — pipe disconnected."
+                )
+            log.info("HookSearcher: game process closed (pipe broken for PID %d)", self._pid)
         log.debug("HookSearcher reader loop exiting")
+
+    def _on_connect_timeout(self) -> None:
+        """Called if the DLL has not connected within ``_CONNECT_TIMEOUT_S``.
+
+        The most likely cause: ``hook_engine.dll`` was already loaded by the
+        game from a previous JustReadIt session.  ``LoadLibraryA`` increments
+        the DLL's reference count without re-running ``DllMain``, so the
+        worker thread that connects to the pipe was never started again.
+        Closing the pipe unblocks ``ConnectNamedPipe`` in :meth:`_reader_loop`.
+        """
+        if self._pipe_connected.is_set():
+            return   # connected in the meantime; nothing to do
+        with self._lock:
+            self._diags.append(
+                "\u26a0 DLL did not connect within "
+                f"{_CONNECT_TIMEOUT_S:.0f} s.  The game likely already has a "
+                "stale hook DLL from a previous session — restart the game and "
+                "try again."
+            )
+        log.warning(
+            "HookSearcher connect timeout for PID %d — closing pipe", self._pid
+        )
+        self.stop()
 
     def _handle_control(self, text: str) -> None:
         if text.startswith("scan_done:"):

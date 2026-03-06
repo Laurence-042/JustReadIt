@@ -463,6 +463,16 @@ class _HookSearchDialog(QDialog):
         if self._searcher is None:
             return
 
+        # Detect game-exit: the pipe broke unexpectedly.
+        if self._searcher.process_died:
+            self._lbl_status.setText(
+                "\u26a0 Game process closed while searching."
+            )
+            self._prog.setVisible(False)
+            self._timer.stop()
+            self._cleanup()
+            return
+
         diags = self._searcher.diags()
         if diags:
             self._te_diag.setPlainText("\n".join(diags))
@@ -1065,6 +1075,16 @@ class DebugWindow(QMainWindow):
     def _refresh_candidates(self) -> None:
         """Refresh the candidates list from the active HookSearcher (500 ms tick)."""
         if self._searcher is None:
+            return
+        # Detect game-exit: pipe broke without an explicit stop.
+        if self._searcher.process_died:
+            self._lbl_search_status.setText(
+                "\u26a0 Game process closed \u2014 hook search stopped."
+            )
+            self.statusBar().showMessage(
+                "Game process closed \u2014 hook search stopped.", 10000
+            )
+            self._stop_search()
             return
         # Append only new diag lines (preserves scroll position)
         diags = self._searcher.diags()
