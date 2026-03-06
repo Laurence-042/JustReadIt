@@ -49,11 +49,9 @@ _DLL_PATH = Path(__file__).parent / "hook_engine.dll"
 # During the scan phase Python advances batches as fast as the DLL can process
 # them.  _BATCH_ADVANCE_DELAY_S is only a tiny inter-thread yield so
 # _send_next_batch runs on a worker thread rather than the pipe reader thread.
-# High-frequency functions are suppressed at the C level (SEND_CALL_LIMIT=150)
-# within milliseconds; no artificial settle window is needed.
-# Once all pdata is covered the player simply plays the game — dialogue
-# functions fire and appear in ranked_candidates().
-_BATCH_ADVANCE_DELAY_S: float = 0.05  # inter-thread yield only; not a settle
+# Race safety is handled in the DLL via freeze_all_threads() / thaw_all_threads()
+# which stably suspends every game thread before each MH_ApplyQueued call.
+_BATCH_ADVANCE_DELAY_S: float = 0.05  # inter-thread yield only
 _DEFAULT_BATCH_SIZE:    int   = 2000  # functions per batch — larger batches finish scanning faster
 
 

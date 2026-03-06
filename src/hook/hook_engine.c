@@ -6,6 +6,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <psapi.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -104,6 +105,65 @@ static volatile LONG64 g_pdisable[PDISABLE_SLOTS]; /* 0 = empty, else VA  */
 static volatile LONG   g_pdisable_seq = 0;         /* rolling producer idx */
 
 /* ================================================================
+ * Stable freeze / thaw
+ *
+ * Suspend every thread in the current process except the caller,
+ * looping until two consecutive snapshots show no new threads.
+ * This guarantees the process is fully quiescent before any
+ * MH_ApplyQueued() call, eliminating the race between MinHook's
+ * internal SuspendThread and game CPUs mid-instruction.
+ *
+ * MinHook also suspends threads internally; that is harmless here
+ * because SuspendThread on an already-suspended thread merely
+ * increments the suspend count, and ResumeThread decrements it.
+ * ============================================================= */
+#define MAX_FROZEN_THREADS 4096u
+static DWORD  g_frozen_tids   [MAX_FROZEN_THREADS];
+static HANDLE g_frozen_handles[MAX_FROZEN_THREADS];
+static DWORD  g_frozen_count = 0;
+
+static void freeze_all_threads(void) {
+    DWORD self_tid = GetCurrentThreadId();
+    DWORD pid      = GetCurrentProcessId();
+    g_frozen_count = 0;
+    bool found_new;
+    do {
+        found_new = false;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) break;
+        THREADENTRY32 te; te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid)      continue;
+                if (te.th32ThreadID       == self_tid) continue;
+                if (g_frozen_count >= MAX_FROZEN_THREADS) continue;
+                /* already suspended by us? */
+                bool already = false;
+                for (DWORD k = 0; k < g_frozen_count; k++)
+                    if (g_frozen_tids[k] == te.th32ThreadID) { already = true; break; }
+                if (already) continue;
+                HANDLE th = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (!th) continue;
+                SuspendThread(th);
+                g_frozen_tids   [g_frozen_count] = te.th32ThreadID;
+                g_frozen_handles[g_frozen_count] = th;
+                g_frozen_count++;
+                found_new = true;
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+    } while (found_new);
+}
+
+static void thaw_all_threads(void) {
+    for (DWORD i = 0; i < g_frozen_count; i++) {
+        ResumeThread(g_frozen_handles[i]);
+        CloseHandle(g_frozen_handles[i]);
+    }
+    g_frozen_count = 0;
+}
+
+/* ================================================================
  * pipe helpers (worker thread only -- no concurrency)
  * ============================================================= */
 static bool pipe_read_all(void *buf, DWORD len) {
@@ -163,14 +223,16 @@ static void ring_drain(void) {
             }
         }
         if (any) {
-            /* MH_ApplyQueued patches TARGET function prologues (in game .text),
-             * NOT the trampoline buffer.  MinHook suspends all threads
-             * internally before patching.  The trampoline buffer stays RX.
-             * DO NOT VirtualProtect the trampoline buffer here: changing
-             * page protection on a buffer that game threads are actively
-             * executing causes 0xC0000005 access violations on those threads.
-             */
+            /* Freeze all game threads before calling MH_ApplyQueued so that
+             * no thread can be executing in a page that MinHook is about to
+             * VirtualProtect(RW) → patch → VirtualProtect(RX).  Without this
+             * a thread that slips through MinHook's own SuspendThread window
+             * on a second CPU core hits 0xC0000005 (no-execute on RW page).
+             * freeze_all_threads loops until the snapshot is stable, so
+             * threads created between iterations are also caught.           */
+            freeze_all_threads();
             MH_ApplyQueued();
+            thaw_all_threads();
         }
     }
     /* Cap iterations per call so the command-check loop stays responsive
@@ -624,12 +686,13 @@ static void do_search(const Config *cfg) {
         log_phase(tmp2);
     }
 
+    DWORD dummy;
+    freeze_all_threads();
     MH_ApplyQueued();
+    VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READ, &dummy);
+    thaw_all_threads();
     pipe_write(0,0,1,"phase:hooks_applied",19);
     log_phase("phase:hooks_applied");
-
-    DWORD dummy;
-    VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READ, &dummy);
     pipe_write(0,0,1,"phase:rx_protected",18);
     log_phase("phase:rx_protected");
 
@@ -663,7 +726,9 @@ static void do_search(const Config *cfg) {
                     MH_QueueDisableHook((LPVOID)(uintptr_t)va);
                 }
                 if (pipe_ok) {
+                    freeze_all_threads();
                     MH_ApplyQueued();
+                    thaw_all_threads();
                     char dbuf[48];
                     int n = _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
                         "disabled:%lu", (unsigned long)cnt);
@@ -675,7 +740,11 @@ static void do_search(const Config *cfg) {
                 uint32_t nbatch = 0;
                 if (!pipe_read_all(&nbatch, 4)) break;
 
-                /* Temporarily make buffer writable to write new trampolines */
+                /* Freeze all threads first so the VirtualProtect(RWX) →
+                 * trampoline write → MH_ApplyQueued → VirtualProtect(RX)
+                 * sequence runs with no game thread able to race against
+                 * MinHook's own page-permission transitions.               */
+                freeze_all_threads();
                 VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READWRITE, &dummy);
                 newly = scan_next_batch(nbatch);
                 if (newly > 0) {
@@ -684,6 +753,7 @@ static void do_search(const Config *cfg) {
                     MH_ApplyQueued();
                 }
                 VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READ, &dummy);
+                thaw_all_threads();
 
                 char nbuf[80];
                 int n = _snprintf_s(nbuf, sizeof(nbuf), _TRUNCATE,

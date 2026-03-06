@@ -689,6 +689,8 @@ class DebugWindow(QMainWindow):
 
         # -- Left column: candidates tab widget --
         self._tab_cands = QTabWidget()
+        self._tab_cands.tabBar().setExpanding(False)
+        self._tab_cands.tabBar().setUsesScrollButtons(True)
 
         # Tab 0: Recommended (high-score dialogue candidates)
         _rec_widget = QWidget()
@@ -1279,7 +1281,7 @@ class DebugWindow(QMainWindow):
             item.setData(32, code_str)
             self._lst_confirmed.addItem(item)
         count = len(self._confirmed_hook_codes)
-        self._tab_cands.setTabText(1, f"Confirmed ({count})")
+        self._tab_cands.setTabText(2, f"Confirmed ({count})")
         if count > 0:
             self._lbl_confirmed_status.setText(
                 f"{count} hook(s) confirmed \u2014 live feed active.  "
