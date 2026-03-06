@@ -390,12 +390,14 @@ class _HookSearchDialog(QDialog):
         the game for ~30 s, then selects the best candidate and clicks OK.
     """
 
-    def __init__(self, target: "GameTarget", parent: QWidget | None = None) -> None:
+    def __init__(self, target: "GameTarget", ocr_lang: str = "",
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Search Hook Sites")
         self.resize(860, 540)
 
         self._target = target
+        self._ocr_lang = ocr_lang
         self._searcher: HookSearcher | None = None
         self.selected_code: HookCode | None = None
         self._last_cand_count = -1
@@ -449,7 +451,7 @@ class _HookSearchDialog(QDialog):
 
     def _start(self) -> None:
         try:
-            self._searcher = HookSearcher(self._target.pid)
+            self._searcher = HookSearcher(self._target.pid, ocr_lang=self._ocr_lang)
             self._searcher.start()
         except HookSearchError as exc:
             self._lbl_status.setText(f"⚠ Could not start: {exc}")
@@ -579,6 +581,7 @@ class DebugWindow(QMainWindow):
         self._search_timer.setInterval(500)
         self._search_timer.timeout.connect(self._refresh_candidates)
         self._last_cand_count: int = -1
+        self._last_rec_count:  int = -1
         self._last_diag_count: int = 0
 
         self._install_proc_handle: int | None = None
@@ -677,7 +680,26 @@ class DebugWindow(QMainWindow):
         # -- Left column: candidates tab widget --
         self._tab_cands = QTabWidget()
 
-        # Tab 0: Hook Candidates
+        # Tab 0: Recommended (high-score dialogue candidates)
+        _rec_widget = QWidget()
+        _rec_lay = QVBoxLayout(_rec_widget)
+        _rec_lay.setContentsMargins(3, 3, 3, 3)
+        self._lbl_rec_status = QLabel(
+            "No active search \u2014 pick a window first."
+        )
+        self._lbl_rec_status.setWordWrap(True)
+        _rec_lay.addWidget(self._lbl_rec_status)
+        self._lst_recommended = QListWidget()
+        self._lst_recommended.setFont(QFont("Consolas", 9))
+        self._lst_recommended.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._lst_recommended.itemDoubleClicked.connect(self._confirm_candidate)
+        _rec_lay.addWidget(self._lst_recommended, 1)
+        _btn_confirm_rec = QPushButton("\u2713  Confirm selected recommended")
+        _btn_confirm_rec.clicked.connect(self._confirm_candidate)
+        _rec_lay.addWidget(_btn_confirm_rec)
+        self._tab_cands.addTab(_rec_widget, "Recommended (0)")
+
+        # Tab 1: All Hook Candidates (sorted by offset)
         _cands_widget = QWidget()
         _cands_lay = QVBoxLayout(_cands_widget)
         _cands_lay.setContentsMargins(3, 3, 3, 3)
@@ -703,9 +725,9 @@ class DebugWindow(QMainWindow):
         _btn_confirm = QPushButton("\u2713  Confirm selected candidate")
         _btn_confirm.clicked.connect(self._confirm_candidate)
         _cands_lay.addWidget(_btn_confirm)
-        self._tab_cands.addTab(_cands_widget, "Hook Candidates")
+        self._tab_cands.addTab(_cands_widget, "All Candidates")
 
-        # Tab 1: Confirmed hooks
+        # Tab 2: Confirmed hooks
         _confirmed_widget = QWidget()
         _confirmed_lay = QVBoxLayout(_confirmed_widget)
         _confirmed_lay.setContentsMargins(3, 3, 3, 3)
@@ -1016,15 +1038,17 @@ class DebugWindow(QMainWindow):
             self.statusBar().showMessage("Pick a window first.", 3000)
             return
         try:
-            self._searcher = HookSearcher(self._target.pid)
+            self._searcher = HookSearcher(self._target.pid, ocr_lang=self._selected_language)
             self._searcher.start()
             self._lbl_search_status.setText(
                 "Scanning…  play the game — candidates appear as dialogue fires."
             )
             self._last_cand_count = -1
+            self._last_rec_count  = -1
             self._last_diag_count = 0
             self._te_search_diag.clear()
             self._lst_candidates.clear()
+            self._lst_recommended.clear()
             self._search_timer.start()
         except HookSearchError as exc:
             self._lbl_search_status.setText(f"⚠ Search failed: {exc}")
@@ -1069,6 +1093,33 @@ class DebugWindow(QMainWindow):
         # Always refresh confirmed labels (hit count / text preview may change
         # even when the total visible count stays the same).
         self._refresh_confirmed_tab()
+
+        # ── Recommended tab ───────────────────────────────────────────────
+        recommended = self._searcher.recommended_candidates()
+        if len(recommended) != self._last_rec_count:
+            self._last_rec_count = len(recommended)
+            rec_cur_key = (
+                self._lst_recommended.currentItem().data(32)
+                if self._lst_recommended.currentItem()
+                else None
+            )
+            self._lst_recommended.clear()
+            for c in recommended:
+                item = QListWidgetItem(c.display_label_scored())
+                item.setData(32, c.to_hook_code().to_str())
+                self._lst_recommended.addItem(item)
+                if item.data(32) == rec_cur_key:
+                    self._lst_recommended.setCurrentItem(item)
+            if self._lst_recommended.count() > 0 and self._lst_recommended.currentItem() is None:
+                self._lst_recommended.setCurrentRow(0)
+            self._tab_cands.setTabText(0, f"Recommended ({len(recommended)})")
+            self._lbl_rec_status.setText(
+                f"{len(recommended)} recommended candidate(s) \u2014 sorted by score."
+                if recommended else
+                "No recommended candidates yet \u2014 play the game."
+            )
+
+        # ── All Candidates tab ────────────────────────────────────────────
         if len(visible) == self._last_cand_count:
             return
         self._last_cand_count = len(visible)
@@ -1102,14 +1153,23 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _confirm_candidate(self) -> None:
-        """Confirm selected candidate(s) and route their live output into the pipeline."""
+        """Confirm selected candidate(s) and route their live output into the pipeline.
+
+        Reads from the Recommended list when Tab 0 is active, otherwise from
+        the All Candidates list.
+        """
         if self._searcher is None:
             self.statusBar().showMessage("No active search — pick a window first.", 3000)
             return
-        selected_items = self._lst_candidates.selectedItems()
+        # Pick the active list based on the current tab.
+        if self._tab_cands.currentIndex() == 0:
+            active_list = self._lst_recommended
+        else:
+            active_list = self._lst_candidates
+        selected_items = active_list.selectedItems()
         if not selected_items:
-            if self._lst_candidates.count() > 0:
-                selected_items = [self._lst_candidates.item(0)]
+            if active_list.count() > 0:
+                selected_items = [active_list.item(0)]
         if not selected_items:
             self.statusBar().showMessage("No candidate selected.", 3000)
             return
@@ -1139,7 +1199,7 @@ class DebugWindow(QMainWindow):
                 existing.add(key)
         _cfg.hook_code = ",".join(self._confirmed_hook_codes)
         self._refresh_confirmed_tab()
-        self._tab_cands.setCurrentIndex(1)  # switch to Confirmed tab
+        self._tab_cands.setCurrentIndex(2)  # switch to Confirmed tab
         self._lbl_search_status.setText(f"Confirmed {len(codes)} hook(s) — live feed active.")
         self.statusBar().showMessage(f"{len(codes)} hook(s) confirmed — starting pipeline\u2026", 6000)
         self._run(searcher=self._searcher)

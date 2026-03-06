@@ -211,6 +211,13 @@ class HookCandidate:
             f"+{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}  {preview!r}"
         )
 
+    def display_label_scored(self) -> str:
+        """Label with score prefix, used in the Recommended tab."""
+        preview = self.text[:55].replace("\n", " ")
+        return (
+            f"[{self.score:6.0f}]  +{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}  {preview!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Filtering helpers
@@ -225,30 +232,12 @@ _QUOTED_DIALOGUE_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Per-language script rejection
+# Per-language candidate scorers
 # ---------------------------------------------------------------------------
-
-_HANGUL_RANGES: list[tuple[int, int]] = [
-    (0x1100, 0x11FF),   # Hangul Jamo
-    (0x3130, 0x318F),   # Hangul Compatibility Jamo
-    (0xA960, 0xA97F),   # Hangul Jamo Extended-A
-    (0xAC00, 0xD7A3),   # Hangul Syllables
-    (0xD7B0, 0xD7FF),   # Hangul Jamo Extended-B
-]
-_KANA_RANGES: list[tuple[int, int]] = [
-    (0x3040, 0x30FF),   # Hiragana + Katakana
-    (0x31F0, 0x31FF),   # Katakana Phonetic Extensions
-    (0xFF65, 0xFF9F),   # Halfwidth Katakana
-]
-# BCP-47 root tag → Unicode ranges to reject.  Any candidate containing a
-# character from a rejected range is almost certainly a cross-script false
-# positive and is discarded immediately.
-_REJECT_SCRIPT_RANGES: dict[str, list[tuple[int, int]]] = {
-    "ja": _HANGUL_RANGES,       # Japanese OCR: reject Korean
-    "zh": _HANGUL_RANGES,       # Chinese  OCR: reject Korean
-    "ko": _KANA_RANGES,         # Korean   OCR: reject Japanese kana
-}
-
+# Each scorer encapsulates hard-reject rules and language-specific bonuses.
+# Register new languages in ``_LANG_SCORERS``; ``score_candidate`` dispatches
+# to the appropriate instance based on the BCP-47 root tag.
+# ---------------------------------------------------------------------------
 
 def _shannon_entropy(text: str) -> float:
     """Character-level Shannon entropy in bits."""
@@ -261,84 +250,192 @@ def _shannon_entropy(text: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
+# Unicode ranges used for cross-script rejection.
+_HANGUL_RANGES: list[tuple[int, int]] = [
+    (0x1100, 0x11FF),   # Hangul Jamo
+    (0x3130, 0x318F),   # Hangul Compatibility Jamo
+    (0xA960, 0xA97F),   # Hangul Jamo Extended-A
+    (0xAC00, 0xD7A3),   # Hangul Syllables
+    (0xD7B0, 0xD7FF),   # Hangul Jamo Extended-B
+]
+_KANA_RANGES: list[tuple[int, int]] = [
+    (0x3040, 0x30FF),   # Hiragana + Katakana
+    (0x31F0, 0x31FF),   # Katakana Phonetic Extensions
+    (0xFF65, 0xFF9F),   # Halfwidth Katakana
+]
+
+
+class _CandidateScorer:
+    """Language-agnostic scorer used as the base class and default fallback.
+
+    Subclass and override :meth:`_language_bonus` to add language-specific
+    multipliers on top of the shared base logic.
+    """
+
+    # Codepoint ranges for scripts this language should *never* contain.
+    # Any character in these ranges causes an immediate score-0 rejection.
+    _reject_script_ranges: list[tuple[int, int]] = []
+
+    # ── hard-reject helpers ────────────────────────────────────────────
+
+    def _hard_reject(self, text: str) -> bool:
+        """Return True if *text* should be immediately discarded."""
+        # Non-printable control characters (null residue, ESC sequences …)
+        # Allow only common whitespace: \t (0x09), \n (0x0A), \r (0x0D).
+        if any(ord(c) < 0x20 and c not in '\t\n\r' for c in text):
+            return True
+        # Binary / high-entropy garbage
+        if _shannon_entropy(text) > 5.5:
+            return True
+        # File / resource paths
+        if _PATH_RE.search(text):
+            return True
+        stripped = text.strip()
+        # Pure ASCII identifiers (internal IDs, enum names …)
+        if _PURE_ASCII_ID_RE.match(stripped):
+            return True
+        # File extensions with short text → likely a filename token
+        if _FILE_EXT_RE.search(stripped) and len(stripped) < 60:
+            return True
+        # Hex blobs
+        if _HEX_BLOB_RE.match(stripped):
+            return True
+        # Cross-script rejection: a string containing characters from a
+        # script foreign to the active OCR language is almost certainly
+        # a false positive (e.g. Hangul on the stack in a Japanese game).
+        if self._reject_script_ranges:
+            for ch in text:
+                cp = ord(ch)
+                if any(lo <= cp <= hi for lo, hi in self._reject_script_ranges):
+                    return True
+        return False
+
+    # ── base CJK check + scoring ───────────────────────────────────────
+
+    def _base_score(self, text: str) -> float:
+        """Shared base score before any language bonuses.
+
+        Returns 0.0 if the text contains no CJK characters at all.
+        """
+        cjk_chars = sum(
+            1 for c in text
+            if "\u3000" <= c <= "\u9FFF" or "\uFF00" <= c <= "\uFFEF"
+        )
+        if cjk_chars == 0:
+            return 0.0
+        score = float(len(text))
+        # Reward high CJK density (dialogue vs. mixed noise)
+        cjk_ratio = cjk_chars / max(len(text), 1)
+        score *= 1.0 + cjk_ratio
+        # Strong bonus for bracket- or quote-delimited dialogue
+        if _QUOTED_DIALOGUE_RE.match(text):
+            score *= 2.5
+        return score
+
+    # ── language bonus (overridden by subclasses) ──────────────────────
+
+    def _language_bonus(self, text: str) -> float:  # noqa: ARG002
+        """Return a multiplier ≥ 1.0 for language-specific dialogue signals.
+
+        The default implementation returns 1.0 (no bonus).
+        """
+        return 1.0
+
+    # ── public entry point ──────────────────────────────────────────────
+
+    def __call__(self, text: str) -> float:
+        """Return quality score ≥ 0.  Zero means 'discard'."""
+        if not text or self._hard_reject(text):
+            return 0.0
+        base = self._base_score(text)
+        if base <= 0.0:
+            return 0.0
+        return base * self._language_bonus(text)
+
+
+class _JaCandidateScorer(_CandidateScorer):
+    """Japanese-specific scorer.
+
+    Adds dialogue-indicator bonuses on top of the shared base:
+
+    * **Particle bonus** — grammatical particles (は/の/に/も/を/と/が/で/
+      へ/か/な/よ/ね/わ) appear in virtually every natural sentence but not
+      in short menu labels.  3+ distinct particles → ×3.0; 1–2 → ×1.8.
+    * **Sentence-end bonus** — 。？！ at the end of the string → ×1.3.
+    * **Menu penalty** — very short (≤6 chars) all-CJK string with no
+      particles → ×0.6 (likely a menu label, deprioritise).
+
+    Cross-script: Hangul characters → immediate score 0.
+    """
+
+    _reject_script_ranges = _HANGUL_RANGES
+
+    # Hiragana function particles that appear in almost all natural sentences
+    # but are rare in menu labels / short UI strings.
+    _PARTICLES: frozenset[str] = frozenset("はのにもをとがでへかなよねわ")
+    _SENTENCE_END: frozenset[str] = frozenset("。？！")
+
+    def _language_bonus(self, text: str) -> float:
+        bonus = 1.0
+
+        distinct_particles = sum(1 for p in self._PARTICLES if p in text)
+        if distinct_particles >= 3:
+            bonus *= 3.0   # strong dialogue signal
+        elif distinct_particles >= 1:
+            bonus *= 1.8   # mild dialogue signal
+
+        # Sentence-final punctuation
+        stripped = text.rstrip()
+        if stripped and stripped[-1] in self._SENTENCE_END:
+            bonus *= 1.3
+
+        # Menu-label penalty: very short, no particles
+        if distinct_particles == 0 and len(text.strip()) <= 6:
+            bonus *= 0.6
+
+        return bonus
+
+
+class _ZhCandidateScorer(_CandidateScorer):
+    """Chinese-specific scorer — rejects Hangul, base scoring only."""
+    _reject_script_ranges = _HANGUL_RANGES
+
+
+class _KoCandidateScorer(_CandidateScorer):
+    """Korean-specific scorer — rejects kana, base scoring only."""
+    _reject_script_ranges = _KANA_RANGES
+
+
+# BCP-47 root tag → scorer instance.
+_LANG_SCORERS: dict[str, _CandidateScorer] = {
+    "ja": _JaCandidateScorer(),
+    "zh": _ZhCandidateScorer(),
+    "ko": _KoCandidateScorer(),
+}
+_DEFAULT_SCORER = _CandidateScorer()
+
+
 def score_candidate(text: str, ocr_lang: str = "") -> float:
     """Return a quality score ≥ 0.  Score 0 means 'discard'.
 
-    Parameters
-    ----------
-    ocr_lang:
-        BCP-47 language tag of the active OCR engine (e.g. ``"ja"``).  When
-        set, characters from scripts that are foreign to that language (e.g.
-        Korean Hangul when OCR lang is Japanese) cause an immediate reject.
+    Dispatches to the appropriate :class:`_CandidateScorer` subclass based
+    on *ocr_lang* (BCP-47 root tag, e.g. ``"ja"``).  Language-specific
+    bonuses reward dialogue text over short menu labels; see the scorer
+    subclasses for details.
     """
-    if not text:
-        return 0.0
-
-    # --- hard rejects ------------------------------------------------------
-
-    # Non-printable control characters (beep, null residue, escape sequences…)
-    # Allow only common whitespace: \t (0x09), \n (0x0A), \r (0x0D).
-    if any(ord(c) < 0x20 and c not in '\t\n\r' for c in text):
-        return 0.0
-
-    # Binary / high-entropy garbage
-    # if _shannon_entropy(text) > 5.5:
-    #     return 0.0
-
-    # File / resource paths
-    if _PATH_RE.search(text):
-        return 0.0
-
-    # Pure ASCII identifiers and filenames (likely internal IDs)
-    stripped = text.strip()
-    if _PURE_ASCII_ID_RE.match(stripped):
-        return 0.0
-    if _FILE_EXT_RE.search(stripped) and len(stripped) < 60:
-        return 0.0
-
-    # Hex blobs
-    if _HEX_BLOB_RE.match(stripped):
-        return 0.0
-
-    # Language / script mismatch rejection.
-    # A candidate containing characters from a script foreign to the active
-    # OCR language (e.g. Korean Hangul when searching a Japanese game) is
-    # almost certainly a false positive.
-    if ocr_lang:
-        root = ocr_lang.split("-")[0].lower()
-        rejects = _REJECT_SCRIPT_RANGES.get(root)
-        if rejects:
-            for ch in text:
-                cp = ord(ch)
-                if any(lo <= cp <= hi for lo, hi in rejects):
-                    return 0.0
-
-    # Require at least some CJK content
-    cjk_chars = sum(
-        1 for c in text
-        if "\u3000" <= c <= "\u9FFF" or "\uFF00" <= c <= "\uFFEF"
-    )
-    if cjk_chars == 0:
-        return 0.0
-
-    # --- scoring -----------------------------------------------------------
-
-    score = float(len(text))
-
-    # Reward high CJK density (dialogue vs. mixed noise)
-    cjk_ratio = cjk_chars / max(len(text), 1)
-    score *= 1.0 + cjk_ratio
-
-    # Strong bonus for double-quoted or bracket-quoted dialogue
-    if _QUOTED_DIALOGUE_RE.match(text):
-        score *= 2.5
-
-    return score
+    root = ocr_lang.split("-")[0].lower() if ocr_lang else ""
+    return _LANG_SCORERS.get(root, _DEFAULT_SCORER)(text)
 
 
 # ---------------------------------------------------------------------------
 # HookSearcher
 # ---------------------------------------------------------------------------
+
+
+# Minimum score for a candidate to appear in the "Recommended" tab.
+# Calibrated so that Japanese dialogue lines (≥8 chars, ≥1 particle) pass
+# while short menu labels (≤6 chars, no particles) are filtered out.
+_RECOMMEND_SCORE_THRESHOLD: float = 60.0
 
 
 class HookSearchError(RuntimeError):
@@ -399,11 +496,13 @@ class HookSearcher:
         max_candidates: int = 50,
         max_hooks: int = 0,  # 0 = scan all pdata entries
         batch_size: int = _DEFAULT_BATCH_SIZE,
+        ocr_lang: str = "",
     ) -> None:
         self._pid        = pid
         self._max_c      = max_candidates
         self._max_hooks  = max_hooks
         self._batch_size = batch_size
+        self._ocr_lang   = ocr_lang
 
         self._h_pipe: int = 0
         self._stop       = threading.Event()
@@ -490,15 +589,19 @@ class HookSearcher:
     # ------------------------------------------------------------------
 
     def ranked_candidates(self) -> list[HookCandidate]:
-        """Return candidates sorted by RVA ascending (snapshot).
-
-        Ordering by RVA is stable across repeated calls; score-based ordering
-        caused constant reordering as `hit_count` accumulated.
-        Candidates with score == 0 (hard-rejected by :func:`score_candidate`)
-        are still included; callers may filter them if desired.
-        """
+        """Return all candidates sorted by RVA ascending (stable, snapshot)."""
         with self._lock:
             return sorted(self._candidates.values(), key=lambda c: c.rva)
+
+    def recommended_candidates(self) -> list[HookCandidate]:
+        """Return candidates with score >= :data:`_RECOMMEND_SCORE_THRESHOLD`,
+        sorted by score descending.  These are the most likely dialogue hooks."""
+        with self._lock:
+            cands = [
+                c for c in self._candidates.values()
+                if c.score >= _RECOMMEND_SCORE_THRESHOLD
+            ]
+        return sorted(cands, key=lambda c: -c.score)
 
     def diags(self) -> list[str]:
         """Return all diagnostic messages received so far."""
@@ -687,7 +790,7 @@ class HookSearcher:
         (SEND_CALL_LIMIT).  Python only sees results that passed the C-level
         gate, so no additional frequency filtering is needed here.
         """
-        s = score_candidate(text)
+        s = score_candidate(text, self._ocr_lang)
         if s <= 0:
             return
 
