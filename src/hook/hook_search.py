@@ -282,8 +282,8 @@ def score_candidate(text: str, ocr_lang: str = "") -> float:
         return 0.0
 
     # Binary / high-entropy garbage
-    if _shannon_entropy(text) > 5.5:
-        return 0.0
+    # if _shannon_entropy(text) > 5.5:
+    #     return 0.0
 
     # File / resource paths
     if _PATH_RE.search(text):

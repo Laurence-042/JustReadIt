@@ -28,7 +28,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTabWidget, QTextEdit, QToolBar,
     QVBoxLayout, QWidget,
 )
@@ -1066,6 +1066,9 @@ class DebugWindow(QMainWindow):
         candidates = self._searcher.ranked_candidates()  # sorted by RVA ascending
         ocr_lang = self._selected_language
         visible = [c for c in candidates if score_candidate(c.text, ocr_lang) > 0]
+        # Always refresh confirmed labels (hit count / text preview may change
+        # even when the total visible count stays the same).
+        self._refresh_confirmed_tab()
         if len(visible) == self._last_cand_count:
             return
         self._last_cand_count = len(visible)
@@ -1176,13 +1179,22 @@ class DebugWindow(QMainWindow):
         """Rebuild the Confirmed tab list and update its title badge."""
         if not hasattr(self, "_lst_confirmed"):
             return  # called before UI is built (during __init__)
+        # Build a lookup map from hook-code string → HookCandidate so confirmed
+        # items render identically to the candidates tab (display_label format).
+        cand_map: dict[str, HookCandidate] = {}
+        if self._searcher is not None:
+            for c in self._searcher.ranked_candidates():
+                cand_map[c.to_hook_code().to_str()] = c
         self._lst_confirmed.clear()
         for code_str in self._confirmed_hook_codes:
-            try:
-                hc = HookCode.from_str(code_str)
-                label = f"+{hc.rva:#x}  {hc.access_pattern}  ({hc.module})"
-            except ValueError:
-                label = code_str
+            if code_str in cand_map:
+                label = cand_map[code_str].display_label()
+            else:
+                try:
+                    hc = HookCode.from_str(code_str)
+                    label = f"+{hc.rva:#x}  {hc.access_pattern}  ({hc.module})"
+                except ValueError:
+                    label = code_str
             item = QListWidgetItem(label)
             item.setData(32, code_str)
             self._lst_confirmed.addItem(item)
