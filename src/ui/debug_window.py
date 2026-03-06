@@ -712,6 +712,12 @@ class DebugWindow(QMainWindow):
         self._lbl_confirmed_status = QLabel("No confirmed hooks yet.")
         self._lbl_confirmed_status.setWordWrap(True)
         _confirmed_lay.addWidget(self._lbl_confirmed_status)
+        self._te_confirmed_hook = QPlainTextEdit()
+        self._te_confirmed_hook.setReadOnly(True)
+        self._te_confirmed_hook.setFont(QFont("Consolas", 9))
+        self._te_confirmed_hook.setFixedHeight(72)
+        self._te_confirmed_hook.setPlaceholderText("Hook text will appear here once confirmed hooks fire…")
+        _confirmed_lay.addWidget(self._te_confirmed_hook)
         self._lst_confirmed = QListWidget()
         self._lst_confirmed.setFont(QFont("Consolas", 9))
         self._lst_confirmed.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -1238,6 +1244,7 @@ class DebugWindow(QMainWindow):
         if region_text:
             self._te_region.setPlainText(region_text)
         self._te_hook.setPlainText(hook_text)
+        self._te_confirmed_hook.setPlainText(hook_text)
         self.statusBar().showMessage(
             f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
         )
