@@ -29,7 +29,10 @@ Mouse hover / Freeze hotkey
 | Screen capture | `src/capture.py` | DXGI Desktop Duplication via dxcam. Context-manager protocol. **Never** `BitBlt`/`PrintWindow` (black frames on DirectX) |
 | OCR engine | `src/ocr/windows_ocr.py` | `WindowsOcr` — sole OCR engine (no manga-ocr). Upscale-then-downscale for small fonts; PIL ↔ WinRT bitmap bridge |
 | Range detection | `src/ocr/range_detectors.py` | `RangeDetector` ABC + chain runner `run_detectors()`. Built-ins: `ParagraphDetector`, `TableRowDetector`, `SingleBoxDetector` |
-| Hook + cleaner | `src/hook/` | Native Win32 DLL injection (`hook_engine.dll` + `_win32.py`). `TextHook` context-manager; `Cleaner` ABC rule chain. Built-ins: `StripControlChars`, `DeduplicateLines`, `TrimWhitespace` |
+| Hook discovery | `src/hook/hook_search.py` | `HookSearcher` — bulk-hooks all EXE function prologues via `hook_engine.dll`, reads CJK strings from Named Pipe, ranks hits with `score_candidate`. Two-phase: scan → confirm. |
+| Hook value objects | `src/hook/hook_code.py` | `HookCode` (`module` + `rva` + `access_pattern` + `encoding`, frozen dataclass, serialised as `module!0xRVA:pattern:enc`). `HookCandidate` — live hit accumulator. |
+| Candidate scorer | `src/hook/candidate_scorer.py` | `score_candidate(text, lang)` — hard-reject filters + per-language `_CandidateScorer` subclasses. Register new languages in `_LANG_SCORERS`. |
+| Hook cleaner | `src/hook/cleaner.py` | `Cleaner` ABC rule chain. `src/hook/__init__.py` exports cleaner symbols only. Built-ins: `StripControlChars`, `DeduplicateLines`, `TrimWhitespace`. |
 | Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results — **stub** (`# TODO: implement match_ocr_to_hook`) |
 | Cache | `src/cache.py` | phash of translated-region screenshot as key — **stub** (`# TODO: implement PhashCache`) |
 | Translation | `src/translators/` | `Translator` ABC in `base.py`. Planned: Cloud Translation API + OpenAI (with rolling summary agent) |
@@ -108,9 +111,18 @@ All are decorated `@dataclass(frozen=True)`. Lazy DPI-awareness (`_ensure_dpi_aw
 
 Use `ctypes.WinDLL` with `use_last_error=True`. Win32 structs as `ctypes.Structure`. Callbacks via `WINFUNCTYPE`. `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS=9)` preferred over `GetWindowRect`. The **only** exception is `src/ui/window_picker.py` which uses pywin32 for brevity.
 
-### Native DLL text hook
+### Native DLL hook: HookSearcher two-phase workflow
 
-`TextHook` (`src/hook/text_hook.py`) injects `hook_engine.dll` via `src/hook/_win32.py` Win32 helpers (`inject_dll`, `get_module_base`, `create_pipe_server`). Hook target is a `HookCode` (from `src/hook/hook_search.py`) specifying `module` name + RVA. Background `threading.Thread` reads results from a Named Pipe. `frida` is a listed dependency but **not yet used** in the current implementation — reserved for future hook-search automation.
+`HookSearcher` (`src/hook/hook_search.py`) drives hook-site discovery:
+
+1. **Scan phase** — `start()` injects `hook_engine.dll` (via `src/hook/_win32.py` helpers: `inject_dll`, `create_pipe_server`, `pack_search_config`). The DLL bulk-patches all EXE function prologues in configurable batches (`_DEFAULT_BATCH_SIZE = 2000`). Each trampoline scans call-stack frames for CJK UTF-16LE strings; results arrive via Named Pipe as `(address, rva, text)` records. High-frequency hooks are suppressed C-side (`SEND_CALL_LIMIT=150`).
+2. **Confirm phase** — `ranked_candidates()` returns `HookCandidate` list sorted by `score_candidate`. User picks; the choice is stored as a `HookCode` in `AppConfig.hook_code`. `filter_to()` narrows the live feed; `drain_live_feed()` yields subsequent strings.
+
+`stop()` unloads the DLL, restoring all patches. Background reads use `threading.Thread`.
+
+`HookCode` (frozen dataclass, `src/hook/hook_code.py`) identifies a confirmed site: `module`, `rva`, `access_pattern`, `encoding`. Serialised as `module!0xRVA:pattern:enc` for `AppConfig`. `frida` is a listed dependency but **not yet used** — reserved for future hook-search automation.
+
+`src/hook/__init__.py` exports **cleaner symbols only** (`Cleaner`, `DEFAULT_CLEANERS`, built-in rules, `run_cleaners`). Import `HookSearcher`, `HookCode`, `HookCandidate`, `score_candidate` directly from their modules.
 
 ### Resource management
 
