@@ -1,0 +1,222 @@
+"""Candidate text scoring for hook-site selection.
+
+Contains hard-reject filters and per-language scorer classes.  Call
+:func:`score_candidate` to obtain a quality score for a raw text string
+captured by the hook engine.
+
+To add support for a new language, subclass :class:`_CandidateScorer`,
+override :meth:`~_CandidateScorer._language_bonus`, and register an instance
+in :data:`_LANG_SCORERS` under the appropriate BCP-47 root tag.
+"""
+from __future__ import annotations
+
+import math
+import re
+
+
+# ---------------------------------------------------------------------------
+# Filtering helpers
+# ---------------------------------------------------------------------------
+
+_PATH_RE           = re.compile(r"[A-Za-z]:[/\\]")
+_PURE_ASCII_ID_RE  = re.compile(r"^[A-Za-z0-9_\-\.]+$")
+_FILE_EXT_RE       = re.compile(r"\.[a-z]{2,5}\b", re.IGNORECASE)
+_HEX_BLOB_RE       = re.compile(r"^[0-9a-fA-F]{8,}$")
+_QUOTED_DIALOGUE_RE = re.compile(
+    r'^[\s\u3000]*[「『""].*[」』""][\s\u3000]*$', re.DOTALL
+)
+
+# ---------------------------------------------------------------------------
+# Per-language candidate scorers
+# ---------------------------------------------------------------------------
+# Each scorer encapsulates hard-reject rules and language-specific bonuses.
+# Register new languages in ``_LANG_SCORERS``; ``score_candidate`` dispatches
+# to the appropriate instance based on the BCP-47 root tag.
+# ---------------------------------------------------------------------------
+
+def _shannon_entropy(text: str) -> float:
+    """Character-level Shannon entropy in bits."""
+    if not text:
+        return 0.0
+    counts: dict[str, int] = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(text)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+# Unicode ranges used for cross-script rejection.
+_HANGUL_RANGES: list[tuple[int, int]] = [
+    (0x1100, 0x11FF),   # Hangul Jamo
+    (0x3130, 0x318F),   # Hangul Compatibility Jamo
+    (0xA960, 0xA97F),   # Hangul Jamo Extended-A
+    (0xAC00, 0xD7A3),   # Hangul Syllables
+    (0xD7B0, 0xD7FF),   # Hangul Jamo Extended-B
+]
+_KANA_RANGES: list[tuple[int, int]] = [
+    (0x3040, 0x30FF),   # Hiragana + Katakana
+    (0x31F0, 0x31FF),   # Katakana Phonetic Extensions
+    (0xFF65, 0xFF9F),   # Halfwidth Katakana
+]
+
+
+class _CandidateScorer:
+    """Language-agnostic scorer used as the base class and default fallback.
+
+    Subclass and override :meth:`_language_bonus` to add language-specific
+    multipliers on top of the shared base logic.
+    """
+
+    # Codepoint ranges for scripts this language should *never* contain.
+    # Any character in these ranges causes an immediate score-0 rejection.
+    _reject_script_ranges: list[tuple[int, int]] = []
+
+    # ── hard-reject helpers ────────────────────────────────────────────
+
+    def _hard_reject(self, text: str) -> bool:
+        """Return True if *text* should be immediately discarded."""
+        # Non-printable control characters (null residue, ESC sequences …)
+        # Allow only common whitespace: \t (0x09), \n (0x0A), \r (0x0D).
+        if any(ord(c) < 0x20 and c not in '\t\n\r' for c in text):
+            return True
+        # Binary / high-entropy garbage
+        if _shannon_entropy(text) > 5.5:
+            return True
+        # File / resource paths
+        if _PATH_RE.search(text):
+            return True
+        stripped = text.strip()
+        # Pure ASCII identifiers (internal IDs, enum names …)
+        if _PURE_ASCII_ID_RE.match(stripped):
+            return True
+        # File extensions with short text → likely a filename token
+        if _FILE_EXT_RE.search(stripped) and len(stripped) < 60:
+            return True
+        # Hex blobs
+        if _HEX_BLOB_RE.match(stripped):
+            return True
+        # Cross-script rejection: a string containing characters from a
+        # script foreign to the active OCR language is almost certainly
+        # a false positive (e.g. Hangul on the stack in a Japanese game).
+        if self._reject_script_ranges:
+            for ch in text:
+                cp = ord(ch)
+                if any(lo <= cp <= hi for lo, hi in self._reject_script_ranges):
+                    return True
+        return False
+
+    # ── base CJK check + scoring ───────────────────────────────────────
+
+    def _base_score(self, text: str) -> float:
+        """Shared base score before any language bonuses.
+
+        Returns 0.0 if the text contains no CJK characters at all.
+        """
+        cjk_chars = sum(
+            1 for c in text
+            if "\u3000" <= c <= "\u9FFF" or "\uFF00" <= c <= "\uFFEF"
+        )
+        if cjk_chars == 0:
+            return 0.0
+        score = float(len(text))
+        # Reward high CJK density (dialogue vs. mixed noise)
+        cjk_ratio = cjk_chars / max(len(text), 1)
+        score *= 1.0 + cjk_ratio
+        # Strong bonus for bracket- or quote-delimited dialogue
+        if _QUOTED_DIALOGUE_RE.match(text):
+            score *= 2.5
+        return score
+
+    # ── language bonus (overridden by subclasses) ──────────────────────
+
+    def _language_bonus(self, text: str) -> float:  # noqa: ARG002
+        """Return a multiplier ≥ 1.0 for language-specific dialogue signals.
+
+        The default implementation returns 1.0 (no bonus).
+        """
+        return 1.0
+
+    # ── public entry point ──────────────────────────────────────────────
+
+    def __call__(self, text: str) -> float:
+        """Return quality score ≥ 0.  Zero means 'discard'."""
+        if not text or self._hard_reject(text):
+            return 0.0
+        base = self._base_score(text)
+        if base <= 0.0:
+            return 0.0
+        return base * self._language_bonus(text)
+
+
+class _JaCandidateScorer(_CandidateScorer):
+    """Japanese-specific scorer.
+
+    Adds dialogue-indicator bonuses on top of the shared base:
+
+    * **Particle bonus** — grammatical particles (は/の/に/も/を/と/が/で/
+      へ/か/な/よ/ね/わ) appear in virtually every natural sentence but not
+      in short menu labels.  3+ distinct particles → ×3.0; 1–2 → ×1.8.
+    * **Sentence-end bonus** — 。？！ at the end of the string → ×1.3.
+    * **Menu penalty** — very short (≤6 chars) all-CJK string with no
+      particles → ×0.6 (likely a menu label, deprioritise).
+
+    Cross-script: Hangul characters → immediate score 0.
+    """
+
+    _reject_script_ranges = _HANGUL_RANGES
+
+    # Hiragana function particles that appear in almost all natural sentences
+    # but are rare in menu labels / short UI strings.
+    _PARTICLES: frozenset[str] = frozenset("はのにもをとがでへかなよねわ")
+    _SENTENCE_END: frozenset[str] = frozenset("。？！")
+
+    def _language_bonus(self, text: str) -> float:
+        bonus = 1.0
+
+        distinct_particles = sum(1 for p in self._PARTICLES if p in text)
+        if distinct_particles >= 3:
+            bonus *= 3.0   # strong dialogue signal
+        elif distinct_particles >= 1:
+            bonus *= 1.8   # mild dialogue signal
+
+        # Sentence-final punctuation
+        stripped = text.rstrip()
+        if stripped and stripped[-1] in self._SENTENCE_END:
+            bonus *= 1.3
+
+        # Menu-label penalty: very short, no particles
+        if distinct_particles == 0 and len(text.strip()) <= 6:
+            bonus *= 0.6
+
+        return bonus
+
+
+class _ZhCandidateScorer(_CandidateScorer):
+    """Chinese-specific scorer — rejects Hangul, base scoring only."""
+    _reject_script_ranges = _HANGUL_RANGES
+
+
+class _KoCandidateScorer(_CandidateScorer):
+    """Korean-specific scorer — rejects kana, base scoring only."""
+    _reject_script_ranges = _KANA_RANGES
+
+
+# BCP-47 root tag → scorer instance.
+_LANG_SCORERS: dict[str, _CandidateScorer] = {
+    "ja": _JaCandidateScorer(),
+    "zh": _ZhCandidateScorer(),
+    "ko": _KoCandidateScorer(),
+}
+_DEFAULT_SCORER = _CandidateScorer()
+
+
+def score_candidate(text: str, ocr_lang: str = "") -> float:
+    """Return a quality score ≥ 0.  Score 0 means 'discard'.
+
+    Dispatches to the appropriate :class:`_CandidateScorer` subclass based
+    on *ocr_lang* (BCP-47 root tag, e.g. ``"ja"``).  Language-specific
+    bonuses reward dialogue text over short menu labels; see the scorer
+    subclasses for details.
+    """
+    root = ocr_lang.split("-")[0].lower() if ocr_lang else ""
+    return _LANG_SCORERS.get(root, _DEFAULT_SCORER)(text)
