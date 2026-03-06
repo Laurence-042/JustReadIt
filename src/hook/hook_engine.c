@@ -254,10 +254,15 @@ void __cdecl Send(char **stack, uintptr_t address) {
 
         if (!c0||!c1) continue;
 
-        /* ---- 3. quick CJK pre-filter ---- */
-        if (!((c0>=0x3000&&c0<=0x9FFF)||(c0>=0xFF00&&c0<=0xFFEF)||
-              (c1>=0x3000&&c1<=0x9FFF)||(c1>=0xFF00&&c1<=0xFFEF)))
+        /* ---- 3. quick CJK pre-filter (check first 4 chars) ----
+         * Some VN strings start with non-CJK punctuation, e.g. U+2026
+         * HORIZONTAL ELLIPSIS ("……それでも…"), where c0 and c1 are both
+         * 0x2026 (not in the CJK block) but c2/c3 contain actual kana.
+         * Checking all four already-read chars avoids false rejection. */
+#define _IS_CJK(c) (((c)>=0x3000&&(c)<=0x9FFF)||((c)>=0xFF00&&(c)<=0xFFEF))
+        if (!_IS_CJK(c0)&&!_IS_CJK(c1)&&!_IS_CJK(c2)&&!_IS_CJK(c3))
             continue;
+#undef _IS_CJK
 
         /* ---- 4. dedup by (address, slot, c2, c3) ---- */
         LONG sig=(LONG)(
