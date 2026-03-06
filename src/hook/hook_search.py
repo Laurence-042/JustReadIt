@@ -55,7 +55,7 @@ _DLL_PATH = Path(__file__).parent / "hook_engine.dll"
 # Once all pdata is covered the player simply plays the game — dialogue
 # functions fire and appear in ranked_candidates().
 _BATCH_ADVANCE_DELAY_S: float = 0.05  # inter-thread yield only; not a settle
-_DEFAULT_BATCH_SIZE:    int   = 500   # functions per batch (smaller = less thread suspension per step)
+_DEFAULT_BATCH_SIZE:    int   = 2000  # functions per batch — larger batches finish scanning faster
 
 # ---------------------------------------------------------------------------
 # HookCode — serialisable reference to a confirmed hook site
@@ -224,6 +224,31 @@ _QUOTED_DIALOGUE_RE = re.compile(
     r'^[\s\u3000]*[「『""].*[」』""][\s\u3000]*$', re.DOTALL
 )
 
+# ---------------------------------------------------------------------------
+# Per-language script rejection
+# ---------------------------------------------------------------------------
+
+_HANGUL_RANGES: list[tuple[int, int]] = [
+    (0x1100, 0x11FF),   # Hangul Jamo
+    (0x3130, 0x318F),   # Hangul Compatibility Jamo
+    (0xA960, 0xA97F),   # Hangul Jamo Extended-A
+    (0xAC00, 0xD7A3),   # Hangul Syllables
+    (0xD7B0, 0xD7FF),   # Hangul Jamo Extended-B
+]
+_KANA_RANGES: list[tuple[int, int]] = [
+    (0x3040, 0x30FF),   # Hiragana + Katakana
+    (0x31F0, 0x31FF),   # Katakana Phonetic Extensions
+    (0xFF65, 0xFF9F),   # Halfwidth Katakana
+]
+# BCP-47 root tag → Unicode ranges to reject.  Any candidate containing a
+# character from a rejected range is almost certainly a cross-script false
+# positive and is discarded immediately.
+_REJECT_SCRIPT_RANGES: dict[str, list[tuple[int, int]]] = {
+    "ja": _HANGUL_RANGES,       # Japanese OCR: reject Korean
+    "zh": _HANGUL_RANGES,       # Chinese  OCR: reject Korean
+    "ko": _KANA_RANGES,         # Korean   OCR: reject Japanese kana
+}
+
 
 def _shannon_entropy(text: str) -> float:
     """Character-level Shannon entropy in bits."""
@@ -236,8 +261,16 @@ def _shannon_entropy(text: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
-def score_candidate(text: str) -> float:
-    """Return a quality score ≥ 0.  Score 0 means 'discard'."""
+def score_candidate(text: str, ocr_lang: str = "") -> float:
+    """Return a quality score ≥ 0.  Score 0 means 'discard'.
+
+    Parameters
+    ----------
+    ocr_lang:
+        BCP-47 language tag of the active OCR engine (e.g. ``"ja"``).  When
+        set, characters from scripts that are foreign to that language (e.g.
+        Korean Hangul when OCR lang is Japanese) cause an immediate reject.
+    """
     if not text:
         return 0.0
 
@@ -266,6 +299,19 @@ def score_candidate(text: str) -> float:
     # Hex blobs
     if _HEX_BLOB_RE.match(stripped):
         return 0.0
+
+    # Language / script mismatch rejection.
+    # A candidate containing characters from a script foreign to the active
+    # OCR language (e.g. Korean Hangul when searching a Japanese game) is
+    # almost certainly a false positive.
+    if ocr_lang:
+        root = ocr_lang.split("-")[0].lower()
+        rejects = _REJECT_SCRIPT_RANGES.get(root)
+        if rejects:
+            for ch in text:
+                cp = ord(ch)
+                if any(lo <= cp <= hi for lo, hi in rejects):
+                    return 0.0
 
     # Require at least some CJK content
     cjk_chars = sum(

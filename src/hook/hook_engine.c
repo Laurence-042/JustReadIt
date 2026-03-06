@@ -1,6 +1,7 @@
 /*
- * hook_engine.c  -- JustReadIt hook discovery DLL
- * Final corrected version.
+ * The hook-search concept (bulk function hooking + stack-frame string
+ * sniffing for VN text extraction) was pioneered by Textractor (GPL-3.0).
+ * This file is an independent implementation with a different architecture.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -162,16 +163,14 @@ static void ring_drain(void) {
             }
         }
         if (any) {
-            /* Re-protect trampoline buffer as RWX briefly so MinHook can
-             * patch the target prologues consistently with our buffer. */
-            DWORD dummy;
-            VirtualProtect(g_trampolines,
-                           (size_t)g_mh * TRAMPOLINE_SIZE,
-                           PAGE_EXECUTE_READWRITE, &dummy);
+            /* MH_ApplyQueued patches TARGET function prologues (in game .text),
+             * NOT the trampoline buffer.  MinHook suspends all threads
+             * internally before patching.  The trampoline buffer stays RX.
+             * DO NOT VirtualProtect the trampoline buffer here: changing
+             * page protection on a buffer that game threads are actively
+             * executing causes 0xC0000005 access violations on those threads.
+             */
             MH_ApplyQueued();
-            VirtualProtect(g_trampolines,
-                           (size_t)g_mh * TRAMPOLINE_SIZE,
-                           PAGE_EXECUTE_READ, &dummy);
         }
     }
     /* Cap iterations per call so the command-check loop stays responsive
@@ -384,10 +383,24 @@ typedef struct {
 static TrampolineUnwindEntry *g_unwind_table = NULL;
 static DWORD                  g_unwind_count  = 0;
 
-/* init_unwind_table: allocate and pre-fill the unwind table for the full
- * trampoline capacity.  Each slot's BeginAddress/EndAddress/UnwindData are
- * written once here and never touched again, so incremental batches only
- * need to call update_seh_registration() with the new active count.
+/* init_unwind_table: allocate and pre-fill the unwind table for the FULL
+ * trampoline capacity, then register it ONCE with RtlAddFunctionTable.
+ *
+ * Registering the full capacity upfront (even for slots not yet written)
+ * is safe because:
+ *   - The trampoline buffer is already allocated (RWX → RX later).
+ *   - UnwindData for each slot points to the matching embedded ui field
+ *     inside g_unwind_table itself (alloc_near ensures it is within ±2 GB
+ *     of g_trampolines so UnwindData fits in a DWORD).
+ *   - Slots not yet populated have CountOfCodes=0 so unwinding them is a
+ *     no-op; they will never be reached until scan_next_batch writes the
+ *     real trampoline bytes and MinHook enables the hook.
+ *
+ * Critically, we NEVER call RtlDeleteFunctionTable + RtlAddFunctionTable
+ * again after this point.  The delete→add gap is a race window where an
+ * exception propagating through a trampoline frame would find no unwind
+ * table, causing RtlFailFast / game crash.  One-shot registration
+ * eliminates this window entirely.
  *
  * Must be alloc_near(base) so that UnwindData RVAs fit in 32 bits.        */
 static void init_unwind_table(BYTE *base, DWORD capacity, size_t stride) {
@@ -408,24 +421,38 @@ static void init_unwind_table(BYTE *base, DWORD capacity, size_t stride) {
         g_unwind_table[i].ui.CountOfCodes         = 0;
         g_unwind_table[i].ui.FrameRegister_Offset = 0;
     }
-    g_unwind_count = 0;  /* not registered yet */
-}
 
-/* update_seh_registration: (re-)register the first active_count trampolines.
- * Safe to call after each batch: delete the old registration, add the new
- * one with the extended count.  The tiny window between delete and add is
- * acceptable -- exceptions inside a trampoline are caught by Send's handler
- * so no external unwind traversal is needed during that window.            */
-static void update_seh_registration(long active_count) {
-    if (!g_unwind_table || active_count <= 0) return;
-    if (g_unwind_count > 0)
-        RtlDeleteFunctionTable((PRUNTIME_FUNCTION)g_unwind_table);
-    g_unwind_count = (DWORD)active_count;
+    /* Register the full-capacity table once.  ImageBase = g_trampolines so
+     * that BeginAddress/EndAddress/UnwindData are all relative to it.     */
+    g_unwind_count = capacity;
     RtlAddFunctionTable(
         (PRUNTIME_FUNCTION)g_unwind_table,
-        (DWORD)active_count,
-        (DWORD64)(uintptr_t)g_trampolines   /* ImageBase */
+        capacity,
+        (DWORD64)(uintptr_t)base   /* ImageBase = trampoline buffer */
     );
+
+    /* Diagnostic: log the delta between the two allocations so that we can
+     * verify UnwindData RVAs are inside the allocation (delta < blksz).   */
+    {
+        char dbg[128];
+        intptr_t delta = (intptr_t)g_unwind_table - (intptr_t)base;
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "unwind_table=0x%llX tpl_base=0x%llX delta=0x%llX",
+            (unsigned long long)(uintptr_t)g_unwind_table,
+            (unsigned long long)(uintptr_t)base,
+            (unsigned long long)(uintptr_t)(delta < 0 ? -delta : delta));
+        log_phase(dbg);
+    }
+}
+
+/* update_seh_registration: kept for the unregister-at-shutdown path only.
+ * After init_unwind_table() registers the full-capacity table, this
+ * function is intentionally NOT called during incremental batch scans.
+ * Calling Delete + Add during hook application creates a race window where
+ * an exception in a live trampoline frame finds no unwind entry and the
+ * runtime calls RtlFailFast, crashing the game.                          */
+static void update_seh_registration(long active_count) {
+    (void)active_count;  /* no-op -- full-capacity table already registered */
 }
 
 static void unregister_trampolines_for_seh(void) {
@@ -573,9 +600,14 @@ static void do_search(const Config *cfg) {
         log_phase(gb_msg);
     }
 
-    /* Pre-allocate unwind table for FULL capacity so incremental batches
-     * only need update_seh_registration(new_count)                        */
+    /* Allocate + pre-fill the full-capacity unwind table and register it
+     * ONCE via RtlAddFunctionTable inside init_unwind_table().  We never
+     * call RtlDeleteFunctionTable / RtlAddFunctionTable again after this
+     * point -- doing so risks a race where an exception in a live trampoline
+     * frame finds no unwind entry and the runtime calls RtlFailFast.       */
     init_unwind_table(trampolines, g_mh, TRAMPOLINE_SIZE);
+    pipe_write(0,0,1,"phase:seh_registered",20);
+    log_phase("phase:seh_registered");
 
     /* ---- First batch ---- */
     long newly = scan_next_batch(first_batch);
@@ -586,13 +618,6 @@ static void do_search(const Config *cfg) {
         pipe_write(0,0,1,tmp2,(DWORD)n);
         log_phase(tmp2);
     }
-
-    /*
-     * CRITICAL: register unwind info BEFORE MH_ApplyQueued activates hooks.
-     */
-    update_seh_registration(g_hook_count);
-    pipe_write(0,0,1,"phase:seh_registered",20);
-    log_phase("phase:seh_registered");
 
     MH_ApplyQueued();
     pipe_write(0,0,1,"phase:hooks_applied",19);
@@ -649,7 +674,8 @@ static void do_search(const Config *cfg) {
                 VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READWRITE, &dummy);
                 newly = scan_next_batch(nbatch);
                 if (newly > 0) {
-                    update_seh_registration(g_hook_count);
+                    /* SEH table already covers full capacity -- no need to
+                     * re-register.  Just apply the newly queued hooks.    */
                     MH_ApplyQueued();
                 }
                 VirtualProtect(trampolines, blksz, PAGE_EXECUTE_READ, &dummy);

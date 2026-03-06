@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
-    QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QSpinBox, QSplitter, QStatusBar, QTabWidget, QTextEdit, QToolBar,
+    QVBoxLayout, QWidget,
 )
 from PIL import Image
 
@@ -229,16 +230,16 @@ class _PipelineWorker(QObject):
                 )
 
         # ── Hook texts ────────────────────────────────────────────────
+        # -- Hook texts: show only the most recent call (VN: one line per scene) --
         if self._searcher is None:
             hook_text = "[no confirmed hooks — select candidates and click Confirm]"
         else:
             new_texts = self._searcher.drain_live_feed()
             if new_texts:
-                self._hook_texts.extend(new_texts)
-                if len(self._hook_texts) > 2048:
-                    self._hook_texts = self._hook_texts[-2048:]
+                # Replace with the most recent entry only.
+                self._hook_texts = [new_texts[-1]]
             if self._hook_texts:
-                hook_text = "\n".join(self._hook_texts[-50:])
+                hook_text = self._hook_texts[0]
             else:
                 hook_text = "[confirmed hooks active — waiting for game text…]"
 
@@ -585,6 +586,13 @@ class DebugWindow(QMainWindow):
         self._install_timer.setInterval(500)
         self._install_timer.timeout.connect(self._poll_install)
 
+        # Confirmed hook codes persisted via AppConfig.hook_code.
+        saved_hook = _cfg.hook_code
+        self._confirmed_hook_codes: list[str] = (
+            [p.strip() for p in saved_hook.split(",") if p.strip()]
+            if saved_hook else []
+        )
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -624,17 +632,6 @@ class DebugWindow(QMainWindow):
         tb.addWidget(self._spn_interval)
         tb.addSeparator()
 
-        act_run = QAction("▶ Run", self)
-        act_run.setToolTip("Start the pipeline (requires a target)")
-        act_run.triggered.connect(self._run)
-        tb.addAction(act_run)
-
-        act_stop = QAction("■ Stop", self)
-        act_stop.triggered.connect(self._stop)
-        tb.addAction(act_stop)
-
-        tb.addSeparator()
-
         act_diag = QAction("🔍 Diagnose", self)
         act_diag.setToolTip(
             "Run deep diagnostics: enumerate modules, scan exports, "
@@ -642,21 +639,6 @@ class DebugWindow(QMainWindow):
         )
         act_diag.triggered.connect(self._diagnose)
         tb.addAction(act_diag)
-
-        act_search = QAction("⟳ Re-search", self)
-        act_search.setToolTip(
-            "Re-run hook search for the current target.  "
-            "Search starts automatically when you pick a window."
-        )
-        act_search.triggered.connect(self._start_search)
-        tb.addAction(act_search)
-
-        tb.addSeparator()
-        tb.addWidget(QLabel(" Hook: "))
-        self._lbl_hook_code = QLabel("(Win32 default)")
-        self._lbl_hook_code.setToolTip("Currently configured engine-specific hook (or Win32 default)")
-        self._lbl_hook_code.setMaximumWidth(300)
-        tb.addWidget(self._lbl_hook_code)
 
         # ── Restore persisted settings ───────────────────────────────────────────────
         saved_lang = _cfg.ocr_language
@@ -667,20 +649,8 @@ class DebugWindow(QMainWindow):
                 self._cmb_lang.setCurrentIndex(i)
                 break
 
-        # Restore saved hook code label (supports comma-separated multi-hook strings)
-        saved_hook = _cfg.hook_code
-        if saved_hook:
-            parts = [p.strip() for p in saved_hook.split(",") if p.strip()]
-            parsed: list[HookCode] = []
-            for p in parts:
-                try:
-                    parsed.append(HookCode.from_str(p))
-                except ValueError:
-                    pass
-            if parsed:
-                label = "  +  ".join(f"+{hc.rva:#x}:{hc.access_pattern}" for hc in parsed)
-                self._lbl_hook_code.setText(label[:80])
-                self._lbl_hook_code.setToolTip(saved_hook)
+        # (Confirmed hook codes are restored from __init__ and rendered after
+        # the UI is built; no toolbar label to restore.)
 
         # ── Install progress bar (hidden until a capability install runs) ──────
         self._install_bar = QWidget()
@@ -704,37 +674,18 @@ class DebugWindow(QMainWindow):
         central_lay.addWidget(splitter)
         self.setCentralWidget(central)
 
-        self._preview = _PreviewLabel(self)
-        splitter.addWidget(self._preview)
+        # -- Left column: candidates tab widget --
+        self._tab_cands = QTabWidget()
 
-        # ── Middle column: OCR / hook output panels ─────────────────────────
-        mid = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(mid)
-
-        grp_wocr, self._te_wocr = _make_panel("Windows OCR")
-        grp_region, self._te_region = _make_panel("Detected Region")
-        grp_hook, self._te_hook = _make_panel("Hook")
-        grp_tl,   self._te_tl   = _make_panel("Translation  (not yet implemented)")
-
-        self._te_region.setPlaceholderText("Region text will appear after range detection.")
-        self._te_hook.setPlaceholderText("Hook will attach automatically when pipeline starts.")
-        self._te_tl.setPlaceholderText("Translation plugin not yet implemented.")
-
-        mid.addWidget(grp_wocr)
-        mid.addWidget(grp_region)
-        mid.addWidget(grp_hook)
-        mid.addWidget(grp_tl)
-        mid.setSizes([280, 160, 160, 120])
-
-        # ── Right column: hook candidates ────────────────────────────────────
-        grp_cands = QGroupBox("Hook Candidates  (auto-starts on Pick Window)")
-        _cands_lay = QVBoxLayout(grp_cands)
+        # Tab 0: Hook Candidates
+        _cands_widget = QWidget()
+        _cands_lay = QVBoxLayout(_cands_widget)
         _cands_lay.setContentsMargins(3, 3, 3, 3)
-        self._lbl_search_status = QLabel("No active search — pick a window first.")
+        self._lbl_search_status = QLabel("No active search \u2014 pick a window first.")
         self._lbl_search_status.setWordWrap(True)
         _cands_lay.addWidget(self._lbl_search_status)
         self._cands_search = QLineEdit()
-        self._cands_search.setPlaceholderText("Filter by text content…")
+        self._cands_search.setPlaceholderText("Filter by text content\u2026")
         self._cands_search.setClearButtonEnabled(True)
         self._cands_search.textChanged.connect(self._apply_cands_filter)
         _cands_lay.addWidget(self._cands_search)
@@ -747,20 +698,66 @@ class DebugWindow(QMainWindow):
         self._te_search_diag.setReadOnly(True)
         self._te_search_diag.setFont(QFont("Consolas", 8))
         self._te_search_diag.setFixedHeight(56)
-        self._te_search_diag.setPlaceholderText("DLL diagnostic output…")
+        self._te_search_diag.setPlaceholderText("DLL diagnostic output\u2026")
         _cands_lay.addWidget(self._te_search_diag)
-        _btn_confirm = QPushButton("✓  Confirm selected candidate")
+        _btn_confirm = QPushButton("\u2713  Confirm selected candidate")
         _btn_confirm.clicked.connect(self._confirm_candidate)
         _cands_lay.addWidget(_btn_confirm)
-        splitter.addWidget(grp_cands)
+        self._tab_cands.addTab(_cands_widget, "Hook Candidates")
 
-        # preview : mid-col : candidates  →  5 : 3 : 2
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 3)
-        splitter.setStretchFactor(2, 2)
+        # Tab 1: Confirmed hooks
+        _confirmed_widget = QWidget()
+        _confirmed_lay = QVBoxLayout(_confirmed_widget)
+        _confirmed_lay.setContentsMargins(3, 3, 3, 3)
+        self._lbl_confirmed_status = QLabel("No confirmed hooks yet.")
+        self._lbl_confirmed_status.setWordWrap(True)
+        _confirmed_lay.addWidget(self._lbl_confirmed_status)
+        self._lst_confirmed = QListWidget()
+        self._lst_confirmed.setFont(QFont("Consolas", 9))
+        self._lst_confirmed.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        _confirmed_lay.addWidget(self._lst_confirmed, 1)
+        _btn_unconfirm = QPushButton("\u2717  Remove selected confirmed")
+        _btn_unconfirm.clicked.connect(self._unconfirm_candidate)
+        _confirmed_lay.addWidget(_btn_unconfirm)
+        self._tab_cands.addTab(_confirmed_widget, "Confirmed (0)")
+
+        splitter.addWidget(self._tab_cands)
+
+        # -- Centre column: game preview --
+        self._preview = _PreviewLabel(self)
+        splitter.addWidget(self._preview)
+
+        # ── Middle column: OCR / hook output panels ─────────────────────────
+        # -- Right column: OCR / hook output panels --
+        right = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(right)
+
+        grp_wocr, self._te_wocr = _make_panel("Windows OCR")
+        grp_region, self._te_region = _make_panel("Detected Region")
+        grp_hook, self._te_hook = _make_panel("Hook")
+        grp_tl,   self._te_tl   = _make_panel("Translation  (not yet implemented)")
+
+        self._te_region.setPlaceholderText("Region text will appear after range detection.")
+        self._te_hook.setPlaceholderText("Hook will attach automatically when pipeline starts.")
+        self._te_tl.setPlaceholderText("Translation plugin not yet implemented.")
+
+        right.addWidget(grp_wocr)
+        right.addWidget(grp_region)
+        right.addWidget(grp_hook)
+        right.addWidget(grp_tl)
+        right.setSizes([280, 160, 160, 120])
+
+        # ── Right column: hook candidates ────────────────────────────────────
+        # candidates : preview : right  ->  2 : 5 : 3
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(2, 3)
 
         # ── Status bar ─────────────────────────────────────────────────
         self.setStatusBar(QStatusBar(self))
+
+        # Populate confirmed tab with any hook codes persisted from a previous session.
+        self._refresh_confirmed_tab()
 
         # Connect AFTER populating to avoid a spurious install prompt on startup.
         self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
@@ -1061,7 +1058,8 @@ class DebugWindow(QMainWindow):
                 "Double-click or select + Confirm."
             )
         candidates = self._searcher.ranked_candidates()  # sorted by RVA ascending
-        visible = [c for c in candidates if score_candidate(c.text) > 0]
+        ocr_lang = self._selected_language
+        visible = [c for c in candidates if score_candidate(c.text, ocr_lang) > 0]
         if len(visible) == self._last_cand_count:
             return
         self._last_cand_count = len(visible)
@@ -1123,13 +1121,74 @@ class DebugWindow(QMainWindow):
         confirmed = [c for c in all_candidates if c.to_hook_code().to_str() in code_keys]
         self._searcher.filter_to(confirmed)
 
-        _cfg.hook_code = ",".join(c.to_str() for c in codes)
-        label = "  +  ".join(f"+{c.rva:#x}:{c.access_pattern}" for c in codes)
-        self._lbl_hook_code.setText(label[:80])
-        self._lbl_hook_code.setToolTip(",".join(c.to_str() for c in codes))
+        # Merge new confirmed codes (union, not replacement).
+        existing = set(self._confirmed_hook_codes)
+        for c in codes:
+            key = c.to_str()
+            if key not in existing:
+                self._confirmed_hook_codes.append(key)
+                existing.add(key)
+        _cfg.hook_code = ",".join(self._confirmed_hook_codes)
+        self._refresh_confirmed_tab()
+        self._tab_cands.setCurrentIndex(1)  # switch to Confirmed tab
         self._lbl_search_status.setText(f"Confirmed {len(codes)} hook(s) — live feed active.")
         self.statusBar().showMessage(f"{len(codes)} hook(s) confirmed — starting pipeline\u2026", 6000)
         self._run(searcher=self._searcher)
+
+    @Slot()
+    def _unconfirm_candidate(self) -> None:
+        """Remove selected confirmed hook(s) and update the live feed filter."""
+        selected = self._lst_confirmed.selectedItems()
+        if not selected:
+            self.statusBar().showMessage("No confirmed hook selected.", 3000)
+            return
+        to_remove = {item.data(32) for item in selected}
+        self._confirmed_hook_codes = [
+            c for c in self._confirmed_hook_codes if c not in to_remove
+        ]
+        _cfg.hook_code = ",".join(self._confirmed_hook_codes)
+        self._refresh_confirmed_tab()
+        # Re-apply filter_to with remaining codes.
+        if self._searcher is not None:
+            codes = []
+            for cs in self._confirmed_hook_codes:
+                try:
+                    codes.append(HookCode.from_str(cs))
+                except ValueError:
+                    pass
+            code_keys = {c.to_str() for c in codes}
+            remaining = [
+                c for c in self._searcher.ranked_candidates()
+                if c.to_hook_code().to_str() in code_keys
+            ]
+            self._searcher.filter_to(remaining)
+        self.statusBar().showMessage(
+            f"Removed {len(selected)} confirmed hook(s).", 3000
+        )
+
+    def _refresh_confirmed_tab(self) -> None:
+        """Rebuild the Confirmed tab list and update its title badge."""
+        if not hasattr(self, "_lst_confirmed"):
+            return  # called before UI is built (during __init__)
+        self._lst_confirmed.clear()
+        for code_str in self._confirmed_hook_codes:
+            try:
+                hc = HookCode.from_str(code_str)
+                label = f"+{hc.rva:#x}  {hc.access_pattern}  ({hc.module})"
+            except ValueError:
+                label = code_str
+            item = QListWidgetItem(label)
+            item.setData(32, code_str)
+            self._lst_confirmed.addItem(item)
+        count = len(self._confirmed_hook_codes)
+        self._tab_cands.setTabText(1, f"Confirmed ({count})")
+        if count > 0:
+            self._lbl_confirmed_status.setText(
+                f"{count} hook(s) confirmed \u2014 live feed active.  "
+                "Select and click Remove to unconfirm."
+            )
+        else:
+            self._lbl_confirmed_status.setText("No confirmed hooks yet.")
 
     def _stop(self) -> None:
         self._run_timer.stop()
