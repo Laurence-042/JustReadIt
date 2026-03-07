@@ -529,6 +529,10 @@ class HookSearcher:
         #   stack[-12..-17] = r10-r15
         #   stack[1..4] = Win64 shadow space (NOT function arguments)
         #   stack[5..]  = stack arguments (arg5 and above)
+        #
+        # Send() scans [-16..+8] (25 positions total). We now accept ALL of
+        # them instead of silently dropping non-standard locations, to avoid
+        # losing game text that appears in unexpected registers/stack slots.
         _reg_to_pattern: dict[int, str] = {
             -4:  "r0",   # rcx = arg0
             -5:  "r1",   # rdx = arg1
@@ -538,9 +542,14 @@ class HookSearcher:
         if slot_i in _reg_to_pattern:
             pattern = _reg_to_pattern[slot_i]
         elif _STACK_ARG_MIN_SLOT <= slot_i <= _STACK_ARG_MAX_SLOT:
+            # Standard stack arguments (arg5+): s+0x28, s+0x30, s+0x38, s+0x40
+            pattern = f"s+{slot_i * 8:#x}"
+        elif slot_i >= 0:
+            # Return address, shadow space, or stack above arg12
             pattern = f"s+{slot_i * 8:#x}"
         else:
-            return   # non-argument locations (incl. shadow space) are ignored
+            # Other saved registers or negative stack offsets
+            pattern = f"s-{abs(slot_i * 8):#x}"
 
         enc_str = "utf16" if encoding == 0 else "utf8"
 
@@ -559,6 +568,7 @@ class HookSearcher:
                 c.hit_count += 1
                 if len(text) > len(c.text):
                     c.text = text
+                    c.score = s  # Recalculate score when text is updated
                 if not c.hook_va:
                     c.hook_va = hook_va
             else:
