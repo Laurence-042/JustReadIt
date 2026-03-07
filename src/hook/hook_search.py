@@ -312,7 +312,9 @@ class HookSearcher:
 
         # Send search config to DLL
         try:
-            write_pipe(self._h_pipe, pack_search_config(self._max_hooks, self._batch_size))
+            write_pipe(self._h_pipe, pack_search_config(
+                self._max_hooks, self._batch_size
+            ))
         except (PipeError, OSError) as exc:
             with self._lock:
                 self._diags.append(f"Config write failed: {exc}")

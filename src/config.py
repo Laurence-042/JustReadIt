@@ -78,3 +78,5 @@ class AppConfig:
         s = _make_qsettings()
         s.setValue("hook/code", value)
         s.sync()
+
+

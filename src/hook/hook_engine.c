@@ -25,10 +25,10 @@
 #define SEND_STK_HI   9
 
 /* Trampoline byte offsets */
-#define TRAMPOLINE_ADDR_OFFSET  50
-#define TRAMPOLINE_SEND_OFFSET  60
-#define TRAMPOLINE_ORIG_OFFSET  134
-#define TRAMPOLINE_SIZE         142
+#define TRAMPOLINE_ADDR_OFFSET  74
+#define TRAMPOLINE_SEND_OFFSET  84
+#define TRAMPOLINE_ORIG_OFFSET  182
+#define TRAMPOLINE_SIZE         190
 
 #pragma pack(push, 1)
 typedef struct { uint8_t mode; uint8_t _p0[3]; uint32_t max_hooks;
@@ -371,10 +371,14 @@ static const BYTE s_tpl[TRAMPOLINE_SIZE] = {
     0x50,0x53,0x51,0x52,0x54,0x55,0x56,0x57,
     0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,
     0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,
-    0x48,0x83,0xEC,0x20,
-    0xF3,0x0F,0x7F,0x24,0x24,
-    0xF3,0x0F,0x7F,0x6C,0x24,0x10,
-    0x48,0x8D,0x8C,0x24,0xA8,0x00,0x00,0x00,
+    0x48,0x83,0xEC,0x60,
+    0xF3,0x0F,0x7F,0x04,0x24,
+    0xF3,0x0F,0x7F,0x4C,0x24,0x10,
+    0xF3,0x0F,0x7F,0x54,0x24,0x20,
+    0xF3,0x0F,0x7F,0x5C,0x24,0x30,
+    0xF3,0x0F,0x7F,0x64,0x24,0x40,
+    0xF3,0x0F,0x7F,0x6C,0x24,0x50,
+    0x48,0x8D,0x8C,0x24,0xE8,0x00,0x00,0x00,
     0x48,0xBA, 0,0,0,0,0,0,0,0,   /* +50: @addr  */
     0x48,0xB8, 0,0,0,0,0,0,0,0,   /* +60: @Send  */
     0x48,0x89,0xE3,
@@ -383,15 +387,19 @@ static const BYTE s_tpl[TRAMPOLINE_SIZE] = {
     0xFF,0xD0,
     0x48,0x83,0xC4,0x28,
     0x48,0x89,0xDC,
+    0xF3,0x0F,0x6F,0x6C,0x24,0x50,
+    0xF3,0x0F,0x6F,0x64,0x24,0x40,
+    0xF3,0x0F,0x6F,0x5C,0x24,0x30,
+    0xF3,0x0F,0x6F,0x54,0x24,0x20,
     0xF3,0x0F,0x6F,0x6C,0x24,0x10,
-    0xF3,0x0F,0x6F,0x24,0x24,
-    0x48,0x83,0xC4,0x20,
+    0xF3,0x0F,0x6F,0x04,0x24,
+    0x48,0x83,0xC4,0x60,
     0x41,0x5F,0x41,0x5E,0x41,0x5D,0x41,0x5C,
     0x41,0x5B,0x41,0x5A,0x41,0x59,0x41,0x58,
     0x5F,0x5E,0x5D,0x5C,0x5A,0x59,0x5B,0x58,
     0x9D,
     0xFF,0x25,0x00,0x00,0x00,0x00,
-    0,0,0,0,0,0,0,0               /* +134: @original */
+    0,0,0,0,0,0,0,0               /* +182: @original */
 };
 
 /* ================================================================
@@ -550,13 +558,25 @@ static long scan_next_batch(DWORD batch) {
         uintptr_t fn_addr = g_img_base + g_pdata[g_pdata_pos].BeginAddress;
         if (fn_addr < g_ts_base || fn_addr >= g_ts_base + g_ts_size) continue;
 
+        DWORD fn_rva = g_pdata[g_pdata_pos].BeginAddress;
+
         BYTE *tramp = (BYTE*)g_trampolines + (size_t)g_hook_count * TRAMPOLINE_SIZE;
         void *orig  = NULL;
 
         memcpy(tramp, g_tpl, TRAMPOLINE_SIZE);
         *(uintptr_t*)(tramp + TRAMPOLINE_ADDR_OFFSET) = fn_addr;
 
-        if (MH_CreateHook((LPVOID)fn_addr, (LPVOID)tramp, &orig) != MH_OK) continue;
+        MH_STATUS mhs = MH_CreateHook((LPVOID)fn_addr, (LPVOID)tramp, &orig);
+        if (mhs != MH_OK) {
+            /* Log failures so unusual functions can be identified and added
+             * to the skip list. MH_ERROR_UNSUPPORTED_FUNCTION is common for
+             * very short functions; other errors may indicate relocate bugs. */
+            char emsg[64];
+            _snprintf_s(emsg, sizeof(emsg), _TRUNCATE,
+                "mh_fail:0x%X st=%d", fn_rva, (int)mhs);
+            log_phase(emsg);
+            continue;
+        }
         *(void**)(tramp + TRAMPOLINE_ORIG_OFFSET) = orig;
         MH_QueueEnableHook((LPVOID)fn_addr);
         g_hook_addrs[g_hook_count++] = (uint64_t)fn_addr;
@@ -819,10 +839,61 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
                            GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
-        char buf[640];
+        char buf[1200];
         EXCEPTION_RECORD *er = ep->ExceptionRecord;
         CONTEXT          *ctx= ep->ContextRecord;
         uintptr_t gb = (uintptr_t)GetModuleHandleW(NULL);
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T vq = VirtualQuery((LPCVOID)(uintptr_t)ctx->Rip, &mbi, sizeof(mbi));
+        long hook_slot = -1;
+        for (long i = 0; i < g_hook_count; i++) {
+            if ((uintptr_t)g_hook_addrs[i] == (uintptr_t)ctx->Rip) {
+                hook_slot = i;
+                break;
+            }
+        }
+        uint32_t rip_rva32 = (uint32_t)((uintptr_t)ctx->Rip - gb);
+        uint32_t fn_begin_rva = 0;
+        uint32_t fn_end_rva = 0;
+        long pdata_idx = -1;
+        for (DWORD i = 0; i < g_pdata_count; i++) {
+            uint32_t b = g_pdata[i].BeginAddress;
+            uint32_t e = g_pdata[i].EndAddress;
+            if (rip_rva32 >= b && rip_rva32 < e) {
+                fn_begin_rva = b;
+                fn_end_rva = e;
+                pdata_idx = (long)i;
+                break;
+            }
+        }
+        long fn_hook_slot = -1;
+        if (fn_begin_rva != 0) {
+            uintptr_t fn_begin_va = gb + fn_begin_rva;
+            for (long i = 0; i < g_hook_count; i++) {
+                if ((uintptr_t)g_hook_addrs[i] == fn_begin_va) {
+                    fn_hook_slot = i;
+                    break;
+                }
+            }
+        }
+        BYTE rip_bytes[16] = {0};
+        int rip_n = 0;
+        __try {
+            memcpy(rip_bytes, (const void*)(uintptr_t)ctx->Rip, sizeof(rip_bytes));
+            rip_n = 16;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            rip_n = 0;
+        }
+        BYTE fn_entry_bytes[16] = {0};
+        int fn_entry_n = 0;
+        if (fn_begin_rva != 0) {
+            __try {
+                memcpy(fn_entry_bytes, (const void*)(uintptr_t)(gb + fn_begin_rva), sizeof(fn_entry_bytes));
+                fn_entry_n = 16;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                fn_entry_n = 0;
+            }
+        }
         int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
             "CODE:       0x%08X\r\n"
             "ADDRESS:    0x%016llX\r\n"
@@ -835,7 +906,22 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
             "tpl base:   0x%016llX\r\n"
             "tpl end:    0x%016llX\r\n"
             "hook_count: %ld\r\n"
-            "unwind_tbl: 0x%016llX\r\n",
+            "unwind_tbl: 0x%016llX\r\n"
+            "vq_ok:      %llu\r\n"
+            "mbi.Base:   0x%016llX\r\n"
+            "mbi.AllocB: 0x%016llX\r\n"
+            "mbi.State:  0x%08X\r\n"
+            "mbi.Prot:   0x%08X\r\n"
+            "mbi.AProt:  0x%08X\r\n"
+            "mbi.Type:   0x%08X\r\n"
+            "hook_slot:  %ld\r\n"
+            "rip_16:     %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n"
+            "rip_n:      %d\r\n"
+            "pdata_idx:  %ld\r\n"
+            "fn_rva:     0x%08X-0x%08X\r\n"
+            "fn_hook:    %ld\r\n"
+            "fn_entry16: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n"
+            "fn_entry_n: %d\r\n",
             (unsigned)er->ExceptionCode,
             (unsigned long long)er->ExceptionAddress,
             (unsigned long long)ctx->Rip,
@@ -848,7 +934,29 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
             (unsigned long long)((uintptr_t)g_trampolines
                                  + (size_t)g_hook_count * TRAMPOLINE_SIZE),
             g_hook_count,
-            (unsigned long long)(uintptr_t)g_unwind_table);
+            (unsigned long long)(uintptr_t)g_unwind_table,
+            (unsigned long long)vq,
+            (unsigned long long)(uintptr_t)mbi.BaseAddress,
+            (unsigned long long)(uintptr_t)mbi.AllocationBase,
+            (unsigned)mbi.State,
+            (unsigned)mbi.Protect,
+            (unsigned)mbi.AllocationProtect,
+            (unsigned)mbi.Type,
+            hook_slot,
+            rip_bytes[0], rip_bytes[1], rip_bytes[2], rip_bytes[3],
+            rip_bytes[4], rip_bytes[5], rip_bytes[6], rip_bytes[7],
+            rip_bytes[8], rip_bytes[9], rip_bytes[10], rip_bytes[11],
+            rip_bytes[12], rip_bytes[13], rip_bytes[14], rip_bytes[15],
+            rip_n,
+            pdata_idx,
+            fn_begin_rva,
+            fn_end_rva,
+            fn_hook_slot,
+            fn_entry_bytes[0], fn_entry_bytes[1], fn_entry_bytes[2], fn_entry_bytes[3],
+            fn_entry_bytes[4], fn_entry_bytes[5], fn_entry_bytes[6], fn_entry_bytes[7],
+            fn_entry_bytes[8], fn_entry_bytes[9], fn_entry_bytes[10], fn_entry_bytes[11],
+            fn_entry_bytes[12], fn_entry_bytes[13], fn_entry_bytes[14], fn_entry_bytes[15],
+            fn_entry_n);
         DWORD wr = 0;
         WriteFile(f, buf, (DWORD)n, &wr, NULL);
         CloseHandle(f);

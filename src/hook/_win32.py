@@ -304,7 +304,10 @@ _RESULT_HDR_SIZE = struct.calcsize(_RESULT_HDR_FMT)  # must be 16
 assert _RESULT_HDR_SIZE == 16, f"ResultHdr struct size mismatch: {_RESULT_HDR_SIZE}"
 
 
-def pack_search_config(max_hooks: int, batch_size: int = 0) -> bytes:
+def pack_search_config(
+    max_hooks: int,
+    batch_size: int = 0,
+) -> bytes:
     """Pack a MODE_SEARCH Config.
 
     Parameters
@@ -316,10 +319,10 @@ def pack_search_config(max_hooks: int, batch_size: int = 0) -> bytes:
         at once (original single-batch behaviour).
     """
     return struct.pack(_CONFIG_FMT,
-                       0,          # mode = search
+                       0,            # mode = search
                        max_hooks,
-                       0,          # hook_address unused
-                       0, 0, 0, 0, # arg_idx, deref, byte_offset, encoding
+                       0,            # hook_address unused
+                       0, 0, 0, 0,   # arg_idx, deref, byte_offset, encoding
                        batch_size,
                        )
 
