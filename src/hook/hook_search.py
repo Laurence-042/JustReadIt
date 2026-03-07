@@ -507,17 +507,6 @@ class HookSearcher:
         (SEND_CALL_LIMIT).  Python only sees results that passed the C-level
         gate, so no additional frequency filtering is needed here.
         """
-        # DEBUG: log specific test texts with full details (rva + slot_i)
-        _target_heads = ("時代を逆", "あの施", "起動さえ", "みんな")
-        if any(text.startswith(h) for h in _target_heads):
-            module = _resolve_module(hook_va, self._pid)
-            if module:
-                base, name = module
-                rva = hook_va - base
-                print(f"[{name}+{rva:#x} slot={slot_i:3d}] {text[:10]!r}", flush=True)
-            else:
-                print(f"[VA={hook_va:#x} slot={slot_i:3d}] {text[:10]!r}", flush=True)
-        
         s = score_candidate(text, self._ocr_lang)
         if s <= 0:
             return
@@ -585,9 +574,9 @@ class HookSearcher:
             if key in self._candidates:
                 c = self._candidates[key]
                 c.hit_count += 1
-                if len(text) > len(c.text):
-                    c.text = text
-                    c.score = s  # Recalculate score when text is updated
+                # Always update to latest text (reflects current game state)
+                c.text = text
+                c.score = s
                 if not c.hook_va:
                     c.hook_va = hook_va
             else:

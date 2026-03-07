@@ -401,6 +401,7 @@ class _HookSearchDialog(QDialog):
         self._searcher: HookSearcher | None = None
         self.selected_code: HookCode | None = None
         self._last_cand_count = -1
+        self._list_items: dict[str, QListWidgetItem] = {}  # key → item
 
         # ── Layout ──────────────────────────────────────────────────
         root = QVBoxLayout(self)
@@ -487,26 +488,38 @@ class _HookSearchDialog(QDialog):
                 "Select the best one and click OK."
             )
 
-        # Populate / refresh candidate list
+        # Populate / refresh candidate list (incremental update by ID)
         candidates = self._searcher.ranked_candidates()
         visible = [c for c in candidates if c.score > 0]
-        if len(visible) != self._last_cand_count:
-            self._last_cand_count = len(visible)
-            cur_key = (
-                self._lst.currentItem().data(32)
-                if self._lst.currentItem()
-                else None
-            )
-            self._lst.clear()
-            for c in visible:
+        
+        # Build current candidate key set
+        current_keys = {c.to_hook_code().to_str(): c for c in visible}
+        
+        # Remove items no longer in candidates
+        for key in list(self._list_items.keys()):
+            if key not in current_keys:
+                item = self._list_items.pop(key)
+                row = self._lst.row(item)
+                if row >= 0:
+                    self._lst.takeItem(row)
+        
+        # Update existing items or add new ones
+        for key, c in current_keys.items():
+            if key in self._list_items:
+                # Update existing item text
+                self._list_items[key].setText(c.display_label())
+            else:
+                # Add new item
                 item = QListWidgetItem(c.display_label())
-                item.setData(32, c.to_hook_code().to_str())
+                item.setData(32, key)
                 self._lst.addItem(item)
-                if item.data(32) == cur_key:
-                    self._lst.setCurrentItem(item)
-            if visible and self._lst.currentItem() is None:
-                self._lst.setCurrentRow(0)
-            self._btn_ok.setEnabled(bool(visible))
+                self._list_items[key] = item
+        
+        # Auto-select first item if nothing selected
+        if visible and self._lst.currentItem() is None:
+            self._lst.setCurrentRow(0)
+        
+        self._btn_ok.setEnabled(bool(visible))
 
     def _accept_selection(self) -> None:
         item = self._lst.currentItem()
@@ -593,6 +606,10 @@ class DebugWindow(QMainWindow):
         self._last_cand_count: int = -1
         self._last_rec_count:  int = -1
         self._last_diag_count: int = 0
+        # Item dictionaries for incremental list updates (key = HookCode.to_str())
+        self._rec_items: dict[str, QListWidgetItem] = {}
+        self._cand_items: dict[str, QListWidgetItem] = {}
+        self._confirmed_items: dict[str, QListWidgetItem] = {}
 
         self._install_proc_handle: int | None = None
         self._install_timer = QTimer(self)
@@ -1061,6 +1078,8 @@ class DebugWindow(QMainWindow):
             self._te_search_diag.clear()
             self._lst_candidates.clear()
             self._lst_recommended.clear()
+            self._cand_items.clear()
+            self._rec_items.clear()
             self._search_timer.start()
         except HookSearchError as exc:
             self._lbl_search_status.setText(f"⚠ Search failed: {exc}")
@@ -1116,50 +1135,67 @@ class DebugWindow(QMainWindow):
         # even when the total visible count stays the same).
         self._refresh_confirmed_tab()
 
-        # ── Recommended tab ───────────────────────────────────────────────
+        # ── Recommended tab (incremental update) ──────────────────────────
         recommended = self._searcher.recommended_candidates()
-        if len(recommended) != self._last_rec_count:
-            self._last_rec_count = len(recommended)
-            rec_cur_key = (
-                self._lst_recommended.currentItem().data(32)
-                if self._lst_recommended.currentItem()
-                else None
-            )
-            self._lst_recommended.clear()
-            for c in recommended:
+        current_keys = {c.to_hook_code().to_str(): c for c in recommended}
+        
+        # Remove items no longer recommended
+        for key in list(self._rec_items.keys()):
+            if key not in current_keys:
+                item = self._rec_items.pop(key)
+                row = self._lst_recommended.row(item)
+                if row >= 0:
+                    self._lst_recommended.takeItem(row)
+        
+        # Update existing or add new items
+        for key, c in current_keys.items():
+            if key in self._rec_items:
+                self._rec_items[key].setText(c.display_label_scored())
+            else:
                 item = QListWidgetItem(c.display_label_scored())
-                item.setData(32, c.to_hook_code().to_str())
+                item.setData(32, key)
                 self._lst_recommended.addItem(item)
-                if item.data(32) == rec_cur_key:
-                    self._lst_recommended.setCurrentItem(item)
-            if self._lst_recommended.count() > 0 and self._lst_recommended.currentItem() is None:
-                self._lst_recommended.setCurrentRow(0)
-            self._tab_cands.setTabText(0, f"Recommended ({len(recommended)})")
-            self._lbl_rec_status.setText(
-                f"{len(recommended)} recommended candidate(s) \u2014 sorted by score."
-                if recommended else
-                "No recommended candidates yet \u2014 play the game."
-            )
-
-        # ── All Candidates tab ────────────────────────────────────────────
-        if len(visible) == self._last_cand_count:
-            return
-        self._last_cand_count = len(visible)
-        cur_key = (
-            self._lst_candidates.currentItem().data(32)
-            if self._lst_candidates.currentItem()
-            else None
+                self._rec_items[key] = item
+        
+        if self._lst_recommended.count() > 0 and self._lst_recommended.currentItem() is None:
+            self._lst_recommended.setCurrentRow(0)
+        self._tab_cands.setTabText(0, f"Recommended ({len(recommended)})")
+        self._lbl_rec_status.setText(
+            f"{len(recommended)} recommended candidate(s) \u2014 sorted by score."
+            if recommended else
+            "No recommended candidates yet \u2014 play the game."
         )
-        self._lst_candidates.clear()
+
+        # ── All Candidates tab (incremental update) ───────────────────────
+        current_keys = {c.to_hook_code().to_str(): c for c in visible}
         filt = self._cands_search.text().lower()
-        for c in visible:
-            item = QListWidgetItem(c.display_label())
-            item.setData(32, c.to_hook_code().to_str())
-            self._lst_candidates.addItem(item)
-            if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
-                item.setHidden(True)
-            if item.data(32) == cur_key:
-                self._lst_candidates.setCurrentItem(item)
+        
+        # Remove items no longer visible
+        for key in list(self._cand_items.keys()):
+            if key not in current_keys:
+                item = self._cand_items.pop(key)
+                row = self._lst_candidates.row(item)
+                if row >= 0:
+                    self._lst_candidates.takeItem(row)
+        
+        # Update existing or add new items
+        for key, c in current_keys.items():
+            if key in self._cand_items:
+                item = self._cand_items[key]
+                item.setText(c.display_label())
+                # Re-apply filter visibility
+                if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
+                    item.setHidden(True)
+                else:
+                    item.setHidden(False)
+            else:
+                item = QListWidgetItem(c.display_label())
+                item.setData(32, key)
+                self._lst_candidates.addItem(item)
+                self._cand_items[key] = item
+                if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
+                    item.setHidden(True)
+        
         if self._lst_candidates.count() > 0 and self._lst_candidates.currentItem() is None:
             self._lst_candidates.setCurrentRow(0)
 
@@ -1258,7 +1294,7 @@ class DebugWindow(QMainWindow):
         )
 
     def _refresh_confirmed_tab(self) -> None:
-        """Rebuild the Confirmed tab list and update its title badge."""
+        """Incrementally update the Confirmed tab list and title badge."""
         if not hasattr(self, "_lst_confirmed"):
             return  # called before UI is built (during __init__)
         # Build a lookup map from hook-code string → HookCandidate so confirmed
@@ -1267,7 +1303,18 @@ class DebugWindow(QMainWindow):
         if self._searcher is not None:
             for c in self._searcher.ranked_candidates():
                 cand_map[c.to_hook_code().to_str()] = c
-        self._lst_confirmed.clear()
+        
+        current_keys = set(self._confirmed_hook_codes)
+        
+        # Remove items no longer confirmed
+        for key in list(self._confirmed_items.keys()):
+            if key not in current_keys:
+                item = self._confirmed_items.pop(key)
+                row = self._lst_confirmed.row(item)
+                if row >= 0:
+                    self._lst_confirmed.takeItem(row)
+        
+        # Update existing or add new items
         for code_str in self._confirmed_hook_codes:
             if code_str in cand_map:
                 label = cand_map[code_str].display_label()
@@ -1277,9 +1324,15 @@ class DebugWindow(QMainWindow):
                     label = f"+{hc.rva:#x}  {hc.access_pattern}  ({hc.module})"
                 except ValueError:
                     label = code_str
-            item = QListWidgetItem(label)
-            item.setData(32, code_str)
-            self._lst_confirmed.addItem(item)
+            
+            if code_str in self._confirmed_items:
+                self._confirmed_items[code_str].setText(label)
+            else:
+                item = QListWidgetItem(label)
+                item.setData(32, code_str)
+                self._lst_confirmed.addItem(item)
+                self._confirmed_items[code_str] = item
+        
         count = len(self._confirmed_hook_codes)
         self._tab_cands.setTabText(2, f"Confirmed ({count})")
         if count > 0:
