@@ -71,20 +71,39 @@ static volatile LONG g_ring_seq = 0;
 #define SIG_CACHE_SIZE 65521u
 static volatile LONG g_sig_cache[SIG_CACHE_SIZE];
 
-/* ---- per-address call-rate suppressor ----
- * Each entry counts raw invocations of a given address (hashed).
- * Once the count exceeds SEND_CALL_LIMIT the slot is marked
- * SUPPRESSED (0x7FFFFFFF) and Send() returns immediately without
- * doing any memory scanning.  No thread suspension required.
- * Hash collisions can silence a second address that shares the
- * slot -- acceptable: a slot holds ~7000 unique addresses on
- * average across 60000 hooks, so collisions are rare.
+/* ---- per-address call-rate suppressor (time-decayed) ----
+ * Each slot stores {epoch(16b), count(16b)} packed in one LONG.
+ * Count is limited per epoch-window (SEND_CALL_LIMIT); when the worker
+ * advances epoch, slots lazily reset on next hit (epoch mismatch).
+ *
+ * This avoids the old "monotonic forever" behavior where long sessions
+ * eventually suppressed nearly everything due to ever-increasing counters.
+ *
+ * NOTE: hashing collisions still exist by design; decay bounds their impact
+ * to one window instead of the whole session lifetime.
  */
 #define CALL_RATE_SIZE   65521u
 #define SEND_CALL_LIMIT  150        /* raw calls before auto-disable        */
-#define SUPPRESSED       0x7FFFFFFF
+#define RATE_WINDOW_MS   3000u      /* per-slot count decay window          */
 static volatile LONG g_call_rate[CALL_RATE_SIZE];
 static volatile LONG g_need_apply = 0; /* set in Send(), consumed in ring_drain() */
+static volatile LONG g_rate_epoch = 1;  /* low 16 bits used in packed slots    */
+static volatile LONG64 g_rate_next_decay_ms = 0;
+
+static void rate_decay_tick(void) {
+    ULONGLONG now = GetTickCount64();
+    LONG64 due = InterlockedCompareExchange64(&g_rate_next_decay_ms, 0, 0);
+    if (due == 0) {
+        InterlockedExchange64(&g_rate_next_decay_ms, (LONG64)(now + RATE_WINDOW_MS));
+        return;
+    }
+    if ((ULONGLONG)due > now) return;
+
+    LONG64 next_due = (LONG64)(now + RATE_WINDOW_MS);
+    if (InterlockedCompareExchange64(&g_rate_next_decay_ms, next_due, due) == due) {
+        InterlockedIncrement(&g_rate_epoch);
+    }
+}
 
 /* ---- pending-disable queue (game threads → worker thread only) ----------
  *
@@ -279,23 +298,39 @@ void __cdecl Send(char **stack, uintptr_t address) {
     /* ---- 0. per-address call-rate gate ---- */
     {
         ULONG ci = (ULONG)((address * 2654435761ULL) % CALL_RATE_SIZE);
-        LONG cur = g_call_rate[ci];
-        if (cur >= SEND_CALL_LIMIT) return;
-        LONG nxt = InterlockedIncrement(&g_call_rate[ci]);
-        if (nxt == SEND_CALL_LIMIT) {
-            /* First thread to hit the limit for this slot.
-             * DO NOT call MH_QueueDisableHook here -- MinHook is NOT
-             * thread-safe and multiple game threads may reach this
-             * branch concurrently for different addresses, corrupting
-             * MinHook's internal state.  Instead, post the VA into the
-             * lock-free pending-disable ring; the worker thread drains
-             * it and calls MinHook APIs single-threadedly.
-             */
-            LONG slot = InterlockedIncrement(&g_pdisable_seq) & (LONG)PDISABLE_MASK;
-            InterlockedExchange64(&g_pdisable[slot], (LONG64)(uintptr_t)address);
-            InterlockedExchange(&g_need_apply, 1);
+        for (;;) {
+            LONG cur = g_call_rate[ci];
+            ULONG epoch = (ULONG)(InterlockedCompareExchange(&g_rate_epoch, 0, 0)) & 0xFFFFu;
+            ULONG cur_epoch = ((ULONG)cur >> 16) & 0xFFFFu;
+            ULONG cur_cnt = (ULONG)cur & 0xFFFFu;
+
+            ULONG new_cnt;
+            ULONG packed_u;
+            LONG nxt;
+
+            if (cur_epoch != epoch) {
+                new_cnt = 1u;
+            } else {
+                if (cur_cnt >= SEND_CALL_LIMIT) return;
+                new_cnt = cur_cnt + 1u;
+            }
+
+            packed_u = ((epoch & 0xFFFFu) << 16) | (new_cnt & 0xFFFFu);
+            nxt = (LONG)packed_u;
+            if (InterlockedCompareExchange(&g_call_rate[ci], nxt, cur) != cur) continue;
+
+            if (new_cnt == SEND_CALL_LIMIT) {
+                /* First hit to reach limit in this decay window.
+                 * DO NOT call MH_QueueDisableHook here -- MinHook is NOT
+                 * thread-safe on game threads. Queue for worker-thread apply.
+                 */
+                LONG slot = InterlockedIncrement(&g_pdisable_seq) & (LONG)PDISABLE_MASK;
+                InterlockedExchange64(&g_pdisable[slot], (LONG64)(uintptr_t)address);
+                InterlockedExchange(&g_need_apply, 1);
+            }
+            if (new_cnt >= SEND_CALL_LIMIT) return;
+            break;
         }
-        if (nxt >= SEND_CALL_LIMIT) return;
     }
 
     for (int i=-(int)SEND_REG_LO; i<(int)SEND_STK_HI; i++) {
@@ -550,13 +585,17 @@ static void unregister_trampolines_for_seh(void) {
  * ============================================================= */
 static long scan_next_batch(DWORD batch) {
     long newly = 0;
+    long skipped_outside_text = 0;  /* Track non-.text functions */
     for (; g_pdata_pos < g_pdata_count
            && g_hook_count < (long)g_mh
            && (DWORD)newly < batch;
          g_pdata_pos++) {
 
         uintptr_t fn_addr = g_img_base + g_pdata[g_pdata_pos].BeginAddress;
-        if (fn_addr < g_ts_base || fn_addr >= g_ts_base + g_ts_size) continue;
+        if (fn_addr < g_ts_base || fn_addr >= g_ts_base + g_ts_size) {
+            skipped_outside_text++;
+            continue;
+        }
 
         DWORD fn_rva = g_pdata[g_pdata_pos].BeginAddress;
 
@@ -582,6 +621,15 @@ static long scan_next_batch(DWORD batch) {
         g_hook_addrs[g_hook_count++] = (uint64_t)fn_addr;
         newly++;
     }
+    
+    /* Log filtering statistics if any functions were skipped */
+    if (skipped_outside_text > 0) {
+        char sbuf[64];
+        int n = _snprintf_s(sbuf, sizeof(sbuf), _TRUNCATE,
+            "skip_nontext:%ld", skipped_outside_text);
+        if (n > 0) log_phase(sbuf);
+    }
+    
     return newly;
 }
 
@@ -599,9 +647,16 @@ static long scan_next_batch(DWORD batch) {
 #define CMD_SCAN_NEXT 2
 
 static void do_search(const Config *cfg) {
+    log_phase("DO_SEARCH_ENTER");
     if (MH_Initialize()!=MH_OK) {
         pipe_write(0,0,1,"ERROR:MH_Initialize",19); return;
     }
+    log_phase("MH_INIT_OK");
+
+    /* Reset decayed call-rate limiter state for each search session. */
+    ZeroMemory((void*)g_call_rate, sizeof(g_call_rate));
+    InterlockedExchange(&g_rate_epoch, 1);
+    InterlockedExchange64(&g_rate_next_decay_ms, (LONG64)(GetTickCount64() + RATE_WINDOW_MS));
 
     /* Patch Send pointer into module-level template (shared by all batches) */
     memcpy(g_tpl, s_tpl, TRAMPOLINE_SIZE);
@@ -629,11 +684,28 @@ static void do_search(const Config *cfg) {
     IMAGE_NT_HEADERS *nt=(IMAGE_NT_HEADERS*)(g_img_base+dos->e_lfanew);
     IMAGE_SECTION_HEADER *sec=IMAGE_FIRST_SECTION(nt);
 
+    log_phase("BEFORE_TEXT_SCAN");
     g_ts_base=0; g_ts_size=0;
     for (WORD i=0;i<nt->FileHeader.NumberOfSections;i++)
         if (!memcmp(sec[i].Name,".text",5))
             { g_ts_base=g_img_base+sec[i].VirtualAddress; g_ts_size=sec[i].Misc.VirtualSize; break; }
-    if (!g_ts_base) { g_ts_base=g_img_base; g_ts_size=mi.SizeOfImage; }
+    log_phase("AFTER_TEXT_SCAN");
+    if (!g_ts_base) {
+        pipe_write(0,0,1,"ERROR:no .text section found",29);
+        log_phase("ERROR:no .text section found");
+        MH_Uninitialize(); return;
+    }
+    
+    /* Log .text segment range for verification */
+    {
+        char tbuf[80];
+        int n = _snprintf_s(tbuf, sizeof(tbuf), _TRUNCATE,
+            "text_seg:0x%llX-0x%llX sz=%lu",
+            (unsigned long long)g_ts_base,
+            (unsigned long long)(g_ts_base + g_ts_size),
+            (unsigned long)g_ts_size);
+        if (n > 0) log_phase(tbuf);
+    }
 
     /* Load pdata early so g_pdata_count can drive capacity (must precede alloc) */
     IMAGE_DATA_DIRECTORY *edir =
@@ -729,6 +801,7 @@ static void do_search(const Config *cfg) {
      * ============================================================= */
     bool pipe_ok = true;
     while (pipe_ok && g_pipe != INVALID_HANDLE_VALUE) {
+        rate_decay_tick();
         DWORD av = 0;
         if (!PeekNamedPipe(g_pipe, NULL, 0, NULL, &av, NULL)) break;
 
@@ -1013,6 +1086,7 @@ static void do_hook(const Config *cfg){
 
 static DWORD WINAPI worker(LPVOID _){
     (void)_;
+    log_phase("WORKER_THREAD_START");
     /* Boost this thread so it stays responsive even when Windows throttles
      * the game process (e.g. when the game window is in the background or
      * the VN engine is idle / waiting for user input).  ABOVE_NORMAL is
@@ -1029,6 +1103,11 @@ static DWORD WINAPI worker(LPVOID _){
     Config cfg;
     if(!pipe_read_all(&cfg,sizeof(cfg))){CloseHandle(g_pipe);g_pipe=INVALID_HANDLE_VALUE;return 1;}
     g_cfg=cfg;
+    {
+        char mbuf[64];
+        _snprintf_s(mbuf, sizeof(mbuf), _TRUNCATE, "CFG_MODE=%d", (int)cfg.mode);
+        log_phase(mbuf);
+    }
     if(cfg.mode==MODE_SEARCH)do_search(&cfg); else do_hook(&cfg);
     CloseHandle(g_pipe);g_pipe=INVALID_HANDLE_VALUE;
     return 0;

@@ -64,6 +64,15 @@ _DEFAULT_BATCH_SIZE:    int   = 2000  # functions per batch — larger batches f
 # Minimum score for a candidate to appear in the "Recommended" tab.
 _RECOMMEND_SCORE_THRESHOLD: float = 60.0
 
+# Win64 calling convention filter for stack slots captured by DLL Send().
+# stack[0]   = return address
+# stack[1:5] = 32-byte shadow space (NOT arguments)
+# stack[5]   = arg5 at [rsp+0x28]
+# We only keep a bounded range of true stack arguments to avoid pulling
+# caller-frame noise that causes "relay" candidates.
+_STACK_ARG_MIN_SLOT: int = 5
+_STACK_ARG_MAX_SLOT: int = 12
+
 # How long to wait for the injected DLL to connect before assuming it is a
 # stale leftover from a previous session (20 s is generous; normally < 1 s).
 _CONNECT_TIMEOUT_S: float = 20.0
@@ -518,7 +527,8 @@ class HookSearcher:
         #   stack[-8] = rsi    stack[-9] = rdi
         #   stack[-10] = r8 (arg2)  stack[-11] = r9 (arg3)
         #   stack[-12..-17] = r10-r15
-        #   stack[1..N] = caller stack frame
+        #   stack[1..4] = Win64 shadow space (NOT function arguments)
+        #   stack[5..]  = stack arguments (arg5 and above)
         _reg_to_pattern: dict[int, str] = {
             -4:  "r0",   # rcx = arg0
             -5:  "r1",   # rdx = arg1
@@ -527,10 +537,10 @@ class HookSearcher:
         }
         if slot_i in _reg_to_pattern:
             pattern = _reg_to_pattern[slot_i]
-        elif slot_i >= 1:
+        elif _STACK_ARG_MIN_SLOT <= slot_i <= _STACK_ARG_MAX_SLOT:
             pattern = f"s+{slot_i * 8:#x}"
         else:
-            return   # saved non-arg register or return addr — ignore
+            return   # non-argument locations (incl. shadow space) are ignored
 
         enc_str = "utf16" if encoding == 0 else "utf8"
 
