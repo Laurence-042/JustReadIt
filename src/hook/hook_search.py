@@ -507,6 +507,17 @@ class HookSearcher:
         (SEND_CALL_LIMIT).  Python only sees results that passed the C-level
         gate, so no additional frequency filtering is needed here.
         """
+        # DEBUG: log specific test texts with full details (rva + slot_i)
+        _target_heads = ("時代を逆", "あの施", "起動さえ", "みんな")
+        if any(text.startswith(h) for h in _target_heads):
+            module = _resolve_module(hook_va, self._pid)
+            if module:
+                base, name = module
+                rva = hook_va - base
+                print(f"[{name}+{rva:#x} slot={slot_i:3d}] {text[:10]!r}", flush=True)
+            else:
+                print(f"[VA={hook_va:#x} slot={slot_i:3d}] {text[:10]!r}", flush=True)
+        
         s = score_candidate(text, self._ocr_lang)
         if s <= 0:
             return
@@ -530,26 +541,34 @@ class HookSearcher:
         #   stack[1..4] = Win64 shadow space (NOT function arguments)
         #   stack[5..]  = stack arguments (arg5 and above)
         #
-        # Send() scans [-16..+8] (25 positions total). We now accept ALL of
-        # them instead of silently dropping non-standard locations, to avoid
-        # losing game text that appears in unexpected registers/stack slots.
+        # Send() scans [-16..+8] (25 positions total).
+        # Accept ALL positions temporarily for debugging - assign each a unique pattern.
         _reg_to_pattern: dict[int, str] = {
-            -4:  "r0",   # rcx = arg0
-            -5:  "r1",   # rdx = arg1
-            -10: "r2",   # r8  = arg2
-            -11: "r3",   # r9  = arg3
+            -1:  "rflags",
+            -2:  "rax",
+            -3:  "rbx",
+            -4:  "r0",    # rcx = arg0
+            -5:  "r1",    # rdx = arg1
+            -6:  "rsp_saved",
+            -7:  "rbp",
+            -8:  "rsi",
+            -9:  "rdi",
+            -10: "r2",    # r8  = arg2
+            -11: "r3",    # r9  = arg3
+            -12: "r10",
+            -13: "r11",
+            -14: "r12",
+            -15: "r13",
+            -16: "r14",
         }
         if slot_i in _reg_to_pattern:
             pattern = _reg_to_pattern[slot_i]
-        elif _STACK_ARG_MIN_SLOT <= slot_i <= _STACK_ARG_MAX_SLOT:
-            # Standard stack arguments (arg5+): s+0x28, s+0x30, s+0x38, s+0x40
-            pattern = f"s+{slot_i * 8:#x}"
         elif slot_i >= 0:
-            # Return address, shadow space, or stack above arg12
+            # Stack positions (return addr, shadow space, stack args)
             pattern = f"s+{slot_i * 8:#x}"
         else:
-            # Other saved registers or negative stack offsets
-            pattern = f"s-{abs(slot_i * 8):#x}"
+            # Unexpected negative offset beyond -16
+            pattern = f"unk_{slot_i}"
 
         enc_str = "utf16" if encoding == 0 else "utf8"
 
