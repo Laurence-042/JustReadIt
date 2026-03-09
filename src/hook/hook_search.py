@@ -335,7 +335,7 @@ class HookSearcher:
             if hdr_bytes is None:
                 break
 
-            hook_va, slot_i, encoding, text_len = unpack_result_hdr(hdr_bytes)
+            hook_va, str_ptr, slot_i, encoding, text_len = unpack_result_hdr(hdr_bytes)
 
             if text_len == 0:
                 continue
@@ -357,7 +357,7 @@ class HookSearcher:
                 self._handle_control(text)
                 continue
 
-            self._handle_hit(hook_va, slot_i, encoding, text)
+            self._handle_hit(hook_va, str_ptr, slot_i, encoding, text)
             # Culls are flushed in bulk by the batch-settle timer (_send_next_batch)
             # rather than per-hit, to avoid starving the timer thread of _write_lock.
 
@@ -499,7 +499,7 @@ class HookSearcher:
             self._live_feed.clear()
         return texts
 
-    def _handle_hit(self, hook_va: int, slot_i: int,
+    def _handle_hit(self, hook_va: int, str_ptr: int, slot_i: int,
                      encoding: int, text: str) -> None:
         """Build / update a HookCandidate from a single pipe result.
 
@@ -577,6 +577,7 @@ class HookSearcher:
                 # Always update to latest text (reflects current game state)
                 c.text = text
                 c.score = s
+                c.str_ptr = str_ptr
                 if not c.hook_va:
                     c.hook_va = hook_va
             else:
@@ -589,6 +590,7 @@ class HookSearcher:
                     hit_count=1,
                     score=s,
                     hook_va=hook_va,
+                    str_ptr=str_ptr,
                 )
             # If this address is in the confirmed set, add to the live feed.
             if self._confirmed_vas and hook_va in self._confirmed_vas:

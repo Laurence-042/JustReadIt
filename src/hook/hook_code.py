@@ -143,6 +143,7 @@ class HookCandidate:
     hit_count: int = 0
     score: float = 0.0
     hook_va: int = 0  # absolute VA as received from the pipe; used for confirmed-set filtering
+    str_ptr: int = 0  # VA of the string in game memory (from Send's stack scan)
 
     def to_hook_code(self) -> HookCode:
         return HookCode(
@@ -156,12 +157,103 @@ class HookCandidate:
         """Short label for UI display (sorted by RVA; no score)."""
         preview = self.text[:60].replace("\n", " ")
         return (
-            f"+{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}  {preview!r}"
+            f"+{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}"
+            f"  ptr={self.str_ptr:#x}  {preview!r}"
         )
 
     def display_label_scored(self) -> str:
         """Label with score prefix, used in the Recommended tab."""
         preview = self.text[:55].replace("\n", " ")
         return (
-            f"[{self.score:6.0f}]  +{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}  {preview!r}"
+            f"[{self.score:6.0f}]  +{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}"
+            f"  ptr={self.str_ptr:#x}  {preview!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Proximity analysis
+# ---------------------------------------------------------------------------
+
+
+def group_by_str_ptr(
+    candidates: list[HookCandidate],
+    tolerance: int = 256,
+) -> list[list[HookCandidate]]:
+    """Group *candidates* whose ``str_ptr`` values fall within *tolerance* bytes.
+
+    Useful for identifying hook sites that share the same string buffer
+    (e.g. two call sites that both receive a pointer into the same object).
+
+    Algorithm: sort by ``str_ptr``, then merge into a group while consecutive
+    entries are within *tolerance* of the group's minimum address.  Candidates
+    with ``str_ptr == 0`` are placed in a separate ``[unresolved]`` group at
+    the end.
+
+    Parameters
+    ----------
+    candidates:
+        Any iterable of :class:`HookCandidate`.
+    tolerance:
+        Maximum byte distance between two ``str_ptr`` values to be considered
+        "close".  Default 256 (covers typical struct-field offsets).
+
+    Returns
+    -------
+    list[list[HookCandidate]]
+        Groups sorted by the minimum ``str_ptr`` of each group, largest group
+        first within the same address range.  Unresolved (ptr=0) group, if
+        any, is appended last.
+    """
+    resolved   = [c for c in candidates if c.str_ptr != 0]
+    unresolved = [c for c in candidates if c.str_ptr == 0]
+
+    resolved.sort(key=lambda c: c.str_ptr)
+
+    groups: list[list[HookCandidate]] = []
+    for c in resolved:
+        if groups and c.str_ptr - groups[-1][0].str_ptr <= tolerance:
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+
+    # Sort each group by str_ptr, then sort groups: larger groups first,
+    # tie-break by minimum str_ptr so the output is deterministic.
+    for g in groups:
+        g.sort(key=lambda c: c.str_ptr)
+    groups.sort(key=lambda g: (-len(g), g[0].str_ptr))
+
+    if unresolved:
+        groups.append(unresolved)
+
+    return groups
+
+
+def format_ptr_groups(
+    groups: list[list[HookCandidate]],
+    *,
+    min_group_size: int = 2,
+) -> str:
+    """Format the output of :func:`group_by_str_ptr` as a human-readable string.
+
+    Parameters
+    ----------
+    groups:
+        Return value of :func:`group_by_str_ptr`.
+    min_group_size:
+        Groups smaller than this are omitted from the output.  Set to 1 to
+        show all.
+    """
+    lines: list[str] = []
+    for i, group in enumerate(groups):
+        if len(group) < min_group_size:
+            continue
+        ptrs = [c.str_ptr for c in group if c.str_ptr]
+        span = max(ptrs) - min(ptrs) if len(ptrs) > 1 else 0
+        header = (
+            f"[group {i}]  {len(group)} candidates"
+            + (f"  ptr range {min(ptrs):#x}–{max(ptrs):#x}  span={span} B" if ptrs else "  (unresolved)")
+        )
+        lines.append(header)
+        for c in group:
+            lines.append(f"    {c.display_label()}")
+    return "\n".join(lines) if lines else "(no groups with >= {} members)".format(min_group_size)

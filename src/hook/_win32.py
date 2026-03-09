@@ -293,15 +293,16 @@ _CONFIG_SIZE = struct.calcsize(_CONFIG_FMT)  # must be 24
 
 assert _CONFIG_SIZE == 24, f"Config struct size mismatch: {_CONFIG_SIZE}"
 
-# struct ResultHdr (16 bytes):
+# struct ResultHdr (24 bytes):
 #   [8]  hook_va
+#   [8]  str_ptr  (VA of the string in game memory)
 #   [4]  slot_i  (signed)
 #   [2]  encoding
 #   [2]  text_len
-_RESULT_HDR_FMT  = "<QiHH"
-_RESULT_HDR_SIZE = struct.calcsize(_RESULT_HDR_FMT)  # must be 16
+_RESULT_HDR_FMT  = "<QQiHH"
+_RESULT_HDR_SIZE = struct.calcsize(_RESULT_HDR_FMT)  # must be 24
 
-assert _RESULT_HDR_SIZE == 16, f"ResultHdr struct size mismatch: {_RESULT_HDR_SIZE}"
+assert _RESULT_HDR_SIZE == 24, f"ResultHdr struct size mismatch: {_RESULT_HDR_SIZE}"
 
 
 def pack_search_config(
@@ -327,8 +328,8 @@ def pack_search_config(
                        )
 
 
-def unpack_result_hdr(data: bytes) -> tuple[int, int, int, int]:
-    """Unpack a ResultHdr into (hook_va, slot_i, encoding, text_len)."""
+def unpack_result_hdr(data: bytes) -> tuple[int, int, int, int, int]:
+    """Unpack a ResultHdr into (hook_va, str_ptr, slot_i, encoding, text_len)."""
     return struct.unpack(_RESULT_HDR_FMT, data)
 
 

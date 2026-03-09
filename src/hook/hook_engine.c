@@ -10,6 +10,8 @@
 #include <psapi.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include "MinHook.h"
@@ -24,6 +26,11 @@
 #define SEND_REG_LO   16
 #define SEND_STK_HI   9
 
+/* Pre-hook static filters (see fn_calls_only_blacklisted_imports, scan_next_batch).
+ * MinHook rejects functions shorter than its own patch sequence (~14 B), so
+ * MIN_FN_BYTES mainly avoids the overhead of a doomed MH_CreateHook call.  */
+#define MIN_FN_BYTES  16
+
 /* Trampoline byte offsets */
 #define TRAMPOLINE_ADDR_OFFSET  74
 #define TRAMPOLINE_SEND_OFFSET  84
@@ -35,7 +42,8 @@ typedef struct { uint8_t mode; uint8_t _p0[3]; uint32_t max_hooks;
                  uint64_t hook_address; uint8_t arg_idx; uint8_t deref;
                  uint16_t byte_offset; uint16_t encoding;
                  uint16_t batch_size;   /* MODE_SEARCH: hooks per batch (0 = all at once) */ } Config;
-typedef struct { uint64_t hook_va; int32_t slot_i;
+typedef struct { uint64_t hook_va; uint64_t str_ptr;  /* VA of the string in game memory */
+                 int32_t slot_i;
                  uint16_t encoding; uint16_t text_len; } ResultHdr;
 #pragma pack(pop)
 
@@ -199,7 +207,7 @@ static void pipe_write(uintptr_t va, int slot, int enc,
     if (g_pipe==INVALID_HANDLE_VALUE||!nb||nb>MAX_STR_LEN*2) return;
     uint8_t buf[sizeof(ResultHdr)+MAX_STR_LEN*2];
     ResultHdr *h=(ResultHdr*)buf;
-    h->hook_va=(uint64_t)va; h->slot_i=(int32_t)slot;
+    h->hook_va=(uint64_t)va; h->str_ptr=0; h->slot_i=(int32_t)slot;
     h->encoding=(uint16_t)enc; h->text_len=(uint16_t)nb;
     memcpy(buf+sizeof(ResultHdr),txt,nb);
     DWORD wr=0;
@@ -209,13 +217,13 @@ static void pipe_write(uintptr_t va, int slot, int enc,
 /* ================================================================
  * ring push (any thread, lock-free)
  * ============================================================= */
-static void ring_push(uintptr_t va, int slot, int enc,
+static void ring_push(uintptr_t va, uintptr_t str_ptr, int slot, int enc,
                       const void *txt, DWORD nb) {
     if (!nb||nb>MAX_STR_LEN*2) return;
     LONG seq=InterlockedIncrement(&g_ring_seq)-1;
     RingSlot *s=&g_ring[seq&(RING_SLOTS-1)];
     if (InterlockedCompareExchange(&s->state,1,0)!=0) return;
-    s->hdr.hook_va=(uint64_t)va; s->hdr.slot_i=(int32_t)slot;
+    s->hdr.hook_va=(uint64_t)va; s->hdr.str_ptr=(uint64_t)str_ptr; s->hdr.slot_i=(int32_t)slot;
     s->hdr.encoding=(uint16_t)enc; s->hdr.text_len=(uint16_t)nb;
     memcpy(s->text,txt,nb);
     _WriteBarrier(); s->state=2;
@@ -394,7 +402,7 @@ void __cdecl Send(char **stack, uintptr_t address) {
         if (!has_cjk(local,wlen)) continue;
 
         /* ---- 7. push to ring (memcpy from local stack -- always safe) ---- */
-        ring_push(address, i, 0, local, (DWORD)(wlen*sizeof(WCHAR)));
+        ring_push(address, val, i, 0, local, (DWORD)(wlen*sizeof(WCHAR)));
     }
 }
 
@@ -574,6 +582,135 @@ static void unregister_trampolines_for_seh(void) {
 }
 
 /* ================================================================
+ * Static pre-hook filter - IAT blacklist
+ *
+ * Functions whose EVERY resolvable direct import call (FF 15 / FF 25)
+ * targets a "clearly unrelated" API are skipped before MH_CreateHook.
+ *
+ * CONSERVATIVE semantics:
+ *   - Skipped only when: (a) at least one FF-15/FF-25 call decoded, AND
+ *     (b) every such call resolves to a blacklisted IAT slot.
+ *   - Unresolvable bytes, indirect/virtual calls (FF 10 / FF 50), and
+ *     intra-module relative calls (E8) are NOT counted as blacklisted.
+ *   - Zero decoded calls -> function is KEPT (relevance unknown).
+ *
+ * --- Extension point ---
+ * Edit SKIP_IAT_KEYWORDS to tune the filter.  Entries are matched with
+ * case-sensitive strstr; keep them specific to avoid false-positive
+ * skips of legitimate text-processing functions.
+ * ============================================================= */
+
+/* Case-sensitive substrings matched against each imported function name.  */
+static const char * const SKIP_IAT_KEYWORDS[] = {
+    /* GDI rasterisation */
+    "BitBlt", "StretchBlt", "PatBlt", "MaskBlt", "PlgBlt",
+    /* DXGI present / flip */
+    "Present",
+    /* High-res timing - pure arithmetic, no string handling */
+    "QueryPerformanceCounter", "QueryPerformanceFrequency",
+    "timeGetTime", "timeBeginPeriod", "timeEndPeriod",
+    /* Win32 waveform audio */
+    "waveOutWrite", "waveOutOpen", "waveOutClose",
+    "waveOutPrepareHeader", "waveOutUnprepareHeader",
+    NULL  /* sentinel */
+};
+
+/* Sorted array of IAT *slot* VAs whose import name matched a keyword.
+ * Built once by build_iat_blacklist(); freed on DLL_PROCESS_DETACH. */
+static uintptr_t *g_iat_bl     = NULL;
+static DWORD      g_iat_bl_cnt = 0;
+
+static int _cmp_uptr(const void *a, const void *b) {
+    uintptr_t x = *(const uintptr_t *)a;
+    uintptr_t y = *(const uintptr_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Walk the PE import directory; build g_iat_bl sorted by slot VA.
+ * Must be called after g_img_base is set.                                 */
+static void build_iat_blacklist(void) {
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_img_base;
+    IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS *)(g_img_base + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY *idir =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!idir->VirtualAddress || !idir->Size) { log_phase("iat_bl_built:0"); return; }
+
+    /* Pass 1 - count matches to size the heap allocation. */
+    DWORD capacity = 0;
+    IMAGE_IMPORT_DESCRIPTOR *imp =
+        (IMAGE_IMPORT_DESCRIPTOR *)(g_img_base + idir->VirtualAddress);
+    for (; imp->Name; imp++) {
+        if (!imp->OriginalFirstThunk) continue;
+        uintptr_t *int_tbl = (uintptr_t *)(g_img_base + imp->OriginalFirstThunk);
+        for (DWORD i = 0; int_tbl[i]; i++) {
+            if (int_tbl[i] & IMAGE_ORDINAL_FLAG64) continue;
+            const char *fname = (const char *)
+                (g_img_base + (DWORD)int_tbl[i] + offsetof(IMAGE_IMPORT_BY_NAME, Name));
+            for (const char * const *kw = SKIP_IAT_KEYWORDS; *kw; kw++)
+                if (strstr(fname, *kw)) { capacity++; break; }
+        }
+    }
+    if (!capacity) { log_phase("iat_bl_built:0"); return; }
+
+    uintptr_t *buf = (uintptr_t *)HeapAlloc(
+        GetProcessHeap(), 0, (size_t)capacity * sizeof(uintptr_t));
+    if (!buf) return;
+
+    /* Pass 2 - record the IAT slot VAs that matched. */
+    DWORD filled = 0;
+    imp = (IMAGE_IMPORT_DESCRIPTOR *)(g_img_base + idir->VirtualAddress);
+    for (; imp->Name && filled < capacity; imp++) {
+        if (!imp->OriginalFirstThunk) continue;
+        uintptr_t *int_tbl = (uintptr_t *)(g_img_base + imp->OriginalFirstThunk);
+        uintptr_t *iat_tbl = (uintptr_t *)(g_img_base + imp->FirstThunk);
+        for (DWORD i = 0; int_tbl[i] && filled < capacity; i++) {
+            if (int_tbl[i] & IMAGE_ORDINAL_FLAG64) continue;
+            const char *fname = (const char *)
+                (g_img_base + (DWORD)int_tbl[i] + offsetof(IMAGE_IMPORT_BY_NAME, Name));
+            for (const char * const *kw = SKIP_IAT_KEYWORDS; *kw; kw++) {
+                if (strstr(fname, *kw)) {
+                    buf[filled++] = (uintptr_t)&iat_tbl[i];
+                    break;
+                }
+            }
+        }
+    }
+    qsort(buf, (size_t)filled, sizeof(uintptr_t), _cmp_uptr);
+    g_iat_bl     = buf;
+    g_iat_bl_cnt = filled;
+    char mbuf[48];
+    _snprintf_s(mbuf, sizeof(mbuf), _TRUNCATE, "iat_bl_built:%lu", (unsigned long)filled);
+    log_phase(mbuf);
+}
+
+/* Returns true if every direct import call (FF 15 / FF 25 RIP-relative)
+ * decoded from [fn, fn+fn_size) resolves to a blacklisted IAT slot, AND
+ * at least one such call was found.  Conservatively returns false when
+ * unsure (zero calls found, or any call resolves outside the blacklist). */
+static bool fn_calls_only_blacklisted_imports(
+        const BYTE *fn, DWORD fn_size) {
+    if (!g_iat_bl_cnt || fn_size < 6) return false;
+    DWORD total = 0, matched = 0;
+    const BYTE *end = fn + fn_size - 5; /* need 6 bytes: FF 15/25 xx xx xx xx */
+    for (const BYTE *p = fn; p < end; p++) {
+        if (p[0] != 0xFF) continue;
+        if (p[1] != 0x15 && p[1] != 0x25) continue;
+        /* RIP-relative: next-insn address + signed disp32 = IAT slot VA */
+        uintptr_t slot = (uintptr_t)(p + 6) + *(const int32_t *)(p + 2);
+        total++;
+        /* Binary search in sorted blacklist */
+        DWORD lo = 0, hi = g_iat_bl_cnt;
+        while (lo < hi) {
+            DWORD mid = lo + (hi - lo) / 2;
+            if      (g_iat_bl[mid] < slot) lo = mid + 1;
+            else if (g_iat_bl[mid] > slot) hi = mid;
+            else { matched++; break; }
+        }
+    }
+    return total > 0 && total == matched;
+}
+
+/* ================================================================
  * scan_next_batch
  *
  * Hook up to `batch` more functions from g_pdata starting at
@@ -584,8 +721,10 @@ static void unregister_trampolines_for_seh(void) {
  * Returns the number of hooks newly installed.
  * ============================================================= */
 static long scan_next_batch(DWORD batch) {
-    long newly = 0;
-    long skipped_outside_text = 0;  /* Track non-.text functions */
+    long newly                = 0;
+    long skipped_outside_text = 0;
+    long skipped_size         = 0;  /* below MIN_FN_BYTES */
+    long skipped_iat          = 0;  /* IAT-blacklist filter */
     for (; g_pdata_pos < g_pdata_count
            && g_hook_count < (long)g_mh
            && (DWORD)newly < batch;
@@ -595,6 +734,16 @@ static long scan_next_batch(DWORD batch) {
         if (fn_addr < g_ts_base || fn_addr >= g_ts_base + g_ts_size) {
             skipped_outside_text++;
             continue;
+        }
+
+        /* ---- Size filter: skip obvious stubs MinHook would reject anyway ---- */
+        DWORD fn_size = g_pdata[g_pdata_pos].EndAddress
+                      - g_pdata[g_pdata_pos].BeginAddress;
+        if (fn_size < MIN_FN_BYTES) { skipped_size++; continue; }
+
+        /* ---- IAT blacklist: skip functions that only call unrelated APIs ---- */
+        if (fn_calls_only_blacklisted_imports((const BYTE *)fn_addr, fn_size)) {
+            skipped_iat++; continue;
         }
 
         DWORD fn_rva = g_pdata[g_pdata_pos].BeginAddress;
@@ -621,15 +770,16 @@ static long scan_next_batch(DWORD batch) {
         g_hook_addrs[g_hook_count++] = (uint64_t)fn_addr;
         newly++;
     }
-    
-    /* Log filtering statistics if any functions were skipped */
-    if (skipped_outside_text > 0) {
-        char sbuf[64];
+
+    /* Log per-batch filtering statistics. */
+    {
+        char sbuf[128];
         int n = _snprintf_s(sbuf, sizeof(sbuf), _TRUNCATE,
-            "skip_nontext:%ld", skipped_outside_text);
+            "skip_nontext:%ld skip_size:%ld skip_iat:%ld",
+            skipped_outside_text, skipped_size, skipped_iat);
         if (n > 0) log_phase(sbuf);
     }
-    
+
     return newly;
 }
 
@@ -687,7 +837,7 @@ static void do_search(const Config *cfg) {
     log_phase("BEFORE_TEXT_SCAN");
     g_ts_base=0; g_ts_size=0;
     for (WORD i=0;i<nt->FileHeader.NumberOfSections;i++)
-        if (!memcmp(sec[i].Name,".text",5))
+        if (!memcmp(sec[i].Name,".text\0\0\0",8))
             { g_ts_base=g_img_base+sec[i].VirtualAddress; g_ts_size=sec[i].Misc.VirtualSize; break; }
     log_phase("AFTER_TEXT_SCAN");
     if (!g_ts_base) {
@@ -706,6 +856,9 @@ static void do_search(const Config *cfg) {
             (unsigned long)g_ts_size);
         if (n > 0) log_phase(tbuf);
     }
+
+    /* Build IAT blacklist from import directory (uses g_img_base). */
+    build_iat_blacklist();
 
     /* Load pdata early so g_pdata_count can drive capacity (must precede alloc) */
     IMAGE_DATA_DIRECTORY *edir =
@@ -1135,6 +1288,7 @@ BOOL WINAPI DllMain(HINSTANCE h,DWORD reason,LPVOID _){
         unregister_trampolines_for_seh();
         if(g_trampolines)VirtualFree(g_trampolines,0,MEM_RELEASE);
         if(g_hook_addrs)HeapFree(GetProcessHeap(),0,g_hook_addrs);
+        if(g_iat_bl)    HeapFree(GetProcessHeap(),0,g_iat_bl);
     }
     return TRUE;
 }

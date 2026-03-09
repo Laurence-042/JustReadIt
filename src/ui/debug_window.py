@@ -41,6 +41,7 @@ from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.hook.hook_search import (
     HookCandidate, HookCode, HookSearcher, HookSearchError, score_candidate,
 )
+from src.hook.hook_code import group_by_str_ptr, format_ptr_groups
 from .window_picker import WindowPicker
 
 
@@ -548,7 +549,164 @@ class _HookSearchDialog(QDialog):
         super().closeEvent(event)
 
 
+# ---------------------------------------------------------------------------
+# _StrPtrAnalysisDialog  — memory-address proximity analysis
+# ---------------------------------------------------------------------------
 
+class _StrPtrAnalysisDialog(QDialog):
+    """Non-modal window that answers: 'where in memory does this text live?'
+
+    Usage
+    -----
+    Type any substring in the search box.  The results pane shows all
+    :class:`~src.hook.hook_code.HookCandidate` objects whose captured text
+    contains that substring, grouped by ``str_ptr`` proximity (default
+    tolerance 256 bytes).  Groups with multiple candidates sharing a close
+    address range are highlighted, as they likely point into the same
+    game-engine string object.
+
+    The dialog holds a *reference* to the live :class:`~src.hook.hook_search.
+    HookSearcher`; click **Refresh** (or enable Auto) to pull the latest
+    candidate snapshot.
+    """
+
+    def __init__(
+        self,
+        searcher: HookSearcher,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("String Pointer Analysis")
+        self.resize(900, 600)
+        # Non-modal: user can interact with the main window simultaneously.
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        # Keep on top of the parent but not the whole desktop.
+        self.setWindowFlags(
+            self.windowFlags() | Qt.WindowType.Window
+        )
+
+        self._searcher = searcher
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(1000)
+        self._auto_timer.timeout.connect(self._refresh)
+
+        # ── Layout ──────────────────────────────────────────────────────
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+
+        # Row 1: search controls
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Filter text:"))
+        self._edit_filter = QLineEdit()
+        self._edit_filter.setPlaceholderText("substring to match in captured text…")
+        self._edit_filter.setClearButtonEnabled(True)
+        self._edit_filter.textChanged.connect(self._apply_filter)
+        row1.addWidget(self._edit_filter, 1)
+
+        row1.addWidget(QLabel(" Tolerance:"))
+        self._spn_tol = QSpinBox()
+        self._spn_tol.setRange(0, 0x10000)
+        self._spn_tol.setValue(256)
+        self._spn_tol.setSuffix(" B")
+        self._spn_tol.setToolTip(
+            "Maximum byte distance between two str_ptr values "
+            "to be considered the same memory region."
+        )
+        self._spn_tol.valueChanged.connect(self._apply_filter)
+        row1.addWidget(self._spn_tol)
+
+        self._chk_auto = QPushButton("Auto ⏴")
+        self._chk_auto.setCheckable(True)
+        self._chk_auto.setToolTip("Refresh automatically every second")
+        self._chk_auto.toggled.connect(self._on_auto_toggled)
+        row1.addWidget(self._chk_auto)
+
+        btn_refresh = QPushButton("↺ Refresh")
+        btn_refresh.clicked.connect(self._refresh)
+        row1.addWidget(btn_refresh)
+        root.addLayout(row1)
+
+        # Row 2: summary label
+        self._lbl_summary = QLabel("")
+        root.addWidget(self._lbl_summary)
+
+        # Row 3: results
+        self._te_result = QPlainTextEdit()
+        self._te_result.setReadOnly(True)
+        self._te_result.setFont(QFont("Consolas", 9))
+        self._te_result.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        root.addWidget(self._te_result, 1)
+
+        # Row 4: close
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        root.addWidget(btn_close)
+
+        self._refresh()
+
+    # ------------------------------------------------------------------
+
+    @Slot(bool)
+    def _on_auto_toggled(self, on: bool) -> None:
+        if on:
+            self._chk_auto.setText("Auto ⏹")
+            self._auto_timer.start()
+        else:
+            self._chk_auto.setText("Auto ⏴")
+            self._auto_timer.stop()
+
+    def _refresh(self) -> None:
+        """Pull a fresh candidate snapshot and re-run the filter."""
+        self._candidates = self._searcher.ranked_candidates()
+        self._apply_filter()
+
+    @Slot()
+    def _apply_filter(self) -> None:
+        """Filter candidates by text content, group by str_ptr, render."""
+        needle = self._edit_filter.text().strip()
+        tol    = self._spn_tol.value()
+        cands  = getattr(self, "_candidates", [])
+
+        if needle:
+            cands = [c for c in cands if needle in c.text]
+
+        total  = len(cands)
+        groups = group_by_str_ptr(cands, tolerance=tol)
+        # Count groups with >= 2 members (the interesting ones)
+        multi  = sum(1 for g in groups if len(g) >= 2)
+
+        if needle:
+            self._lbl_summary.setText(
+                f"{total} candidates match '{needle}'  —  "
+                f"{len(groups)} ptr group(s), {multi} with ≥2 members"
+            )
+        else:
+            self._lbl_summary.setText(
+                f"{total} candidates total  —  "
+                f"{len(groups)} ptr group(s), {multi} with ≥2 members"
+            )
+
+        # For the text pane: show all groups (min_group_size=1) but mark
+        # multi-candidate groups with a leading *** prefix.
+        lines: list[str] = []
+        for i, group in enumerate(groups):
+            ptrs = [c.str_ptr for c in group if c.str_ptr]
+            if not ptrs:
+                hdr = f"[group {i:2d}]  {len(group)} candidate(s)  (str_ptr unknown)"
+            else:
+                lo, hi = min(ptrs), max(ptrs)
+                span = hi - lo
+                marker = "*** " if len(group) >= 2 else "    "
+                hdr = (
+                    f"{marker}[group {i:2d}]  {len(group)} candidate(s)  "
+                    f"ptr {lo:#018x} .. {hi:#018x}  span={span} B"
+                )
+            lines.append(hdr)
+            for c in group:
+                lines.append(f"    {c.display_label()}")
+            lines.append("")
+
+        self._te_result.setPlainText("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +768,7 @@ class DebugWindow(QMainWindow):
         self._rec_items: dict[str, QListWidgetItem] = {}
         self._cand_items: dict[str, QListWidgetItem] = {}
         self._confirmed_items: dict[str, QListWidgetItem] = {}
+        self._ptr_analysis_dlg: _StrPtrAnalysisDialog | None = None  # singleton
 
         self._install_proc_handle: int | None = None
         self._install_timer = QTimer(self)
@@ -751,9 +910,20 @@ class DebugWindow(QMainWindow):
         self._te_search_diag.setFixedHeight(56)
         self._te_search_diag.setPlaceholderText("DLL diagnostic output\u2026")
         _cands_lay.addWidget(self._te_search_diag)
+        _btn_row = QHBoxLayout()
         _btn_confirm = QPushButton("\u2713  Confirm selected candidate")
         _btn_confirm.clicked.connect(self._confirm_candidate)
-        _cands_lay.addWidget(_btn_confirm)
+        _btn_row.addWidget(_btn_confirm)
+        self._btn_ptr_analysis = QPushButton("\U0001f50d  Analyse PTR")
+        self._btn_ptr_analysis.setToolTip(
+            "Open the String Pointer Analysis window: \n"
+            "filter candidates by text and see which ones\n"
+            "share close memory addresses."
+        )
+        self._btn_ptr_analysis.setEnabled(False)
+        self._btn_ptr_analysis.clicked.connect(self._open_ptr_analysis)
+        _btn_row.addWidget(self._btn_ptr_analysis)
+        _cands_lay.addLayout(_btn_row)
         self._tab_cands.addTab(_cands_widget, "All Candidates")
 
         # Tab 2: Confirmed hooks
@@ -1081,6 +1251,7 @@ class DebugWindow(QMainWindow):
             self._cand_items.clear()
             self._rec_items.clear()
             self._search_timer.start()
+            self._btn_ptr_analysis.setEnabled(True)
         except HookSearchError as exc:
             self._lbl_search_status.setText(f"⚠ Search failed: {exc}")
             self.statusBar().showMessage(f"Hook search failed: {exc}", 8000)
@@ -1088,9 +1259,25 @@ class DebugWindow(QMainWindow):
     def _stop_search(self) -> None:
         """Stop and clean up the active HookSearcher."""
         self._search_timer.stop()
+        if self._ptr_analysis_dlg is not None:
+            self._ptr_analysis_dlg.close()
+            self._ptr_analysis_dlg = None
+        self._btn_ptr_analysis.setEnabled(False)
         if self._searcher is not None:
             self._searcher.stop()
             self._searcher = None
+
+    @Slot()
+    def _open_ptr_analysis(self) -> None:
+        """Open (or raise) the String Pointer Analysis window."""
+        if self._searcher is None:
+            return
+        if self._ptr_analysis_dlg is not None and self._ptr_analysis_dlg.isVisible():
+            self._ptr_analysis_dlg.raise_()
+            self._ptr_analysis_dlg.activateWindow()
+            return
+        self._ptr_analysis_dlg = _StrPtrAnalysisDialog(self._searcher, parent=self)
+        self._ptr_analysis_dlg.show()
 
     @Slot()
     def _refresh_candidates(self) -> None:
