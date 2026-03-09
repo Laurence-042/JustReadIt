@@ -32,6 +32,10 @@ _ASCII_LETTER_IN_CJK_RE = re.compile(r"[\u3000-\u9FFF\uFF00-\uFFEF][A-Za-z]|[A-Z
 _INVISIBLE_CHARS_RE     = re.compile(r"[\u200B-\u200F\u2060-\u206F\uFE00-\uFE0F\uFFF0-\uFFFF]")
 _PUA_RE                 = re.compile(r"[\uE000-\uF8FF]")
 
+# CJK Unified Ideographs Extension A (U+3400..U+4DBF) — extremely rare in
+# modern Japanese/Chinese text.  High density is a strong binary-garbage signal.
+_CJK_EXT_A_RANGE = (0x3400, 0x4DBF)
+
 # ---------------------------------------------------------------------------
 # Per-language candidate scorers
 # ---------------------------------------------------------------------------
@@ -110,6 +114,16 @@ class _CandidateScorer:
         # Private Use Area characters
         if _PUA_RE.search(text):
             return True
+        # CJK Extension A density: characters U+3400–U+4DBF are archaic /
+        # variant forms almost never seen in modern game text.  A high ratio
+        # signals binary data decoded as CJK (e.g. stack noise / misaligned
+        # memory reads).  Require at least 3 to avoid single-char false pos.
+        ext_a_count = sum(
+            1 for c in text
+            if _CJK_EXT_A_RANGE[0] <= ord(c) <= _CJK_EXT_A_RANGE[1]
+        )
+        if ext_a_count >= 3 and ext_a_count / max(len(text), 1) > 0.10:
+            return True
         # Cross-script rejection: a string containing characters from a
         # script foreign to the active OCR language is almost certainly
         # a false positive (e.g. Hangul on the stack in a Japanese game).
@@ -126,6 +140,10 @@ class _CandidateScorer:
         """Shared base score before any language bonuses.
 
         Returns 0.0 if the text contains no CJK characters at all.
+
+        Length contribution is sub-linear (``sqrt(len) * 4``) so that short
+        real dialogue is not drowned out by long binary-garbage strings that
+        happen to pass the hard-reject filters.
         """
         cjk_chars = sum(
             1 for c in text
@@ -133,7 +151,9 @@ class _CandidateScorer:
         )
         if cjk_chars == 0:
             return 0.0
-        score = float(len(text))
+        # Sub-linear length: sqrt(n)*4 crosses raw length at n=16,
+        # slightly boosting short text while compressing long strings.
+        score = math.sqrt(len(text)) * 4
         # Reward high CJK density (dialogue vs. mixed noise)
         cjk_ratio = cjk_chars / max(len(text), 1)
         score *= 1.0 + cjk_ratio
@@ -168,6 +188,10 @@ class _JaCandidateScorer(_CandidateScorer):
 
     Adds dialogue-indicator bonuses on top of the shared base:
 
+    * **Kana gate** — Japanese text virtually always contains hiragana or
+      katakana (particles, verb endings, auxiliaries).  A string longer than
+      8 characters with *zero* kana is almost certainly binary garbage that
+      happened to decode into CJK codepoints.  Penalty: ×0.05.
     * **Particle bonus** — grammatical particles (は/の/に/も/を/と/が/で/
       へ/か/な/よ/ね/わ) appear in virtually every natural sentence but not
       in short menu labels.  3+ distinct particles → ×3.0; 1–2 → ×1.8.
@@ -187,6 +211,17 @@ class _JaCandidateScorer(_CandidateScorer):
 
     def _language_bonus(self, text: str) -> float:
         bonus = 1.0
+
+        # Kana gate: real Japanese virtually always contains hiragana /
+        # katakana.  Pure-kanji strings > 8 chars are a strong garbage signal.
+        kana_count = sum(
+            1 for c in text
+            if '\u3040' <= c <= '\u30FF'     # Hiragana + Katakana
+            or '\u31F0' <= c <= '\u31FF'     # Katakana Phonetic Extensions
+            or '\uFF65' <= c <= '\uFF9F'     # Halfwidth Katakana
+        )
+        if kana_count == 0 and len(text.strip()) > 8:
+            bonus *= 0.05  # near-zero — almost certainly not Japanese
 
         distinct_particles = sum(1 for p in self._PARTICLES if p in text)
         if distinct_particles >= 3:
