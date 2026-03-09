@@ -22,8 +22,11 @@ class HookCode:
         Relative virtual address of the function within the module.
         Stable across process restarts (ASLR changes the base, not the RVA).
     access_pattern:
-        Memory-access pattern string as emitted by ``hook_search.js``.
-        Examples: ``"r0"``, ``"*(r1+0x14)"``, ``"*(s+0x28)"``.
+        Memory-access pattern describing how the text pointer was found.
+        Direct register:  ``"r0"``  (RCX value is the text pointer)
+        L1 struct deref:  ``"r0+0x48"``  (*(RCX + 0x48) is text pointer)
+        L2 struct deref:  ``"r0+0x48->0x10"``  (*(*(RCX+0x48) + 0x10))
+        Stack argument:   ``"s+0x28"``  (stack arg at RSP+0x28)
     encoding:
         ``"utf16"`` or ``"utf8"``.
     """
@@ -84,16 +87,19 @@ class HookCode:
 
         Supported patterns
         ------------------
-        ``r0``           → (0, 0, 0, enc)
-        ``r2``           → (2, 0, 0, enc)
-        ``*(r0+0x14)``   → (0, 1, 0x14, enc)
-        ``*(r1)``        → (1, 1, 0, enc)
-        ``*(s+0x28)``    → (0xFF, 1, 0x28, enc)  stack-relative
+        ``r0``              → (0, 0, 0, enc)        direct register
+        ``r2``              → (2, 0, 0, enc)        direct register
+        ``r0+0x48``         → (0, 1, 0x48, enc)     L1 struct deref
+        ``r0+0x48->0x10``   → (0, 2, 0x48, enc)     L2 (off2 in high bits, TODO)
+        ``*(r0+0x14)``      → (0, 1, 0x14, enc)     legacy format
+        ``*(r1)``           → (1, 1, 0, enc)         legacy format
+        ``*(s+0x28)``       → (0xFF, 1, 0x28, enc)   stack-relative (legacy)
+        ``s+0x28``          → (0xFF, 0, 0x28, enc)   stack arg direct
         """
         enc_int = 0 if self.encoding == "utf16" else 1
         p = self.access_pattern.strip()
 
-        # Normalise "*(base+off)" → "*base+off"
+        # Normalise legacy "*(base+off)" → "*base+off"
         if p.startswith("*(") and p.endswith(")"):
             p = "*" + p[2:-1]
 
@@ -101,8 +107,22 @@ class HookCode:
         if deref:
             p = p[1:]
 
-        base, _, offset_str = p.partition("+")
-        byte_offset = int(offset_str, 16) if offset_str else 0
+        # Handle L2 "r0+0x48->0x10" pattern (arrow separates two offsets)
+        if "->" in p:
+            left, right = p.split("->", 1)
+            base, _, off1_str = left.partition("+")
+            byte_offset = int(off1_str, 16) if off1_str else 0
+            # off2 stored in high 16 bits of byte_offset for now
+            # (MODE_HOOK for L2 is not yet implemented — this preserves info)
+            off2 = int(right, 16) if right else 0
+            byte_offset = byte_offset | (off2 << 16)
+            deref = 2
+        else:
+            base, _, offset_str = p.partition("+")
+            byte_offset = int(offset_str, 16) if offset_str else 0
+            # New-style "r0+0x48" (no leading *) is also a deref
+            if offset_str and not deref:
+                deref = 1
 
         if base == "s":
             arg_idx = 0xFF

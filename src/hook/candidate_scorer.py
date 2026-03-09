@@ -23,8 +23,14 @@ _PURE_ASCII_ID_RE  = re.compile(r"^[A-Za-z0-9_\-\.]+$")
 _FILE_EXT_RE       = re.compile(r"\.[a-z]{2,5}\b", re.IGNORECASE)
 _HEX_BLOB_RE       = re.compile(r"^[0-9a-fA-F]{8,}$")
 _QUOTED_DIALOGUE_RE = re.compile(
-    r'^[\s\u3000]*[「『""].*[」』""][\s\u3000]*$', re.DOTALL
+    r'^[\s\u3000]*[「『\u201c\u201d"].*[」』\u201c\u201d"][\s\u3000]*$', re.DOTALL
 )
+
+# Binary garbage indicators — ASCII letters mixed with CJK, PUA, invisible
+# formatting chars.  Any match → instant rejection.
+_ASCII_LETTER_IN_CJK_RE = re.compile(r"[\u3000-\u9FFF\uFF00-\uFFEF][A-Za-z]|[A-Za-z][\u3000-\u9FFF\uFF00-\uFFEF]")
+_INVISIBLE_CHARS_RE     = re.compile(r"[\u200B-\u200F\u2060-\u206F\uFE00-\uFE0F\uFFF0-\uFFFF]")
+_PUA_RE                 = re.compile(r"[\uE000-\uF8FF]")
 
 # ---------------------------------------------------------------------------
 # Per-language candidate scorers
@@ -94,6 +100,15 @@ class _CandidateScorer:
             return True
         # Hex blobs
         if _HEX_BLOB_RE.match(stripped):
+            return True
+        # Binary garbage: ASCII letters adjacent to CJK characters
+        if _ASCII_LETTER_IN_CJK_RE.search(text):
+            return True
+        # Invisible Unicode formatting characters
+        if _INVISIBLE_CHARS_RE.search(text):
+            return True
+        # Private Use Area characters
+        if _PUA_RE.search(text):
             return True
         # Cross-script rejection: a string containing characters from a
         # script foreign to the active OCR language is almost certainly

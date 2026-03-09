@@ -23,7 +23,7 @@
 #define MAX_HOOKS     200000  /* hard safety ceiling; 0 in config means scan all pdata */
 #define MAX_STR_LEN   400
 #define MIN_STR_LEN   2
-#define SEND_REG_LO   16
+#define SEND_REG_LO   16     /* UNUSED — kept for reference; arg regs use explicit slots now */
 #define SEND_STK_HI   9
 
 /* Pre-hook static filters (see fn_calls_only_blacklisted_imports, scan_next_batch).
@@ -281,7 +281,7 @@ static void ring_drain(void) {
 }
 
 /* ================================================================
- * CJK check
+ * CJK / text-quality helpers
  * ============================================================= */
 static bool has_cjk(const WCHAR *p, int n) {
     for (int i=0;i<n;i++) {
@@ -291,16 +291,226 @@ static bool has_cjk(const WCHAR *p, int n) {
     return false;
 }
 
+/* Returns true if the character is a legitimate dialogue text character.
+ *
+ * Covers: CJK ideographs, hiragana, katakana, CJK punctuation/symbols,
+ *         fullwidth forms, common punctuation (dashes, quotes, ellipsis),
+ *         whitespace, ASCII printable (letters, digits, punctuation).
+ *
+ * Explicitly EXCLUDES:
+ *   - Private Use Area (U+E000-F8FF)
+ *   - Invisible formatting (U+200B-200F, U+2060-206F, U+FE00-FE0F)
+ *   - Variation selectors, specials, surrogates
+ *   - Control characters (except whitespace)
+ */
+static bool is_dialogue_char(WCHAR c) {
+    /* Whitespace */
+    if (c == L' ' || c == L'\t' || c == L'\n' || c == L'\r') return true;
+    /* Ideographic space */
+    if (c == 0x3000) return true;
+
+    /* ASCII printable range (0x21-0x7E): letters, digits, punctuation */
+    if (c >= 0x21 && c <= 0x7E) return true;
+
+    /* General Punctuation U+2000-2069 (skip invisible formatting) */
+    if (c >= 0x2000 && c <= 0x2069) {
+        if (c >= 0x200B && c <= 0x200F) return false;  /* ZWSP, ZWNJ, ZWJ, etc. */
+        if (c >= 0x2060 && c <= 0x2069) return false;  /* invisible operators */
+        return true;  /* em-dash, quotes, ellipsis, etc. */
+    }
+
+    /* CJK core: symbols/punct 3000-303F, hiragana 3040-309F,
+     * katakana 30A0-30FF, CJK unified ideographs 4E00-9FFF,
+     * and everything between (CJK compatibility, etc.) */
+    if (c >= 0x3001 && c <= 0x9FFF) return true;
+
+    /* Fullwidth/halfwidth forms FF00-FFEF */
+    if (c >= 0xFF00 && c <= 0xFFEF) return true;
+
+    /* CJK Compatibility Ideographs F900-FAFF */
+    if (c >= 0xF900 && c <= 0xFAFF) return true;
+
+    /* Everything else: not dialogue text */
+    return false;
+}
+
+/* Returns true if the character is a "poison" indicator — a character
+ * that NEVER appears in genuine CJK game dialogue text.
+ * A single occurrence causes immediate rejection of the entire string.
+ */
+static bool is_poison_char(WCHAR c) {
+    /* Control characters (except whitespace) */
+    if (c < 0x20 && c != L'\t' && c != L'\n' && c != L'\r') return true;
+    /* Private Use Area */
+    if (c >= 0xE000 && c <= 0xF8FF) return true;
+    /* Invisible formatting / joiners */
+    if (c >= 0x200B && c <= 0x200F) return true;
+    if (c >= 0x2060 && c <= 0x206F) return true;
+    /* Variation selectors */
+    if (c >= 0xFE00 && c <= 0xFE0F) return true;
+    /* Specials (FFFE, FFFF = BOM / nonchar) */
+    if (c >= 0xFFF0) return true;
+    return false;
+}
+
+/* Minimum string lengths */
+#define DEREF_MIN_STR_LEN       4   /* struct deref: lowered since quality filters are strong */
+/* Dialogue-char ratio for deref: require >= 80% of characters to be
+ * legitimate dialogue characters (CJK, kana, punctuation, whitespace). */
+#define DEREF_DIALOGUE_RATIO_PCT 80
+
+/* ================================================================
+ * try_push_text — extracted helper for text probing + ring push
+ *
+ * Checks whether *val* looks like a wchar_t* pointing to CJK text,
+ * deduplicates, copies, and pushes to the ring buffer.
+ *
+ * min_wlen: minimum number of WCHARs for the string to be accepted.
+ *           Use MIN_STR_LEN for direct reg/stack, DEREF_MIN_STR_LEN
+ *           for struct dereference results.
+ * strict:   if true, apply deref-quality filters:
+ *           - Reject if ANY poison char (ASCII letter, PUA, invisible)
+ *           - Require >= 80% dialogue characters
+ *           If false, only require has_cjk (direct reg/stack mode).
+ *
+ * Same safety rules as Send():
+ *   - All game-pointer reads inside __try/__except.
+ *   - Only intrinsics (no DLL calls).
+ * Returns: 1 if a string was pushed, 0 otherwise.
+ * ============================================================= */
+static int try_push_text(uintptr_t address, uintptr_t val, int slot_i,
+                         int min_wlen, bool strict) {
+    if (val < 0x10000 || val > 0x000F000000000000ULL) return 0;
+
+    /* ---- quick peek: read first 4 WCHARs ---- */
+    WCHAR c0, c1, c2, c3;
+    __try {
+        const WCHAR *p = (const WCHAR *)val;
+        c0 = p[0]; c1 = p[1]; c2 = p[2]; c3 = p[3];
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+
+    if (!c0 || !c1) return 0;
+
+    /* ---- CJK pre-filter (first 4 chars) ---- */
+#define _IS_CJK(c) (((c)>=0x3000&&(c)<=0x9FFF)||((c)>=0xFF00&&(c)<=0xFFEF))
+    if (!_IS_CJK(c0) && !_IS_CJK(c1) && !_IS_CJK(c2) && !_IS_CJK(c3))
+        return 0;
+#undef _IS_CJK
+
+    /* ---- early poison check on the 4 peeked chars (strict mode only) ---- */
+    if (strict) {
+        if (is_poison_char(c0) || is_poison_char(c1) ||
+            is_poison_char(c2) || is_poison_char(c3))
+            return 0;
+    }
+
+    /* ---- dedup by (address, slot_i, c2, c3) ---- */
+    LONG sig = (LONG)(
+        (address * 2654435761UL) ^
+        ((ULONG)((slot_i & 0xFFFF) + 32) * 1234567891UL) ^
+        ((ULONG)(c2 << 16) | (ULONG)c3));
+    if (!sig) sig = 1;
+    ULONG idx = (ULONG)((ULONG)sig % SIG_CACHE_SIZE);
+    if (InterlockedCompareExchange(&g_sig_cache[idx], sig, sig) == sig)
+        return 0;
+    InterlockedExchange(&g_sig_cache[idx], sig);
+
+    /* ---- copy string into a local buffer (inside __try) ---- */
+    WCHAR local[MAX_STR_LEN];
+    int wlen = 0;
+    __try {
+        const WCHAR *p = (const WCHAR *)val;
+        while (wlen < MAX_STR_LEN && p[wlen]) { local[wlen] = p[wlen]; wlen++; }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        if (wlen < min_wlen) return 0;
+    }
+    if (wlen < min_wlen) return 0;
+
+    /* ---- quality check ---- */
+    if (strict) {
+        /* Poison scan + dialogue-char ratio on the full string */
+        int good = 0;
+        for (int k = 0; k < wlen; k++) {
+            if (is_poison_char(local[k])) return 0;  /* instant kill */
+            if (is_dialogue_char(local[k])) good++;
+        }
+        if (good * 100 / wlen < DEREF_DIALOGUE_RATIO_PCT) return 0;
+    } else {
+        if (!has_cjk(local, wlen)) return 0;
+    }
+
+    /* ---- push to ring ---- */
+    ring_push(address, val, slot_i, 0, local, (DWORD)(wlen * sizeof(WCHAR)));
+    return 1;
+}
+
+/* ================================================================
+ * Struct-dereference scan for argument registers
+ *
+ * DEREF_L1_MAX_OFF: max byte offset in level-1 scan (struct fields).
+ * DEREF_L2_MAX_OFF: max byte offset in level-2 scan (nested struct).
+ * DEREF_STEP:       pointer-aligned stride (8 bytes on x64).
+ *
+ * slot_i encoding for deref hits (decoded by Python _handle_hit):
+ *   Level-1:  DEREF_L1_BASE + reg_code * 100 + off1/8
+ *   Level-2:  DEREF_L2_BASE + reg_code * 10000 + (off1/8)*100 + off2/8
+ * where reg_code: 0=RCX, 1=RDX, 2=R8, 3=R9.
+ * ============================================================= */
+#define DEREF_L1_MAX_OFF  0x200      /* 512 B — 65 pointer slots */
+#define DEREF_L2_MAX_OFF  0x100      /* 256 B — 33 pointer slots */
+#define DEREF_STEP        8
+#define DEREF_L1_BASE     100
+#define DEREF_L2_BASE     10000
+
+static void scan_struct_deref(uintptr_t address, uintptr_t base_ptr,
+                              int reg_code) {
+    /* Level 1: read *(base_ptr + off1) as potential wchar_t* or sub-struct* */
+    for (int off1 = 0; off1 <= DEREF_L1_MAX_OFF; off1 += DEREF_STEP) {
+        uintptr_t ptr1;
+        __try { ptr1 = *(uintptr_t *)((char *)base_ptr + off1); }
+        __except(EXCEPTION_EXECUTE_HANDLER) { break; }  /* rest of struct likely unmapped */
+
+        if (ptr1 < 0x10000 || ptr1 > 0x000F000000000000ULL) continue;
+
+        /* Try as direct text pointer */
+        int slot_l1 = DEREF_L1_BASE + reg_code * 100 + off1 / DEREF_STEP;
+        if (try_push_text(address, ptr1, slot_l1,
+                          DEREF_MIN_STR_LEN, true))
+            continue;  /* found text — skip level 2 for this offset */
+
+        /* Level 2: treat ptr1 as a sub-struct, scan its fields */
+        for (int off2 = 0; off2 <= DEREF_L2_MAX_OFF; off2 += DEREF_STEP) {
+            uintptr_t ptr2;
+            __try { ptr2 = *(uintptr_t *)((char *)ptr1 + off2); }
+            __except(EXCEPTION_EXECUTE_HANDLER) { break; }
+
+            if (ptr2 < 0x10000 || ptr2 > 0x000F000000000000ULL) continue;
+
+            int slot_l2 = DEREF_L2_BASE + reg_code * 10000
+                        + (off1 / DEREF_STEP) * 100
+                        + off2 / DEREF_STEP;
+            try_push_text(address, ptr2, slot_l2,
+                          DEREF_MIN_STR_LEN, true);
+        }
+    }
+}
+
 /* ================================================================
  * Send  -- called from every trampoline
+ *
+ * Scans argument registers (RCX, RDX, R8, R9) with up to two levels
+ * of struct dereference, plus direct stack-argument slots.
+ *
+ * Callee-saved registers (RBX, RBP, RSI, RDI, R10-R15) are
+ * TEMPORARILY DISABLED — they produced unstable "relay" candidates
+ * from ancestor-frame register residue.
  *
  * Rules:
  *  1. NO external DLL calls (risk of recursion / kernel-call latency).
  *     Only compiler intrinsics (InterlockedXxx, _WriteBarrier, memcpy).
  *  2. All memory reads from game pointers MUST be inside __try/__except.
- *  3. The __try that covers memcpy into the ring slot is inside Send,
- *     so its .pdata frame covers the copy -- no unhandled fault escapes
- *     to the trampoline frame (which has no .pdata).
+ *  3. The __try that covers memcpy into the ring slot is inside
+ *     try_push_text, so its .pdata frame covers the copy.
  * ============================================================= */
 void __cdecl Send(char **stack, uintptr_t address) {
     /* ---- 0. per-address call-rate gate ---- */
@@ -328,10 +538,6 @@ void __cdecl Send(char **stack, uintptr_t address) {
             if (InterlockedCompareExchange(&g_call_rate[ci], nxt, cur) != cur) continue;
 
             if (new_cnt == SEND_CALL_LIMIT) {
-                /* First hit to reach limit in this decay window.
-                 * DO NOT call MH_QueueDisableHook here -- MinHook is NOT
-                 * thread-safe on game threads. Queue for worker-thread apply.
-                 */
                 LONG slot = InterlockedIncrement(&g_pdisable_seq) & (LONG)PDISABLE_MASK;
                 InterlockedExchange64(&g_pdisable[slot], (LONG64)(uintptr_t)address);
                 InterlockedExchange(&g_need_apply, 1);
@@ -341,68 +547,44 @@ void __cdecl Send(char **stack, uintptr_t address) {
         }
     }
 
-    for (int i=-(int)SEND_REG_LO; i<(int)SEND_STK_HI; i++) {
+    /* ---- 1. Argument registers: direct check + struct dereference ----
+     *
+     * Trampoline push order → stack slot mapping:
+     *   stack[-4]  = RCX (arg0 / this)   reg_code 0
+     *   stack[-5]  = RDX (arg1)          reg_code 1
+     *   stack[-10] = R8  (arg2)          reg_code 2
+     *   stack[-11] = R9  (arg3)          reg_code 3
+     */
+    {
+        static const int  arg_slots[]   = { -4,  -5,  -10,  -11 };
+        static const int  arg_regcodes[] = {  0,   1,    2,    3 };
+        for (int ai = 0; ai < 4; ai++) {
+            uintptr_t val;
+            __try { val = (uintptr_t)stack[arg_slots[ai]]; }
+            __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
 
-        /* ---- 1. read the candidate pointer ---- */
+            if (val < 0x10000 || val > 0x000F000000000000ULL) continue;
+
+            /* Direct: treat register value as wchar_t* */
+            try_push_text(address, val, arg_slots[ai],
+                          MIN_STR_LEN, false);
+
+            /* Struct dereference: treat value as object/struct pointer */
+            scan_struct_deref(address, val, arg_regcodes[ai]);
+        }
+    }
+
+    /* ---- 2. Stack arguments (direct only, no struct deref) ----
+     *   stack[0]   = return address (skip)
+     *   stack[1-4] = shadow space  (skip — uninitialized)
+     *   stack[5+]  = true stack arguments (arg5 and above)
+     */
+    for (int i = 5; i < (int)SEND_STK_HI; i++) {
         uintptr_t val;
-        __try { val=(uintptr_t)stack[i]; }
+        __try { val = (uintptr_t)stack[i]; }
         __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
 
-        if (val < 0x10000 || val > 0x000F000000000000ULL) continue;
-
-        /* ---- 2. quick peek: read first 4 WCHARs ---- */
-        WCHAR c0,c1,c2,c3;
-        __try {
-            const WCHAR *p=(const WCHAR *)val;
-            c0=p[0]; c1=p[1]; c2=p[2]; c3=p[3];
-        } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
-
-        if (!c0||!c1) continue;
-
-        /* ---- 3. quick CJK pre-filter (check first 4 chars) ----
-         * Some VN strings start with non-CJK punctuation, e.g. U+2026
-         * HORIZONTAL ELLIPSIS ("……それでも…"), where c0 and c1 are both
-         * 0x2026 (not in the CJK block) but c2/c3 contain actual kana.
-         * Checking all four already-read chars avoids false rejection. */
-#define _IS_CJK(c) (((c)>=0x3000&&(c)<=0x9FFF)||((c)>=0xFF00&&(c)<=0xFFEF))
-        if (!_IS_CJK(c0)&&!_IS_CJK(c1)&&!_IS_CJK(c2)&&!_IS_CJK(c3))
-            continue;
-#undef _IS_CJK
-
-        /* ---- 4. dedup by (address, slot, c2, c3) ---- */
-        LONG sig=(LONG)(
-            (address*2654435761UL)^
-            ((ULONG)(i+32)*1234567891UL)^
-            ((ULONG)(c2<<16)|(ULONG)c3));
-        if (!sig) sig=1;
-        ULONG idx=(ULONG)((ULONG)sig % SIG_CACHE_SIZE);
-        if (InterlockedCompareExchange(&g_sig_cache[idx],sig,sig)==sig)
-            continue;
-        InterlockedExchange(&g_sig_cache[idx],sig);
-
-        /* ---- 5. copy string into a local buffer (inside __try) ---- */
-        /*
-         * KEY FIX: the memcpy is inside __try so that if the game frees
-         * the buffer between step 2 and now, the fault is caught here
-         * (inside Send's .pdata frame) rather than escaping to the
-         * trampoline (which has no .pdata, causing RtlFailFast).
-         */
-        WCHAR local[MAX_STR_LEN];
-        int wlen=0;
-        __try {
-            const WCHAR *p=(const WCHAR *)val;
-            while (wlen<MAX_STR_LEN && p[wlen]) { local[wlen]=p[wlen]; wlen++; }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            if (wlen<MIN_STR_LEN) continue;
-            /* use what we managed to copy */
-        }
-        if (wlen<MIN_STR_LEN) continue;
-
-        /* ---- 6. full CJK check on the local copy ---- */
-        if (!has_cjk(local,wlen)) continue;
-
-        /* ---- 7. push to ring (memcpy from local stack -- always safe) ---- */
-        ring_push(address, val, i, 0, local, (DWORD)(wlen*sizeof(WCHAR)));
+        try_push_text(address, val, i, MIN_STR_LEN, false);
     }
 }
 

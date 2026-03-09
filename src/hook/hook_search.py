@@ -511,52 +511,47 @@ class HookSearcher:
         if s <= 0:
             return
 
-        # Map slot index to HookCode access_pattern.
+        # Map slot_i to HookCode access_pattern.
         #
-        # Trampoline push order (from the s_tpl template in hook_engine.c):
-        #   pushfq, rax, rbx, rcx, rdx, rsp, rbp, rsi, rdi,
-        #   r8, r9, r10, r11, r12, r13, r14, r15  (17 values)
-        #   sub rsp, 0x20  (xmm shadow space)
-        #   lea rcx, [rsp+0xa8]  ← points to entry RSP (== stack param)
-        #
-        # stack[i] = *(entry_RSP + i*8)
-        #   stack[ 0] = return address
-        #   stack[-1] = rflags    stack[-2] = rax     stack[-3] = rbx
-        #   stack[-4] = rcx (arg0)  stack[-5] = rdx (arg1)
-        #   stack[-6] = rsp (saved)  stack[-7] = rbp
-        #   stack[-8] = rsi    stack[-9] = rdi
-        #   stack[-10] = r8 (arg2)  stack[-11] = r9 (arg3)
-        #   stack[-12..-17] = r10-r15
-        #   stack[1..4] = Win64 shadow space (NOT function arguments)
-        #   stack[5..]  = stack arguments (arg5 and above)
-        #
-        # Send() scans [-16..+8] (25 positions total).
-        # Accept ALL positions temporarily for debugging - assign each a unique pattern.
-        _reg_to_pattern: dict[int, str] = {
-            -1:  "rflags",
-            -2:  "rax",
-            -3:  "rbx",
-            -4:  "r0",    # rcx = arg0
+        # Encoding (matches hook_engine.c):
+        #   Direct arg regs:  slot_i in {-4, -5, -10, -11}
+        #   Stack args:       slot_i in [5, 8]
+        #   L1 struct deref:  slot_i = 100 + reg_code*100 + off1/8
+        #   L2 struct deref:  slot_i = 10000 + reg_code*10000 + (off1/8)*100 + off2/8
+        #   reg_code: 0=RCX(r0), 1=RDX(r1), 2=R8(r2), 3=R9(r3)
+        _DEREF_L1_BASE = 100
+        _DEREF_L2_BASE = 10000
+        _REG_NAMES = ["r0", "r1", "r2", "r3"]
+
+        _direct_reg_to_pattern: dict[int, str] = {
+            -4:  "r0",    # rcx = arg0 / this
             -5:  "r1",    # rdx = arg1
-            -6:  "rsp_saved",
-            -7:  "rbp",
-            -8:  "rsi",
-            -9:  "rdi",
             -10: "r2",    # r8  = arg2
             -11: "r3",    # r9  = arg3
-            -12: "r10",
-            -13: "r11",
-            -14: "r12",
-            -15: "r13",
-            -16: "r14",
         }
-        if slot_i in _reg_to_pattern:
-            pattern = _reg_to_pattern[slot_i]
+
+        if slot_i >= _DEREF_L2_BASE:
+            # Level-2 struct deref: reg->off1->off2
+            remainder = slot_i - _DEREF_L2_BASE
+            reg_idx   = remainder // 10000
+            remainder %= 10000
+            off1_idx  = remainder // 100
+            off2_idx  = remainder % 100
+            reg_name  = _REG_NAMES[reg_idx] if reg_idx < 4 else f"r{reg_idx}"
+            pattern = f"{reg_name}+{off1_idx * 8:#x}->{off2_idx * 8:#x}"
+        elif slot_i >= _DEREF_L1_BASE:
+            # Level-1 struct deref: reg->off1
+            remainder = slot_i - _DEREF_L1_BASE
+            reg_idx   = remainder // 100
+            off_idx   = remainder % 100
+            reg_name  = _REG_NAMES[reg_idx] if reg_idx < 4 else f"r{reg_idx}"
+            pattern = f"{reg_name}+{off_idx * 8:#x}"
+        elif slot_i in _direct_reg_to_pattern:
+            pattern = _direct_reg_to_pattern[slot_i]
         elif slot_i >= 0:
-            # Stack positions (return addr, shadow space, stack args)
+            # Stack positions (direct stack args)
             pattern = f"s+{slot_i * 8:#x}"
         else:
-            # Unexpected negative offset beyond -16
             pattern = f"unk_{slot_i}"
 
         enc_str = "utf16" if encoding == 0 else "utf8"
