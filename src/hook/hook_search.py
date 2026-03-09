@@ -275,6 +275,17 @@ class HookSearcher:
             ]
         return sorted(cands, key=lambda c: -c.score)
 
+    def aggregated_recommended_candidates(
+        self,
+    ) -> list[tuple[HookCandidate, list[HookCandidate]]]:
+        """Return recommended candidates aggregated by text content.
+
+        Each entry is ``(representative, members)`` — see
+        :func:`~src.hook.hook_code.aggregate_by_text` for details.
+        """
+        from src.hook.hook_code import aggregate_by_text
+        return aggregate_by_text(self.recommended_candidates())
+
     def diags(self) -> list[str]:
         """Return all diagnostic messages received so far."""
         with self._lock:

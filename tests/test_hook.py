@@ -168,3 +168,63 @@ class TestDefaultCleaners:
         for c in DEFAULT_CLEANERS:
             assert isinstance(c, Cleaner)
 
+
+# ==========================================================================
+# aggregate_by_text
+# ==========================================================================
+
+from src.hook.hook_code import HookCandidate, aggregate_by_text
+
+
+class TestAggregateByText:
+
+    @staticmethod
+    def _cand(text: str, score: float, hits: int = 1, rva: int = 0,
+              pattern: str = "r0") -> HookCandidate:
+        return HookCandidate(
+            module="game.exe", rva=rva, access_pattern=pattern,
+            encoding="utf16", text=text, hit_count=hits, score=score,
+        )
+
+    def test_empty_input(self) -> None:
+        assert aggregate_by_text([]) == []
+
+    def test_single_candidate(self) -> None:
+        c = self._cand("hello", 10.0)
+        result = aggregate_by_text([c])
+        assert len(result) == 1
+        rep, members = result[0]
+        assert rep.text == "hello"
+        assert len(members) == 1
+
+    def test_groups_by_text(self) -> None:
+        c1 = self._cand("AAA", 10.0, hits=1, rva=0x100, pattern="r0")
+        c2 = self._cand("AAA", 20.0, hits=3, rva=0x200, pattern="r1")
+        c3 = self._cand("BBB", 15.0, hits=2, rva=0x300, pattern="r2")
+        result = aggregate_by_text([c1, c2, c3])
+        assert len(result) == 2
+        # Sorted by score descending: c2's group (score=20) then c3 (score=15)
+        rep_a, mem_a = result[0]
+        rep_b, mem_b = result[1]
+        assert rep_a.text == "AAA"
+        assert rep_a.score == 20.0
+        assert rep_a.hit_count == 4  # 1 + 3
+        assert len(mem_a) == 2
+        assert rep_b.text == "BBB"
+        assert len(mem_b) == 1
+
+    def test_representative_is_highest_score(self) -> None:
+        c1 = self._cand("X", 5.0, rva=0x10)
+        c2 = self._cand("X", 50.0, rva=0x20)
+        c3 = self._cand("X", 25.0, rva=0x30)
+        [(rep, members)] = aggregate_by_text([c1, c2, c3])
+        assert rep.rva == 0x20   # highest score → representative
+        assert rep.hit_count == 3  # sum of all
+
+    def test_does_not_mutate_originals(self) -> None:
+        c1 = self._cand("T", 10.0, hits=2)
+        c2 = self._cand("T", 20.0, hits=5)
+        aggregate_by_text([c1, c2])
+        assert c1.hit_count == 2
+        assert c2.hit_count == 5
+

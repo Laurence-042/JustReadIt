@@ -1334,10 +1334,14 @@ class DebugWindow(QMainWindow):
         # even when the total visible count stays the same).
         self._refresh_confirmed_tab()
 
-        # ── Recommended tab (incremental update) ──────────────────────────
-        recommended = self._searcher.recommended_candidates()
-        current_keys = {c.to_hook_code().to_str(): c for c in recommended}
-        
+        # ── Recommended tab (aggregated by text, incremental update) ─────
+        aggregated = self._searcher.aggregated_recommended_candidates()
+        total_rec = sum(len(members) for _, members in aggregated)
+        # Key = representative text (stable within a group)
+        current_keys: dict[str, tuple] = {}
+        for rep, members in aggregated:
+            current_keys[rep.text] = (rep, members)
+
         # Remove items no longer recommended
         for key in list(self._rec_items.keys()):
             if key not in current_keys:
@@ -1345,23 +1349,33 @@ class DebugWindow(QMainWindow):
                 row = self._lst_recommended.row(item)
                 if row >= 0:
                     self._lst_recommended.takeItem(row)
-        
+
         # Update existing or add new items
-        for key, c in current_keys.items():
+        for key, (rep, members) in current_keys.items():
+            label = rep.display_label_aggregated(len(members))
+            # Store ALL member hook codes so _confirm_candidate confirms the
+            # entire group; store text separately for Copy Text.
+            all_codes = "\n".join(m.to_hook_code().to_str() for m in members)
             if key in self._rec_items:
-                self._rec_items[key].setText(c.display_label_scored())
+                item = self._rec_items[key]
+                item.setText(label)
+                item.setData(32, all_codes)
+                item.setData(33, rep.text)
             else:
-                item = QListWidgetItem(c.display_label_scored())
-                item.setData(32, key)
+                item = QListWidgetItem(label)
+                item.setData(32, all_codes)
+                item.setData(33, rep.text)
                 self._lst_recommended.addItem(item)
                 self._rec_items[key] = item
-        
+
         if self._lst_recommended.count() > 0 and self._lst_recommended.currentItem() is None:
             self._lst_recommended.setCurrentRow(0)
-        self._tab_cands.setTabText(0, f"Recommended ({len(recommended)})")
+        self._tab_cands.setTabText(
+            0, f"Recommended ({len(aggregated)} / {total_rec})"
+        )
         self._lbl_rec_status.setText(
-            f"{len(recommended)} recommended candidate(s) \u2014 sorted by score."
-            if recommended else
+            f"{len(aggregated)} unique text(s) from {total_rec} candidate(s) \u2014 sorted by score."
+            if aggregated else
             "No recommended candidates yet \u2014 play the game."
         )
 
@@ -1382,6 +1396,7 @@ class DebugWindow(QMainWindow):
             if key in self._cand_items:
                 item = self._cand_items[key]
                 item.setText(c.display_label())
+                item.setData(33, c.text)
                 # Re-apply filter visibility
                 if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
                     item.setHidden(True)
@@ -1390,6 +1405,7 @@ class DebugWindow(QMainWindow):
             else:
                 item = QListWidgetItem(c.display_label())
                 item.setData(32, key)
+                item.setData(33, c.text)
                 self._lst_candidates.addItem(item)
                 self._cand_items[key] = item
                 if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
@@ -1434,10 +1450,16 @@ class DebugWindow(QMainWindow):
         codes: list[HookCode] = []
         bad: list[str] = []
         for item in selected_items:
-            try:
-                codes.append(HookCode.from_str(item.data(32)))
-            except ValueError as exc:
-                bad.append(str(exc))
+            raw = item.data(32) or ""
+            # Aggregated items store multiple hook codes separated by \n.
+            for cs in raw.split("\n"):
+                cs = cs.strip()
+                if not cs:
+                    continue
+                try:
+                    codes.append(HookCode.from_str(cs))
+                except ValueError as exc:
+                    bad.append(str(exc))
         if bad:
             self.statusBar().showMessage(f"Invalid hook code(s): {'; '.join(bad)}", 5000)
             return
@@ -1502,13 +1524,7 @@ class DebugWindow(QMainWindow):
         if not code_str:
             return
 
-        # Look up the full candidate object for its .text
-        candidate: HookCandidate | None = None
-        if self._searcher is not None:
-            for c in self._searcher.ranked_candidates():
-                if c.to_hook_code().to_str() == code_str:
-                    candidate = c
-                    break
+        stored_text: str = item.data(33) or ""
 
         menu = QMenu(lst)
         act_text = menu.addAction("Copy Text")
@@ -1520,9 +1536,11 @@ class DebugWindow(QMainWindow):
             return
 
         clipboard = QApplication.clipboard()
-        if chosen is act_text and candidate is not None:
-            clipboard.setText(candidate.text)
+        if chosen is act_text and stored_text:
+            clipboard.setText(stored_text)
         elif chosen is act_code:
+            # For aggregated items code_str may contain multiple lines;
+            # copy them all (one hook code per line).
             clipboard.setText(code_str)
         elif chosen is act_label:
             clipboard.setText(item.text())

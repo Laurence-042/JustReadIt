@@ -189,6 +189,18 @@ class HookCandidate:
             f"  ptr={self.str_ptr:#x}  {preview!r}"
         )
 
+    def display_label_aggregated(self, n_sites: int) -> str:
+        """Label for an aggregated group in the Recommended tab.
+
+        Shows the representative's best access pattern and score, plus the
+        total hit count and how many unique hook sites produced this text.
+        """
+        preview = self.text[:50].replace("\n", " ")
+        return (
+            f"[{self.score:6.0f}]  +{self.rva:#x}  {self.access_pattern}"
+            f"  hits={self.hit_count}  sites={n_sites}  {preview!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Proximity analysis
@@ -246,6 +258,37 @@ def group_by_str_ptr(
         groups.append(unresolved)
 
     return groups
+
+
+def aggregate_by_text(
+    candidates: list[HookCandidate],
+) -> list[tuple[HookCandidate, list[HookCandidate]]]:
+    """Group *candidates* by their current ``text`` value.
+
+    Returns a list of ``(representative, members)`` pairs sorted by
+    representative score descending.  The *representative* is a **shallow
+    copy** of the highest-scored member in each group, with ``hit_count``
+    set to the sum across all members.  *members* is the full list of
+    original :class:`HookCandidate` objects sharing that text.
+
+    This is a pure presentation helper — the underlying candidate objects
+    are not modified.
+    """
+    from copy import copy as _copy
+
+    groups: dict[str, list[HookCandidate]] = {}
+    for c in candidates:
+        groups.setdefault(c.text, []).append(c)
+
+    result: list[tuple[HookCandidate, list[HookCandidate]]] = []
+    for _text, members in groups.items():
+        best = max(members, key=lambda c: c.score)
+        rep = _copy(best)
+        rep.hit_count = sum(m.hit_count for m in members)
+        result.append((rep, members))
+
+    result.sort(key=lambda t: -t[0].score)
+    return result
 
 
 def format_ptr_groups(
