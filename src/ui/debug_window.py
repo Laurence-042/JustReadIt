@@ -880,6 +880,10 @@ class DebugWindow(QMainWindow):
         self._lst_recommended = QListWidget()
         self._lst_recommended.setFont(QFont("Consolas", 9))
         self._lst_recommended.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._lst_recommended.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._lst_recommended.customContextMenuRequested.connect(
+            lambda pos: self._on_candidate_context_menu(self._lst_recommended, pos),
+        )
         self._lst_recommended.itemDoubleClicked.connect(self._confirm_candidate)
         _rec_lay.addWidget(self._lst_recommended, 1)
         _btn_confirm_rec = QPushButton("\u2713  Confirm selected recommended")
@@ -902,6 +906,10 @@ class DebugWindow(QMainWindow):
         self._lst_candidates = QListWidget()
         self._lst_candidates.setFont(QFont("Consolas", 9))
         self._lst_candidates.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._lst_candidates.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._lst_candidates.customContextMenuRequested.connect(
+            lambda pos: self._on_candidate_context_menu(self._lst_candidates, pos),
+        )
         self._lst_candidates.itemDoubleClicked.connect(self._confirm_candidate)
         _cands_lay.addWidget(self._lst_candidates, 1)
         self._te_search_diag = QTextEdit()
@@ -942,6 +950,10 @@ class DebugWindow(QMainWindow):
         self._lst_confirmed = QListWidget()
         self._lst_confirmed.setFont(QFont("Consolas", 9))
         self._lst_confirmed.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._lst_confirmed.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._lst_confirmed.customContextMenuRequested.connect(
+            lambda pos: self._on_candidate_context_menu(self._lst_confirmed, pos),
+        )
         _confirmed_lay.addWidget(self._lst_confirmed, 1)
         _btn_unconfirm = QPushButton("\u2717  Remove selected confirmed")
         _btn_unconfirm.clicked.connect(self._unconfirm_candidate)
@@ -1479,6 +1491,41 @@ class DebugWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Removed {len(selected)} confirmed hook(s).", 3000
         )
+
+    def _on_candidate_context_menu(self, lst: QListWidget, pos) -> None:
+        """Show a right-click context menu for copying candidate text / hook code."""
+        from PySide6.QtWidgets import QMenu
+        item = lst.itemAt(pos)
+        if item is None:
+            return
+        code_str = item.data(32)
+        if not code_str:
+            return
+
+        # Look up the full candidate object for its .text
+        candidate: HookCandidate | None = None
+        if self._searcher is not None:
+            for c in self._searcher.ranked_candidates():
+                if c.to_hook_code().to_str() == code_str:
+                    candidate = c
+                    break
+
+        menu = QMenu(lst)
+        act_text = menu.addAction("Copy Text")
+        act_code = menu.addAction("Copy Hook Code")
+        act_label = menu.addAction("Copy Display Label")
+
+        chosen = menu.exec(lst.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        clipboard = QApplication.clipboard()
+        if chosen is act_text and candidate is not None:
+            clipboard.setText(candidate.text)
+        elif chosen is act_code:
+            clipboard.setText(code_str)
+        elif chosen is act_label:
+            clipboard.setText(item.text())
 
     def _refresh_confirmed_tab(self) -> None:
         """Incrementally update the Confirmed tab list and title badge."""
