@@ -98,6 +98,48 @@ static volatile LONG g_need_apply = 0; /* set in Send(), consumed in ring_drain(
 static volatile LONG g_rate_epoch = 1;  /* low 16 bits used in packed slots    */
 static volatile LONG64 g_rate_next_decay_ms = 0;
 
+/* ---- struct-pointer dedup cache ----
+ * Prevents redundant scan_struct_deref calls when the same (address,
+ * base_ptr, reg_code) combination repeats within a single rate epoch.
+ *
+ * Key: hash(address, base_ptr, reg_code, g_rate_epoch).
+ * Natural invalidation: epoch rotation every RATE_WINDOW_MS causes all
+ * stale entries to become automatic misses — text changes are picked up
+ * within one epoch window (3 s).
+ *
+ * Memory: 65521 * 8 B = 512 KB.
+ */
+#define SPTR_CACHE_SIZE  65521u
+static volatile LONG64 g_sptr_cache[SPTR_CACHE_SIZE];
+
+/* ---- L1-offset layout cache ----
+ * Learns which struct-field offsets (at DEREF_STEP granularity) ever held
+ * a pointer-like value at each hook address.  After LAYOUT_WARMUP calls
+ * the scan only probes those offsets, pruning ~80-90% of L1 memory reads.
+ * Also tracks whether L2 (nested-struct dereference) ever found text for
+ * each argument register, skipping entire L2 loops when fruitless.
+ *
+ * Struct field layouts are determined at compile time, so the learned
+ * mask is permanent across epochs.  Hash collisions fall through to the
+ * full-scan path: safe but slower.
+ *
+ * Memory: 16384 * 56 B = 896 KB.
+ */
+#define LAYOUT_CACHE_SIZE  16384u
+#define LAYOUT_CACHE_MASK  (LAYOUT_CACHE_SIZE - 1)
+#define LAYOUT_WARMUP      16u          /* ~4 Send() calls * 4 regs          */
+
+typedef struct {
+    uintptr_t addr;          /* hook VA (key); 0 = empty slot              */
+    uint32_t  warmup;        /* call count; saturates at LAYOUT_WARMUP     */
+    uint32_t  _pad;
+    uint64_t  l1_mask[4];    /* per-reg: bits 0-63 -> offsets 0x000..0x1F8 */
+    uint8_t   l2_hit[4];     /* 1 if L2 ever found text for this register  */
+    uint8_t   _pad2[4];
+} LayoutEntry;
+
+static LayoutEntry g_layout_cache[LAYOUT_CACHE_SIZE];
+
 static void rate_decay_tick(void) {
     ULONGLONG now = GetTickCount64();
     LONG64 due = InterlockedCompareExchange64(&g_rate_next_decay_ms, 0, 0);
@@ -464,19 +506,75 @@ static int try_push_text(uintptr_t address, uintptr_t val, int slot_i,
 
 static void scan_struct_deref(uintptr_t address, uintptr_t base_ptr,
                               int reg_code) {
+    /* ---- L1-offset layout cache lookup ----
+     * Find (or claim) this hook address's layout entry.  On hash
+     * collision the pointer stays NULL and we fall through to a full
+     * uncached scan — safe but slower.                               */
+    LayoutEntry *le = NULL;
+    bool pruning = false;
+    {
+        ULONG li = (ULONG)(((address >> 4) * 2654435761ULL) & LAYOUT_CACHE_MASK);
+        LayoutEntry *slot = &g_layout_cache[li];
+        if (slot->addr == 0)
+            slot->addr = address;          /* claim empty slot */
+        if (slot->addr == address) {
+            le = slot;
+            if (le->warmup < LAYOUT_WARMUP)
+                le->warmup++;
+            else
+                pruning = true;
+        }
+    }
+
+    /* ---- struct-pointer dedup ----
+     * Skip if the exact (address, base_ptr, reg_code) combination was
+     * already scanned in the current rate epoch.  Epoch rotation every
+     * RATE_WINDOW_MS naturally invalidates stale entries, so text
+     * changes are re-discovered within one window (~3 s).             */
+    {
+        LONG epoch = g_rate_epoch;          /* volatile read; atomic on x64 */
+        uint64_t h = address * 2654435761ULL;
+        h ^= base_ptr * 0x9E3779B97F4A7C15ULL;
+        h ^= (uint64_t)(unsigned)(reg_code + 1) * 0x517CC1B727220A95ULL;
+        h ^= (uint64_t)(ULONG)epoch * 0x9E3779B1ULL;
+        LONG64 key = (LONG64)(h | 1);       /* ensure non-zero */
+        ULONG ci = (ULONG)((uint64_t)key % SPTR_CACHE_SIZE);
+        if (InterlockedCompareExchange64(&g_sptr_cache[ci], key, key) == key)
+            return;                         /* cache hit — nothing new */
+        InterlockedExchange64(&g_sptr_cache[ci], key);
+    }
+
     /* Level 1: read *(base_ptr + off1) as potential wchar_t* or sub-struct* */
     for (int off1 = 0; off1 <= DEREF_L1_MAX_OFF; off1 += DEREF_STEP) {
+        int bit = off1 / DEREF_STEP;        /* 0 .. 64 */
+
+        /* After warmup, skip offsets that never contained a pointer-like
+         * value.  Bit 64 (offset 0x200) falls outside the 64-bit mask
+         * and is always probed — one extra read is negligible.          */
+        if (pruning && bit < 64 &&
+            !(le->l1_mask[reg_code] & (1ULL << bit)))
+            continue;
+
         uintptr_t ptr1;
         __try { ptr1 = *(uintptr_t *)((char *)base_ptr + off1); }
         __except(EXCEPTION_EXECUTE_HANDLER) { break; }  /* rest of struct likely unmapped */
 
         if (ptr1 < 0x10000 || ptr1 > 0x000F000000000000ULL) continue;
 
+        /* Learning: record this offset as ever holding a valid pointer. */
+        if (le && bit < 64)
+            le->l1_mask[reg_code] |= (1ULL << bit);
+
         /* Try as direct text pointer */
-        int slot_l1 = DEREF_L1_BASE + reg_code * 100 + off1 / DEREF_STEP;
+        int slot_l1 = DEREF_L1_BASE + reg_code * 100 + bit;
         if (try_push_text(address, ptr1, slot_l1,
                           DEREF_MIN_STR_LEN, true))
             continue;  /* found text — skip level 2 for this offset */
+
+        /* Level 2: after warmup, skip entirely if this register has
+         * never yielded L2 text.  During learning, always attempt L2. */
+        if (pruning && le && !le->l2_hit[reg_code])
+            continue;
 
         /* Level 2: treat ptr1 as a sub-struct, scan its fields */
         for (int off2 = 0; off2 <= DEREF_L2_MAX_OFF; off2 += DEREF_STEP) {
@@ -487,10 +585,12 @@ static void scan_struct_deref(uintptr_t address, uintptr_t base_ptr,
             if (ptr2 < 0x10000 || ptr2 > 0x000F000000000000ULL) continue;
 
             int slot_l2 = DEREF_L2_BASE + reg_code * 10000
-                        + (off1 / DEREF_STEP) * 100
+                        + bit * 100
                         + off2 / DEREF_STEP;
-            try_push_text(address, ptr2, slot_l2,
-                          DEREF_MIN_STR_LEN, true);
+            if (try_push_text(address, ptr2, slot_l2,
+                              DEREF_MIN_STR_LEN, true)) {
+                if (le) le->l2_hit[reg_code] = 1;
+            }
         }
     }
 }
@@ -987,6 +1087,8 @@ static void do_search(const Config *cfg) {
 
     /* Reset decayed call-rate limiter state for each search session. */
     ZeroMemory((void*)g_call_rate, sizeof(g_call_rate));
+    ZeroMemory((void*)g_sptr_cache, sizeof(g_sptr_cache));
+    ZeroMemory((void*)g_layout_cache, sizeof(g_layout_cache));
     InterlockedExchange(&g_rate_epoch, 1);
     InterlockedExchange64(&g_rate_next_decay_ms, (LONG64)(GetTickCount64() + RATE_WINDOW_MS));
 
