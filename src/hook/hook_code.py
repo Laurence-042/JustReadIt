@@ -177,7 +177,7 @@ class HookCandidate:
 
     def display_label(self) -> str:
         """Short label for UI display (sorted by RVA; no score)."""
-        preview = self.text[:60].replace("\n", " ")
+        preview = self.text[:120].replace("\n", " ")
         return (
             f"+{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}"
             f"  ptr={self.str_ptr:#x}  {preview!r}"
@@ -185,7 +185,7 @@ class HookCandidate:
 
     def display_label_scored(self) -> str:
         """Label with score prefix, used in the Recommended tab."""
-        preview = self.text[:55].replace("\n", " ")
+        preview = self.text[:120].replace("\n", " ")
         return (
             f"[{self.score:6.0f}]  +{self.rva:#x}  {self.access_pattern}  hits={self.hit_count}"
             f"  ptr={self.str_ptr:#x}  {preview!r}"
@@ -198,7 +198,7 @@ class HookCandidate:
         total hit count and how many unique hook sites / struct groups
         produced this text.
         """
-        preview = self.text[:45].replace("\n", " ")
+        preview = self.text[:120].replace("\n", " ")
         return (
             f"[{self.score:6.0f}]  +{self.rva:#x}  {self.access_pattern}"
             f"  hits={self.hit_count}  structs={n_structs}  hooks={n_sites}"

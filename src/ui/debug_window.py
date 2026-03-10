@@ -1352,26 +1352,26 @@ class DebugWindow(QMainWindow):
 
         # Update existing or add new items
         for key, tg in current_keys.items():
-            preview = tg.text[:45].replace("\n", " ")
+            preview = tg.text[:120].replace("\n", " ")
             label = (
                 f"[{tg.score:6.0f}]  +{tg.leader.rva:#x}  {tg.leader.access_pattern}"
                 f"  hits={tg.total_hits}  structs={len(tg.structs)}"
                 f"  hooks={tg.total_hooks}  {preview!r}"
             )
-            # Store ALL member hook codes (across all structs) so
-            # _confirm_candidate confirms the entire text group;
-            # store text separately for Copy Text.
-            all_members = [m for sg in tg.structs for m in sg.members]
-            all_codes = "\n".join(m.to_hook_code().to_str() for m in all_members)
+            # Store only the leader's hook code — confirming one text group
+            # means confirming its single best representative hook.
+            leader_code = tg.leader.to_hook_code().to_str()
             if key in self._rec_items:
                 item = self._rec_items[key]
                 item.setText(label)
-                item.setData(32, all_codes)
+                item.setData(32, leader_code)
                 item.setData(33, tg.text)
+                item.setToolTip(tg.text)
             else:
                 item = QListWidgetItem(label)
-                item.setData(32, all_codes)
+                item.setData(32, leader_code)
                 item.setData(33, tg.text)
+                item.setToolTip(tg.text)
                 self._lst_recommended.addItem(item)
                 self._rec_items[key] = item
 
@@ -1404,6 +1404,7 @@ class DebugWindow(QMainWindow):
                 item = self._cand_items[key]
                 item.setText(c.display_label())
                 item.setData(33, c.text)
+                item.setToolTip(c.text)
                 # Re-apply filter visibility
                 if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
                     item.setHidden(True)
@@ -1413,6 +1414,7 @@ class DebugWindow(QMainWindow):
                 item = QListWidgetItem(c.display_label())
                 item.setData(32, key)
                 item.setData(33, c.text)
+                item.setToolTip(c.text)
                 self._lst_candidates.addItem(item)
                 self._cand_items[key] = item
                 if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
@@ -1584,11 +1586,14 @@ class DebugWindow(QMainWindow):
                 except ValueError:
                     label = code_str
             
+            tooltip = cand_map[code_str].text if code_str in cand_map else ""
             if code_str in self._confirmed_items:
                 self._confirmed_items[code_str].setText(label)
+                self._confirmed_items[code_str].setToolTip(tooltip)
             else:
                 item = QListWidgetItem(label)
                 item.setData(32, code_str)
+                item.setToolTip(tooltip)
                 self._lst_confirmed.addItem(item)
                 self._confirmed_items[code_str] = item
         
