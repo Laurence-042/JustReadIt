@@ -174,6 +174,13 @@ class TestDefaultCleaners:
 # ==========================================================================
 
 from src.hook.hook_code import HookCandidate, aggregate_by_text
+from src.hook.hook_code import (
+    StructGroup,
+    TextGroup,
+    build_struct_groups,
+    build_text_groups,
+    compute_redundant_hook_vas,
+)
 
 
 class TestAggregateByText:
@@ -227,4 +234,235 @@ class TestAggregateByText:
         aggregate_by_text([c1, c2])
         assert c1.hit_count == 2
         assert c2.hit_count == 5
+
+
+# ==========================================================================
+# build_struct_groups
+# ==========================================================================
+
+
+class TestBuildStructGroups:
+
+    @staticmethod
+    def _cand(
+        text: str = "テスト",
+        score: float = 80.0,
+        hits: int = 1,
+        rva: int = 0x100,
+        pattern: str = "r0",
+        hook_va: int = 0,
+        str_ptr: int = 0,
+        seq: int = 0,
+    ) -> HookCandidate:
+        return HookCandidate(
+            module="game.exe", rva=rva, access_pattern=pattern,
+            encoding="utf16", text=text, hit_count=hits, score=score,
+            hook_va=hook_va, str_ptr=str_ptr, first_seen_seq=seq,
+        )
+
+    def test_empty_input(self) -> None:
+        assert build_struct_groups([]) == []
+
+    def test_single_candidate(self) -> None:
+        c = self._cand(str_ptr=0x1000, seq=0)
+        groups = build_struct_groups([c])
+        assert len(groups) == 1
+        assert groups[0].leader is c
+        assert groups[0].members == [c]
+
+    def test_nearby_str_ptrs_grouped(self) -> None:
+        c1 = self._cand(str_ptr=0x1000, seq=0, rva=0x100, hook_va=0xA)
+        c2 = self._cand(str_ptr=0x1080, seq=1, rva=0x200, hook_va=0xB)
+        groups = build_struct_groups([c1, c2], tolerance=256)
+        assert len(groups) == 1
+        assert groups[0].leader is c1  # earlier first_seen_seq
+        assert len(groups[0].members) == 2
+
+    def test_distant_str_ptrs_separate(self) -> None:
+        c1 = self._cand(str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(str_ptr=0x2000, seq=1, rva=0x200)
+        groups = build_struct_groups([c1, c2], tolerance=256)
+        assert len(groups) == 2
+
+    def test_leader_is_earliest_seq(self) -> None:
+        # c2 has smaller first_seen_seq → should be leader
+        c1 = self._cand(str_ptr=0x1000, seq=5, rva=0x100)
+        c2 = self._cand(str_ptr=0x1010, seq=2, rva=0x200)
+        groups = build_struct_groups([c1, c2])
+        assert groups[0].leader is c2
+
+    def test_zero_str_ptr_separate_groups(self) -> None:
+        c1 = self._cand(str_ptr=0, seq=0, rva=0x100)
+        c2 = self._cand(str_ptr=0, seq=1, rva=0x200)
+        groups = build_struct_groups([c1, c2])
+        assert len(groups) == 2  # each in own singleton group
+
+    def test_groups_sorted_by_leader_seq(self) -> None:
+        c1 = self._cand(str_ptr=0x5000, seq=10, rva=0x100)
+        c2 = self._cand(str_ptr=0x1000, seq=3, rva=0x200)
+        groups = build_struct_groups([c1, c2])
+        assert groups[0].leader.first_seen_seq == 3
+        assert groups[1].leader.first_seen_seq == 10
+
+    def test_total_hits_property(self) -> None:
+        c1 = self._cand(str_ptr=0x1000, seq=0, hits=5, rva=0x100)
+        c2 = self._cand(str_ptr=0x1010, seq=1, hits=3, rva=0x200)
+        [sg] = build_struct_groups([c1, c2])
+        assert sg.total_hits == 8
+
+    def test_hook_vas_property(self) -> None:
+        c1 = self._cand(str_ptr=0x1000, seq=0, hook_va=0xAAA, rva=0x100)
+        c2 = self._cand(str_ptr=0x1010, seq=1, hook_va=0xBBB, rva=0x200)
+        c3 = self._cand(str_ptr=0x1020, seq=2, hook_va=0xAAA, rva=0x100, pattern="r1")
+        [sg] = build_struct_groups([c1, c2, c3])
+        assert sg.hook_vas == {0xAAA, 0xBBB}
+
+
+# ==========================================================================
+# build_text_groups
+# ==========================================================================
+
+
+class TestBuildTextGroups:
+
+    @staticmethod
+    def _cand(
+        text: str = "テスト",
+        score: float = 80.0,
+        hits: int = 1,
+        rva: int = 0x100,
+        pattern: str = "r0",
+        hook_va: int = 0,
+        str_ptr: int = 0,
+        seq: int = 0,
+    ) -> HookCandidate:
+        return HookCandidate(
+            module="game.exe", rva=rva, access_pattern=pattern,
+            encoding="utf16", text=text, hit_count=hits, score=score,
+            hook_va=hook_va, str_ptr=str_ptr, first_seen_seq=seq,
+        )
+
+    def test_empty_input(self) -> None:
+        assert build_text_groups([]) == []
+
+    def test_single_struct_group(self) -> None:
+        c = self._cand(text="hello", str_ptr=0x1000, seq=0)
+        sgs = build_struct_groups([c])
+        tgs = build_text_groups(sgs)
+        assert len(tgs) == 1
+        assert tgs[0].text == "hello"
+        assert tgs[0].leader is c
+
+    def test_same_text_merged(self) -> None:
+        # Two struct groups (far apart str_ptr) with same text
+        c1 = self._cand(text="same", str_ptr=0x1000, seq=0, rva=0x100, hook_va=0xA)
+        c2 = self._cand(text="same", str_ptr=0x9000, seq=5, rva=0x200, hook_va=0xB)
+        sgs = build_struct_groups([c1, c2])
+        tgs = build_text_groups(sgs)
+        assert len(tgs) == 1
+        assert tgs[0].text == "same"
+        assert len(tgs[0].structs) == 2
+        assert tgs[0].leader is c1  # earlier first_seen_seq
+
+    def test_different_texts_separate(self) -> None:
+        c1 = self._cand(text="AAA", str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(text="BBB", str_ptr=0x9000, seq=1, rva=0x200)
+        sgs = build_struct_groups([c1, c2])
+        tgs = build_text_groups(sgs)
+        assert len(tgs) == 2
+
+    def test_sorted_by_score_descending(self) -> None:
+        c1 = self._cand(text="low", score=50.0, str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(text="high", score=90.0, str_ptr=0x9000, seq=1, rva=0x200)
+        sgs = build_struct_groups([c1, c2])
+        tgs = build_text_groups(sgs)
+        assert tgs[0].text == "high"
+        assert tgs[1].text == "low"
+
+    def test_score_uses_max_across_structs(self) -> None:
+        # Two struct groups with same text, different scores
+        c1 = self._cand(text="X", score=50.0, str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(text="X", score=90.0, str_ptr=0x9000, seq=5, rva=0x200)
+        sgs = build_struct_groups([c1, c2])
+        [tg] = build_text_groups(sgs)
+        assert tg.score == 90.0
+
+    def test_total_hooks_across_structs(self) -> None:
+        c1 = self._cand(text="T", str_ptr=0x1000, seq=0, hook_va=0xA, rva=0x100)
+        c2 = self._cand(text="T", str_ptr=0x1010, seq=1, hook_va=0xB, rva=0x200)
+        c3 = self._cand(text="T", str_ptr=0x9000, seq=2, hook_va=0xC, rva=0x300)
+        sgs = build_struct_groups([c1, c2, c3])
+        [tg] = build_text_groups(sgs)
+        assert tg.total_hooks == 3
+
+    def test_priority_struct_has_earliest_leader(self) -> None:
+        c1 = self._cand(text="X", str_ptr=0x9000, seq=10, rva=0x100, hook_va=0xA)
+        c2 = self._cand(text="X", str_ptr=0x1000, seq=2, rva=0x200, hook_va=0xB)
+        sgs = build_struct_groups([c1, c2])
+        [tg] = build_text_groups(sgs)
+        assert tg.priority_struct.leader.first_seen_seq == 2
+        assert tg.leader is c2
+
+
+# ==========================================================================
+# compute_redundant_hook_vas
+# ==========================================================================
+
+
+class TestComputeRedundantHookVas:
+
+    @staticmethod
+    def _cand(
+        text: str = "テスト",
+        score: float = 80.0,
+        rva: int = 0x100,
+        pattern: str = "r0",
+        hook_va: int = 0,
+        str_ptr: int = 0,
+        seq: int = 0,
+    ) -> HookCandidate:
+        return HookCandidate(
+            module="game.exe", rva=rva, access_pattern=pattern,
+            encoding="utf16", text=text, hit_count=1, score=score,
+            hook_va=hook_va, str_ptr=str_ptr, first_seen_seq=seq,
+        )
+
+    def test_empty_input(self) -> None:
+        assert compute_redundant_hook_vas([]) == set()
+
+    def test_single_member_no_redundancy(self) -> None:
+        c = self._cand(hook_va=0xA, str_ptr=0x1000, seq=0)
+        sgs = build_struct_groups([c])
+        assert compute_redundant_hook_vas(sgs) == set()
+
+    def test_leader_kept_others_redundant(self) -> None:
+        c1 = self._cand(hook_va=0xA, str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(hook_va=0xB, str_ptr=0x1010, seq=5, rva=0x200)
+        sgs = build_struct_groups([c1, c2])
+        redundant = compute_redundant_hook_vas(sgs)
+        assert redundant == {0xB}
+
+    def test_confirmed_excluded(self) -> None:
+        c1 = self._cand(hook_va=0xA, str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(hook_va=0xB, str_ptr=0x1010, seq=5, rva=0x200)
+        sgs = build_struct_groups([c1, c2])
+        redundant = compute_redundant_hook_vas(sgs, confirmed_vas={0xB})
+        assert redundant == set()
+
+    def test_multi_group_leader_in_one(self) -> None:
+        # hook_va 0xB is leader in group 2 but non-leader in group 1 →
+        # should NOT be marked redundant (it leads at least one group).
+        c1 = self._cand(hook_va=0xA, str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(hook_va=0xB, str_ptr=0x1010, seq=5, rva=0x200)
+        c3 = self._cand(hook_va=0xB, str_ptr=0x9000, seq=1, rva=0x200, pattern="r1")
+        sgs = build_struct_groups([c1, c2, c3])
+        redundant = compute_redundant_hook_vas(sgs)
+        # 0xB is leader of the group at 0x9000 → not redundant
+        assert 0xB not in redundant
+
+    def test_all_different_groups_no_redundancy(self) -> None:
+        c1 = self._cand(hook_va=0xA, str_ptr=0x1000, seq=0, rva=0x100)
+        c2 = self._cand(hook_va=0xB, str_ptr=0x9000, seq=1, rva=0x200)
+        sgs = build_struct_groups([c1, c2])
+        assert compute_redundant_hook_vas(sgs) == set()
 

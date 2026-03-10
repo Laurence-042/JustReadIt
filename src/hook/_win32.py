@@ -346,6 +346,27 @@ def pack_scan_next_command(batch_size: int) -> bytes:
     return struct.pack("<BI", _CMD_SCAN_NEXT, batch_size)
 
 
+# CMD_DISABLE: uint8_t(1) + uint32_t(count) + count × uint64_t(va)
+_CMD_DISABLE: int = 1
+
+
+def pack_disable_command(vas: set[int] | list[int]) -> bytes:
+    """Pack a CMD_DISABLE command to disable one or more hooks by absolute VA.
+
+    Parameters
+    ----------
+    vas:
+        Absolute virtual addresses of the hooks to disable.
+
+    Returns
+    -------
+    bytes
+        Wire-format command ready for :func:`write_pipe`.
+    """
+    va_list = list(vas)
+    return struct.pack(f"<BI{len(va_list)}Q", _CMD_DISABLE, len(va_list), *va_list)
+
+
 # ---------------------------------------------------------------------------
 # Module base lookup
 # ---------------------------------------------------------------------------

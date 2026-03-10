@@ -29,6 +29,7 @@ from src.hook._win32 import (
     connect_pipe,
     create_pipe_server,
     inject_dll,
+    pack_disable_command,
     pack_scan_next_command,
     pack_search_config,
     read_pipe_exact,
@@ -36,7 +37,14 @@ from src.hook._win32 import (
     write_pipe,
     _RESULT_HDR_SIZE,
 )
-from src.hook.hook_code import HookCode, HookCandidate
+from src.hook.hook_code import (
+    HookCode,
+    HookCandidate,
+    TextGroup,
+    build_struct_groups,
+    build_text_groups,
+    compute_redundant_hook_vas,
+)
 from src.hook.candidate_scorer import score_candidate
 
 log = logging.getLogger(__name__)
@@ -158,6 +166,10 @@ class HookSearcher:
         # Confirmed-address live feed (populated after filter_to())
         self._confirmed_vas: set[int] = set()
         self._live_feed:     list[str] = []
+        # Monotonic sequence counter for tracking first-seen order of candidates.
+        self._seq_counter: int = 0
+        # hook_va values already sent via CMD_DISABLE (avoid re-sending).
+        self._disabled_vas: set[int] = set()
         # Process-exit / connect-timeout detection
         self._pipe_connected  = threading.Event()
         self._process_died:  bool                   = False
@@ -275,16 +287,17 @@ class HookSearcher:
             ]
         return sorted(cands, key=lambda c: -c.score)
 
-    def aggregated_recommended_candidates(
-        self,
-    ) -> list[tuple[HookCandidate, list[HookCandidate]]]:
-        """Return recommended candidates aggregated by text content.
+    def aggregated_recommended_candidates(self) -> list[TextGroup]:
+        """Return recommended candidates aggregated via the three-level model.
 
-        Each entry is ``(representative, members)`` — see
-        :func:`~src.hook.hook_code.aggregate_by_text` for details.
+        Returns :class:`TextGroup` objects built from struct-level proximity
+        grouping, ordered by score descending.  See
+        :func:`~src.hook.hook_code.build_struct_groups` and
+        :func:`~src.hook.hook_code.build_text_groups`.
         """
-        from src.hook.hook_code import aggregate_by_text
-        return aggregate_by_text(self.recommended_candidates())
+        recommended = self.recommended_candidates()
+        struct_groups = build_struct_groups(recommended)
+        return build_text_groups(struct_groups)
 
     def diags(self) -> list[str]:
         """Return all diagnostic messages received so far."""
@@ -462,13 +475,15 @@ class HookSearcher:
         t.start()
 
     def _send_next_batch(self) -> None:
-        """Called by advance thread: send CMD_SCAN_NEXT."""
+        """Called by advance thread: prune redundant hooks, then send CMD_SCAN_NEXT."""
         with self._lock:
             self._diags.append(
                 f"Advancing: stop={self._stop.is_set()} pipe={self._h_pipe}"
             )
         if self._stop.is_set() or not self._h_pipe:
             return
+        # Prune before installing new hooks to reduce noise early.
+        self._prune_redundant()
         with self._write_lock:
             if self._stop.is_set() or not self._h_pipe:
                 with self._lock:
@@ -481,6 +496,85 @@ class HookSearcher:
                 with self._lock:
                     self._diags.append(f"CMD_SCAN_NEXT write failed: {exc}")
                 log.warning("Failed to send CMD_SCAN_NEXT: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Pruning — disable non-recommended and struct-redundant hooks
+    # ------------------------------------------------------------------
+
+    # Minimum hit count before a non-recommended hook is eligible for pruning.
+    # Gives each hook a fair chance to produce representative text.
+    _MIN_HITS_FOR_PRUNE: int = 3
+
+    def _send_disable(self, vas: set[int]) -> None:
+        """Send CMD_DISABLE for *vas* to the DLL (thread-safe)."""
+        if not vas or self._stop.is_set() or not self._h_pipe:
+            return
+        with self._write_lock:
+            if self._stop.is_set() or not self._h_pipe:
+                return
+            try:
+                write_pipe(self._h_pipe, pack_disable_command(vas))
+                log.info("HookSearcher: CMD_DISABLE sent for %d hook(s)", len(vas))
+            except (PipeError, OSError) as exc:
+                log.warning("CMD_DISABLE write failed: %s", exc)
+
+    def _prune_redundant(self) -> None:
+        """Identify and disable non-recommended and struct-redundant hooks.
+
+        Called on the advance-thread between batches.
+
+        Two pruning rules:
+
+        1. **Non-recommended**: A ``hook_va`` is disabled if *all* its
+           candidates score below the recommended threshold *and* have
+           fired at least ``_MIN_HITS_FOR_PRUNE`` times.
+        2. **Struct-redundant**: Among recommended candidates, those
+           grouped into the same struct (by ``str_ptr`` proximity) are
+           reduced to the *leader* (earliest ``first_seen_seq``).  Other
+           hook VAs in the group are disabled.
+
+        Confirmed hooks and already-disabled hooks are never re-sent.
+        """
+        with self._lock:
+            candidates = list(self._candidates.values())
+            confirmed = set(self._confirmed_vas)
+
+        # ── (A) Non-recommended hook VAs ──────────────────────────────
+        by_va: dict[int, list[HookCandidate]] = {}
+        for c in candidates:
+            if c.hook_va:
+                by_va.setdefault(c.hook_va, []).append(c)
+
+        non_rec_vas: set[int] = set()
+        for va, cands in by_va.items():
+            if all(
+                c.score < _RECOMMEND_SCORE_THRESHOLD
+                and c.hit_count >= self._MIN_HITS_FOR_PRUNE
+                for c in cands
+            ):
+                non_rec_vas.add(va)
+
+        # ── (B) Struct-redundant among recommended ────────────────────
+        recommended = [c for c in candidates if c.score >= _RECOMMEND_SCORE_THRESHOLD]
+        struct_groups = build_struct_groups(recommended)
+        redundant_vas = compute_redundant_hook_vas(struct_groups, confirmed)
+
+        # ── Merge, exclude confirmed & already-sent ───────────────────
+        to_disable = (non_rec_vas | redundant_vas) - confirmed - self._disabled_vas
+        if not to_disable:
+            return
+
+        # Compute per-category counts for diagnostics *before* updating the set.
+        n_non_rec = len(non_rec_vas & to_disable)
+        n_struct_dup = len(redundant_vas & to_disable)
+
+        with self._lock:
+            self._disabled_vas.update(to_disable)
+            self._diags.append(
+                f"Pruned {len(to_disable)} hook(s) "
+                f"(non-rec={n_non_rec}, struct-dup={n_struct_dup})"
+            )
+        self._send_disable(to_disable)
 
     def filter_to(self, candidates: list["HookCandidate"]) -> None:
         """Set the confirmed address set so the live feed receives their texts.
@@ -587,6 +681,8 @@ class HookSearcher:
                 if not c.hook_va:
                     c.hook_va = hook_va
             else:
+                seq = self._seq_counter
+                self._seq_counter += 1
                 self._candidates[key] = HookCandidate(
                     module=name,
                     rva=rva,
@@ -597,6 +693,7 @@ class HookSearcher:
                     score=s,
                     hook_va=hook_va,
                     str_ptr=str_ptr,
+                    first_seen_seq=seq,
                 )
             # If this address is in the confirmed set, add to the live feed.
             if self._confirmed_vas and hook_va in self._confirmed_vas:

@@ -1,7 +1,8 @@
 """Value objects for hook sites used by :class:`~src.hook.hook_search.HookSearcher`."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import copy as _copy
+from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,7 @@ class HookCandidate:
     score: float = 0.0
     hook_va: int = 0  # absolute VA as received from the pipe; used for confirmed-set filtering
     str_ptr: int = 0  # VA of the string in game memory (from Send's stack scan)
+    first_seen_seq: int = 0  # monotonic sequence number assigned on first hit
 
     def to_hook_code(self) -> HookCode:
         return HookCode(
@@ -189,16 +191,18 @@ class HookCandidate:
             f"  ptr={self.str_ptr:#x}  {preview!r}"
         )
 
-    def display_label_aggregated(self, n_sites: int) -> str:
-        """Label for an aggregated group in the Recommended tab.
+    def display_label_aggregated(self, n_sites: int, n_structs: int = 1) -> str:
+        """Label for an aggregated text group in the Recommended tab.
 
         Shows the representative's best access pattern and score, plus the
-        total hit count and how many unique hook sites produced this text.
+        total hit count and how many unique hook sites / struct groups
+        produced this text.
         """
-        preview = self.text[:50].replace("\n", " ")
+        preview = self.text[:45].replace("\n", " ")
         return (
             f"[{self.score:6.0f}]  +{self.rva:#x}  {self.access_pattern}"
-            f"  hits={self.hit_count}  sites={n_sites}  {preview!r}"
+            f"  hits={self.hit_count}  structs={n_structs}  hooks={n_sites}"
+            f"  {preview!r}"
         )
 
 
@@ -274,8 +278,6 @@ def aggregate_by_text(
     This is a pure presentation helper — the underlying candidate objects
     are not modified.
     """
-    from copy import copy as _copy
-
     groups: dict[str, list[HookCandidate]] = {}
     for c in candidates:
         groups.setdefault(c.text, []).append(c)
@@ -289,6 +291,176 @@ def aggregate_by_text(
 
     result.sort(key=lambda t: -t[0].score)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Three-level aggregation model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StructGroup:
+    """Middle tier — candidates whose ``str_ptr`` values are nearby.
+
+    Represents a single struct instance seen by one or more hook functions.
+
+    Attributes
+    ----------
+    leader:
+        The candidate with the smallest ``first_seen_seq`` in this group.
+        It is the "top-level function" and should be kept active.
+    members:
+        All candidates belonging to this struct group (including the leader),
+        sorted by ``first_seen_seq`` ascending.
+    """
+
+    leader: HookCandidate
+    members: list[HookCandidate] = field(default_factory=list)
+
+    @property
+    def total_hits(self) -> int:
+        return sum(m.hit_count for m in self.members)
+
+    @property
+    def hook_vas(self) -> set[int]:
+        """Distinct ``hook_va`` values across all members."""
+        return {m.hook_va for m in self.members if m.hook_va}
+
+    @property
+    def text(self) -> str:
+        """Current text from the leader."""
+        return self.leader.text
+
+
+@dataclass
+class TextGroup:
+    """Top tier — struct groups whose leaders produce the same text.
+
+    Attributes
+    ----------
+    priority_struct:
+        The struct group whose leader has the smallest ``first_seen_seq``.
+        Its leader is the overall priority hook for this text.
+    structs:
+        All struct groups with this text, sorted by leader's
+        ``first_seen_seq`` ascending.
+    text:
+        The shared text string.
+    """
+
+    priority_struct: StructGroup
+    structs: list[StructGroup] = field(default_factory=list)
+    text: str = ""
+
+    @property
+    def total_hits(self) -> int:
+        return sum(sg.total_hits for sg in self.structs)
+
+    @property
+    def total_hooks(self) -> int:
+        """Number of unique ``hook_va`` across all struct groups."""
+        vas: set[int] = set()
+        for sg in self.structs:
+            vas.update(sg.hook_vas)
+        return len(vas)
+
+    @property
+    def leader(self) -> HookCandidate:
+        return self.priority_struct.leader
+
+    @property
+    def score(self) -> float:
+        return max((sg.leader.score for sg in self.structs), default=0.0)
+
+
+def build_struct_groups(
+    candidates: list[HookCandidate],
+    tolerance: int = 256,
+) -> list[StructGroup]:
+    """Group *candidates* into struct groups by ``str_ptr`` proximity.
+
+    Within each group the candidate with the smallest ``first_seen_seq`` is
+    the leader.  Returns groups sorted by leader's ``first_seen_seq``.
+
+    Candidates with ``str_ptr == 0`` are each placed in their own singleton
+    group (we can't tell whether they share a struct).
+    """
+    resolved = [c for c in candidates if c.str_ptr != 0]
+    unresolved = [c for c in candidates if c.str_ptr == 0]
+
+    resolved.sort(key=lambda c: c.str_ptr)
+
+    raw_groups: list[list[HookCandidate]] = []
+    for c in resolved:
+        if raw_groups and c.str_ptr - raw_groups[-1][0].str_ptr <= tolerance:
+            raw_groups[-1].append(c)
+        else:
+            raw_groups.append([c])
+
+    # Unresolved → each in its own group
+    for c in unresolved:
+        raw_groups.append([c])
+
+    result: list[StructGroup] = []
+    for members in raw_groups:
+        members.sort(key=lambda c: c.first_seen_seq)
+        result.append(StructGroup(leader=members[0], members=members))
+
+    result.sort(key=lambda sg: sg.leader.first_seen_seq)
+    return result
+
+
+def build_text_groups(struct_groups: list[StructGroup]) -> list[TextGroup]:
+    """Aggregate *struct_groups* by their leader's text into text groups.
+
+    Returns text groups sorted by ``score`` descending.
+    """
+    by_text: dict[str, list[StructGroup]] = {}
+    for sg in struct_groups:
+        by_text.setdefault(sg.text, []).append(sg)
+
+    result: list[TextGroup] = []
+    for text, sgs in by_text.items():
+        sgs.sort(key=lambda sg: sg.leader.first_seen_seq)
+        result.append(TextGroup(
+            priority_struct=sgs[0],
+            structs=sgs,
+            text=text,
+        ))
+
+    result.sort(key=lambda tg: -tg.score)
+    return result
+
+
+def compute_redundant_hook_vas(
+    struct_groups: list[StructGroup],
+    confirmed_vas: set[int] | None = None,
+) -> set[int]:
+    """Return ``hook_va`` values that can safely be disabled.
+
+    A ``hook_va`` is redundant if it is **not** the leader's ``hook_va`` in
+    **any** struct group.  Confirmed hooks (already in use by the pipeline)
+    are never marked redundant.
+
+    Parameters
+    ----------
+    struct_groups:
+        Output of :func:`build_struct_groups`.
+    confirmed_vas:
+        ``hook_va`` values currently confirmed by the user.  These are
+        excluded from the redundant set regardless of leader status.
+    """
+    leader_vas: set[int] = set()
+    all_vas: set[int] = set()
+    for sg in struct_groups:
+        if sg.leader.hook_va:
+            leader_vas.add(sg.leader.hook_va)
+        all_vas.update(sg.hook_vas)
+
+    redundant = all_vas - leader_vas
+    if confirmed_vas:
+        redundant -= confirmed_vas
+    return redundant
 
 
 def format_ptr_groups(

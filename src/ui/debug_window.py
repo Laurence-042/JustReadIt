@@ -41,7 +41,7 @@ from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.hook.hook_search import (
     HookCandidate, HookCode, HookSearcher, HookSearchError, score_candidate,
 )
-from src.hook.hook_code import group_by_str_ptr, format_ptr_groups
+from src.hook.hook_code import group_by_str_ptr, format_ptr_groups, TextGroup
 from .window_picker import WindowPicker
 
 
@@ -1334,13 +1334,13 @@ class DebugWindow(QMainWindow):
         # even when the total visible count stays the same).
         self._refresh_confirmed_tab()
 
-        # ── Recommended tab (aggregated by text, incremental update) ─────
-        aggregated = self._searcher.aggregated_recommended_candidates()
-        total_rec = sum(len(members) for _, members in aggregated)
-        # Key = representative text (stable within a group)
-        current_keys: dict[str, tuple] = {}
-        for rep, members in aggregated:
-            current_keys[rep.text] = (rep, members)
+        # ── Recommended tab (three-level aggregation, incremental update) ─
+        text_groups: list[TextGroup] = self._searcher.aggregated_recommended_candidates()
+        total_rec = sum(tg.total_hooks for tg in text_groups)
+        # Key = shared text string (stable within a text group)
+        current_keys: dict[str, TextGroup] = {}
+        for tg in text_groups:
+            current_keys[tg.text] = tg
 
         # Remove items no longer recommended
         for key in list(self._rec_items.keys()):
@@ -1351,31 +1351,38 @@ class DebugWindow(QMainWindow):
                     self._lst_recommended.takeItem(row)
 
         # Update existing or add new items
-        for key, (rep, members) in current_keys.items():
-            label = rep.display_label_aggregated(len(members))
-            # Store ALL member hook codes so _confirm_candidate confirms the
-            # entire group; store text separately for Copy Text.
-            all_codes = "\n".join(m.to_hook_code().to_str() for m in members)
+        for key, tg in current_keys.items():
+            preview = tg.text[:45].replace("\n", " ")
+            label = (
+                f"[{tg.score:6.0f}]  +{tg.leader.rva:#x}  {tg.leader.access_pattern}"
+                f"  hits={tg.total_hits}  structs={len(tg.structs)}"
+                f"  hooks={tg.total_hooks}  {preview!r}"
+            )
+            # Store ALL member hook codes (across all structs) so
+            # _confirm_candidate confirms the entire text group;
+            # store text separately for Copy Text.
+            all_members = [m for sg in tg.structs for m in sg.members]
+            all_codes = "\n".join(m.to_hook_code().to_str() for m in all_members)
             if key in self._rec_items:
                 item = self._rec_items[key]
                 item.setText(label)
                 item.setData(32, all_codes)
-                item.setData(33, rep.text)
+                item.setData(33, tg.text)
             else:
                 item = QListWidgetItem(label)
                 item.setData(32, all_codes)
-                item.setData(33, rep.text)
+                item.setData(33, tg.text)
                 self._lst_recommended.addItem(item)
                 self._rec_items[key] = item
 
         if self._lst_recommended.count() > 0 and self._lst_recommended.currentItem() is None:
             self._lst_recommended.setCurrentRow(0)
         self._tab_cands.setTabText(
-            0, f"Recommended ({len(aggregated)} / {total_rec})"
+            0, f"Recommended ({len(text_groups)} / {total_rec})"
         )
         self._lbl_rec_status.setText(
-            f"{len(aggregated)} unique text(s) from {total_rec} candidate(s) \u2014 sorted by score."
-            if aggregated else
+            f"{len(text_groups)} text group(s) from {total_rec} candidate(s) \u2014 sorted by score."
+            if text_groups else
             "No recommended candidates yet \u2014 play the game."
         )
 
