@@ -179,6 +179,7 @@ from src.hook.hook_code import (
     TextGroup,
     build_struct_groups,
     build_text_groups,
+    compute_fragment_texts,
     compute_redundant_hook_vas,
 )
 
@@ -465,4 +466,101 @@ class TestComputeRedundantHookVas:
         c2 = self._cand(hook_va=0xB, str_ptr=0x9000, seq=1, rva=0x200)
         sgs = build_struct_groups([c1, c2])
         assert compute_redundant_hook_vas(sgs) == set()
+
+
+# ==========================================================================
+# compute_fragment_texts
+# ==========================================================================
+
+
+class TestComputeFragmentTexts:
+
+    @staticmethod
+    def _cand(text: str, score: float = 80.0) -> HookCandidate:
+        return HookCandidate(
+            module="game.exe", rva=0x100, access_pattern="r0",
+            encoding="utf16", text=text, hit_count=1, score=score,
+            hook_va=0xA000, str_ptr=0x5000, first_seen_seq=0,
+        )
+
+    def test_empty_returns_empty(self) -> None:
+        assert compute_fragment_texts([]) == set()
+
+    def test_single_candidate_returns_empty(self) -> None:
+        assert compute_fragment_texts([self._cand("hello")]) == set()
+
+    def test_no_concatenation_returns_empty(self) -> None:
+        """Unrelated texts produce no fragments."""
+        cands = [self._cand("ABC"), self._cand("XYZ")]
+        assert compute_fragment_texts(cands) == set()
+
+    def test_simple_two_piece_concat(self) -> None:
+        """A = B + C  →  hide B and C."""
+        cands = [
+            self._cand("こんにちは世界"),
+            self._cand("こんにちは"),
+            self._cand("世界"),
+        ]
+        frags = compute_fragment_texts(cands)
+        assert frags == {"こんにちは", "世界"}
+
+    def test_three_piece_concat(self) -> None:
+        """A = B + C + D  →  hide B, C, D."""
+        cands = [
+            self._cand("ABCDEF"),
+            self._cand("AB"),
+            self._cand("CD"),
+            self._cand("EF"),
+        ]
+        frags = compute_fragment_texts(cands)
+        assert frags == {"AB", "CD", "EF"}
+
+    def test_composite_not_in_fragments(self) -> None:
+        """The long text itself must NOT appear in fragments."""
+        cands = [
+            self._cand("ABCD"),
+            self._cand("AB"),
+            self._cand("CD"),
+        ]
+        frags = compute_fragment_texts(cands)
+        assert "ABCD" not in frags
+
+    def test_partial_overlap_no_match(self) -> None:
+        """Pieces that don't exactly tile the target produce no fragments."""
+        cands = [
+            self._cand("ABCDE"),
+            self._cand("ABC"),
+            self._cand("DE_"),  # trailing underscore — doesn't match
+        ]
+        assert compute_fragment_texts(cands) == set()
+
+    def test_repeated_piece(self) -> None:
+        """Same piece used twice: ABAB = AB + AB."""
+        cands = [
+            self._cand("ABAB"),
+            self._cand("AB"),
+        ]
+        frags = compute_fragment_texts(cands)
+        assert frags == {"AB"}
+
+    def test_standalone_text_not_hidden_if_no_composite(self) -> None:
+        """If no longer text exists that concatenates these, nothing is hidden."""
+        cands = [self._cand("AB"), self._cand("CD")]
+        assert compute_fragment_texts(cands) == set()
+
+    def test_transitive_fragments(self) -> None:
+        """ABCDEF = ABCD + EF;  ABCD = AB + CD.
+
+        AB and CD are fragments of ABCD; ABCD and EF are fragments of ABCDEF.
+        All four should appear in the result.
+        """
+        cands = [
+            self._cand("ABCDEF"),
+            self._cand("ABCD"),
+            self._cand("EF"),
+            self._cand("AB"),
+            self._cand("CD"),
+        ]
+        frags = compute_fragment_texts(cands)
+        assert frags == {"ABCD", "EF", "AB", "CD"}
 

@@ -43,7 +43,7 @@ from src.hook.hook_code import (
     TextGroup,
     build_struct_groups,
     build_text_groups,
-    compute_redundant_hook_vas,
+    compute_fragment_texts,
 )
 from src.hook.candidate_scorer import score_candidate
 
@@ -165,6 +165,7 @@ class HookSearcher:
         self._advance_thread:  threading.Timer | None = None
         # Confirmed-address live feed (populated after filter_to())
         self._confirmed_vas: set[int] = set()
+        self._confirmed_keys: set[str] = set()  # candidate keys (rva:pattern)
         self._live_feed:     list[str] = []
         # Monotonic sequence counter for tracking first-seen order of candidates.
         self._seq_counter: int = 0
@@ -279,7 +280,8 @@ class HookSearcher:
 
     def recommended_candidates(self) -> list[HookCandidate]:
         """Return candidates with score >= :data:`_RECOMMEND_SCORE_THRESHOLD`,
-        sorted by score descending.  These are the most likely dialogue hooks."""
+        sorted by score descending.  These are the most likely dialogue hooks.
+        """
         with self._lock:
             cands = [
                 c for c in self._candidates.values()
@@ -290,12 +292,21 @@ class HookSearcher:
     def aggregated_recommended_candidates(self) -> list[TextGroup]:
         """Return recommended candidates aggregated via the three-level model.
 
+        Fragment texts (whose concatenation reproduces a longer candidate's
+        text) are filtered out before grouping so that only the
+        *composite* hook is displayed.
+
         Returns :class:`TextGroup` objects built from struct-level proximity
         grouping, ordered by score descending.  See
         :func:`~src.hook.hook_code.build_struct_groups` and
         :func:`~src.hook.hook_code.build_text_groups`.
         """
         recommended = self.recommended_candidates()
+        fragment_texts = compute_fragment_texts(recommended)
+        if fragment_texts:
+            recommended = [
+                c for c in recommended if c.text not in fragment_texts
+            ]
         struct_groups = build_struct_groups(recommended)
         return build_text_groups(struct_groups)
 
@@ -519,19 +530,20 @@ class HookSearcher:
                 log.warning("CMD_DISABLE write failed: %s", exc)
 
     def _prune_redundant(self) -> None:
-        """Identify and disable non-recommended and struct-redundant hooks.
+        """Disable hooks that have never produced useful text.
 
         Called on the advance-thread between batches.
 
-        Two pruning rules:
+        A ``hook_va`` is disabled if **all** its candidates have
+        ``max_score`` below the recommended threshold **and** have fired
+        at least ``_MIN_HITS_FOR_PRUNE`` times.  This is safe: a hook
+        that never scored well after several hits is genuine noise.
 
-        1. **Non-recommended**: A ``hook_va`` is disabled if *all* its
-           candidates score below the recommended threshold *and* have
-           fired at least ``_MIN_HITS_FOR_PRUNE`` times.
-        2. **Struct-redundant**: Among recommended candidates, those
-           grouped into the same struct (by ``str_ptr`` proximity) are
-           reduced to the *leader* (earliest ``first_seen_seq``).  Other
-           hook VAs in the group are disabled.
+        Struct-redundant pruning is intentionally **not** performed here
+        because ``str_ptr`` proximity is only a heuristic — different
+        access patterns at the same function can produce completely
+        different (and valid) dialogue text.  Since the DLL has no
+        CMD_ENABLE, disabling a hook is irreversible.
 
         Confirmed hooks and already-disabled hooks are never re-sent.
         """
@@ -539,7 +551,6 @@ class HookSearcher:
             candidates = list(self._candidates.values())
             confirmed = set(self._confirmed_vas)
 
-        # ── (A) Non-recommended hook VAs ──────────────────────────────
         by_va: dict[int, list[HookCandidate]] = {}
         for c in candidates:
             if c.hook_va:
@@ -548,31 +559,20 @@ class HookSearcher:
         non_rec_vas: set[int] = set()
         for va, cands in by_va.items():
             if all(
-                c.score < _RECOMMEND_SCORE_THRESHOLD
+                c.max_score < _RECOMMEND_SCORE_THRESHOLD
                 and c.hit_count >= self._MIN_HITS_FOR_PRUNE
                 for c in cands
             ):
                 non_rec_vas.add(va)
 
-        # ── (B) Struct-redundant among recommended ────────────────────
-        recommended = [c for c in candidates if c.score >= _RECOMMEND_SCORE_THRESHOLD]
-        struct_groups = build_struct_groups(recommended)
-        redundant_vas = compute_redundant_hook_vas(struct_groups, confirmed)
-
-        # ── Merge, exclude confirmed & already-sent ───────────────────
-        to_disable = (non_rec_vas | redundant_vas) - confirmed - self._disabled_vas
+        to_disable = non_rec_vas - confirmed - self._disabled_vas
         if not to_disable:
             return
-
-        # Compute per-category counts for diagnostics *before* updating the set.
-        n_non_rec = len(non_rec_vas & to_disable)
-        n_struct_dup = len(redundant_vas & to_disable)
 
         with self._lock:
             self._disabled_vas.update(to_disable)
             self._diags.append(
-                f"Pruned {len(to_disable)} hook(s) "
-                f"(non-rec={n_non_rec}, struct-dup={n_struct_dup})"
+                f"Pruned {len(to_disable)} non-recommended hook(s)"
             )
         self._send_disable(to_disable)
 
@@ -589,9 +589,14 @@ class HookSearcher:
         Safe to call on the UI thread; can be called multiple times.
         """
         confirmed_vas: set[int] = {c.hook_va for c in candidates if c.hook_va}
+        confirmed_keys: set[str] = {
+            f"{c.rva:#x}:{c.access_pattern}" for c in candidates
+        }
         with self._lock:
             self._confirmed_vas = confirmed_vas
-        log.info("filter_to: live feed watching %d address(es)", len(confirmed_vas))
+            self._confirmed_keys = confirmed_keys
+        log.info("filter_to: live feed watching %d key(s) across %d VA(s)",
+                 len(confirmed_keys), len(confirmed_vas))
 
     def drain_live_feed(self) -> list[str]:
         """Return and clear all texts queued since the last drain.
@@ -677,6 +682,7 @@ class HookSearcher:
                 # Always update to latest text (reflects current game state)
                 c.text = text
                 c.score = s
+                c.max_score = max(c.max_score, s)
                 c.str_ptr = str_ptr
                 if not c.hook_va:
                     c.hook_va = hook_va
@@ -691,12 +697,16 @@ class HookSearcher:
                     text=text,
                     hit_count=1,
                     score=s,
+                    max_score=s,
                     hook_va=hook_va,
                     str_ptr=str_ptr,
                     first_seen_seq=seq,
                 )
-            # If this address is in the confirmed set, add to the live feed.
-            if self._confirmed_vas and hook_va in self._confirmed_vas:
+            # If this specific candidate key is in the confirmed set, add to
+            # the live feed.  Filtering by key (rva:pattern) rather than just
+            # hook_va prevents unrelated access patterns at the same function
+            # from polluting the feed.
+            if self._confirmed_keys and key in self._confirmed_keys:
                 self._live_feed.append(text)
                 if len(self._live_feed) > 2048:
                     self._live_feed = self._live_feed[-2048:]

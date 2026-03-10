@@ -1,6 +1,7 @@
 """Value objects for hook sites used by :class:`~src.hook.hook_search.HookSearcher`."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from copy import copy as _copy
 from dataclasses import dataclass, field
 
@@ -163,6 +164,7 @@ class HookCandidate:
     text: str
     hit_count: int = 0
     score: float = 0.0
+    max_score: float = 0.0  # highest score ever seen; used for pruning decisions
     hook_va: int = 0  # absolute VA as received from the pipe; used for confirmed-set filtering
     str_ptr: int = 0  # VA of the string in game memory (from Send's stack scan)
     first_seen_seq: int = 0  # monotonic sequence number assigned on first hit
@@ -461,6 +463,82 @@ def compute_redundant_hook_vas(
     if confirmed_vas:
         redundant -= confirmed_vas
     return redundant
+
+
+def compute_fragment_texts(
+    candidates: Sequence[HookCandidate],
+) -> set[str]:
+    """Return candidate texts that are concatenation-fragments of longer texts.
+
+    A text *F* is a **fragment** if some longer candidate text *L* can be
+    expressed as a concatenation of two or more candidate texts, with *F*
+    being one of those pieces.  In game hooking this happens when a
+    high-level function assembles the full dialogue string from parts that
+    lower-level hooks also capture independently.
+
+    Uses dynamic programming (*word-break*) for each candidate text,
+    processing longest texts first.
+
+    Returns
+    -------
+    set[str]
+        Texts eligible for hiding in the Recommended display.  The
+        *composite* text (the long one) is **not** included.
+    """
+    all_texts = {c.text for c in candidates if c.text}
+    if len(all_texts) < 2:
+        return set()
+
+    fragments: set[str] = set()
+
+    for target in sorted(all_texts, key=len, reverse=True):
+        n = len(target)
+        # Only strictly shorter texts can serve as pieces.
+        pieces = {t for t in all_texts if 0 < len(t) < n}
+        if not pieces:
+            continue
+
+        piece_lens = sorted({len(p) for p in pieces})
+
+        # Forward DP: dp[i] = True  ⟺  target[:i] is decomposable.
+        dp = [False] * (n + 1)
+        dp[0] = True
+        for i in range(1, n + 1):
+            for pl in piece_lens:
+                if pl > i:
+                    break
+                if dp[i - pl] and target[i - pl : i] in pieces:
+                    dp[i] = True
+                    # Do NOT break — other lengths may enable longer pieces
+                    # in downstream positions (needed for full reachability).
+
+        if not dp[n]:
+            continue
+
+        # Backward reachability: rdp[i] = True  ⟺  target[i:] is
+        # decomposable into pieces.
+        rdp = [False] * (n + 1)
+        rdp[n] = True
+        for i in range(n - 1, -1, -1):
+            for pl in piece_lens:
+                end = i + pl
+                if end > n:
+                    break
+                if rdp[end] and target[i:end] in pieces:
+                    rdp[i] = True
+
+        # Every piece on ANY valid 0→n path is a fragment.
+        for i in range(n):
+            if not dp[i]:
+                continue
+            for pl in piece_lens:
+                end = i + pl
+                if end > n:
+                    break
+                if rdp[end] and target[i:end] in pieces:
+                    fragments.add(target[i:end])
+
+    return fragments
 
 
 def format_ptr_groups(

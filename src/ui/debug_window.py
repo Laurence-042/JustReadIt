@@ -1473,12 +1473,7 @@ class DebugWindow(QMainWindow):
             self.statusBar().showMessage(f"Invalid hook code(s): {'; '.join(bad)}", 5000)
             return
 
-        code_keys = {c.to_str() for c in codes}
-        all_candidates = self._searcher.ranked_candidates()
-        confirmed = [c for c in all_candidates if c.to_hook_code().to_str() in code_keys]
-        self._searcher.filter_to(confirmed)
-
-        # Merge new confirmed codes (union, not replacement).
+        # Merge new confirmed codes first (union, not replacement).
         existing = set(self._confirmed_hook_codes)
         for c in codes:
             key = c.to_str()
@@ -1486,6 +1481,13 @@ class DebugWindow(QMainWindow):
                 self._confirmed_hook_codes.append(key)
                 existing.add(key)
         _cfg.hook_code = ",".join(self._confirmed_hook_codes)
+
+        # filter_to with ALL confirmed codes so every confirmed VA stays
+        # protected from pruning and feeds into the live stream.
+        all_code_keys = set(self._confirmed_hook_codes)
+        all_candidates = self._searcher.ranked_candidates()
+        confirmed = [c for c in all_candidates if c.to_hook_code().to_str() in all_code_keys]
+        self._searcher.filter_to(confirmed)
         self._refresh_confirmed_tab()
         self._tab_cands.setCurrentIndex(2)  # switch to Confirmed tab
         self._lbl_search_status.setText(f"Confirmed {len(codes)} hook(s) — live feed active.")
