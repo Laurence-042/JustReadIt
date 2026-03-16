@@ -52,6 +52,11 @@ _MAX_EXTRACT_CHARS: int = 4096
 # Minimum extracted string length to consider a quality hit.
 _MIN_TEXT_LENGTH: int = 2
 
+# Strings longer than this are refined to nearby lines.
+# VN engines load entire script files as one null-terminated block;
+# line-level refinement isolates the dialog paragraph for Levenshtein matching.
+_LINE_REFINE_THRESHOLD: int = 300
+
 
 # ---------------------------------------------------------------------------
 # Value object
@@ -257,6 +262,44 @@ def _is_quality_text(text: str) -> bool:
     return printable >= _MIN_TEXT_LENGTH
 
 
+def _refine_to_lines(
+    text: str,
+    needle: str,
+    *,
+    context_lines: int = 3,
+) -> str:
+    """Narrow a long text block to lines near *needle*.
+
+    VN engines (e.g. Light.VN) load entire script files into memory as
+    one null-terminated string.  This function splits by ``\\r\\n`` /
+    ``\\n``, locates the line containing *needle*, and returns a small
+    window of adjacent lines — producing a paragraph-sized candidate
+    instead of the full script.
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+
+    # Find which line contains the needle.
+    center: int | None = None
+    for i, line in enumerate(lines):
+        if needle in line:
+            center = i
+            break
+
+    if center is None:
+        return text  # defensive — should not happen
+
+    lo = max(0, center - context_lines)
+    hi = min(len(lines), center + context_lines + 1)
+
+    # Trim empty / whitespace-only lines from boundaries.
+    while lo < center and not lines[lo].strip():
+        lo += 1
+    while hi > center + 1 and not lines[hi - 1].strip():
+        hi -= 1
+
+    return "\n".join(lines[lo:hi])
+
+
 # ---------------------------------------------------------------------------
 # Encoder helper
 # ---------------------------------------------------------------------------
@@ -387,7 +430,8 @@ class MemoryScanner:
                 if len(results) >= max_results:
                     break
                 self._scan_one_region(
-                    base, size, needle_bytes, enc, results, seen_texts, max_results,
+                    base, size, needle_bytes, needle, enc,
+                    results, seen_texts, max_results,
                 )
 
             if len(results) >= max_results:
@@ -403,7 +447,8 @@ class MemoryScanner:
                 if size > max_region_bytes:
                     continue
                 self._scan_one_region(
-                    base, size, needle_bytes, enc, results, seen_texts, max_results,
+                    base, size, needle_bytes, needle, enc,
+                    results, seen_texts, max_results,
                 )
 
             if results:
@@ -432,6 +477,7 @@ class MemoryScanner:
         base: int,
         size: int,
         needle_bytes: bytes,
+        needle_text: str,
         encoding: str,
         results: list[ScanResult],
         seen_texts: set[str],
@@ -451,6 +497,14 @@ class MemoryScanner:
             text = _extract_string(data, pos, encoding)
             if text is None or not _is_quality_text(text):
                 continue
+
+            # Refine large blocks (e.g. entire VN script files) to the
+            # paragraph surrounding the needle.
+            if len(text) > _LINE_REFINE_THRESHOLD:
+                text = _refine_to_lines(text, needle_text)
+                if not _is_quality_text(text):
+                    continue
+
             if text in seen_texts:
                 continue
 

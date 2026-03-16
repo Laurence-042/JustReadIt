@@ -18,6 +18,7 @@ from src.memory.scanner import (
     _extract_byte_delimited,
     _is_cjk,
     _is_quality_text,
+    _refine_to_lines,
     _try_encode,
 )
 
@@ -215,6 +216,78 @@ class TestIsQualityText:
 
     def test_two_printable_accepted(self) -> None:
         assert _is_quality_text("AB")
+
+
+# ==========================================================================
+# _refine_to_lines
+# ==========================================================================
+
+
+class TestRefineToLines:
+    """Line-level refinement for VN script blocks."""
+
+    def test_short_text_unchanged(self) -> None:
+        """Text shorter than threshold is returned as-is."""
+        short = "テスト文字列"
+        assert _refine_to_lines(short, "テスト") == short
+
+    def test_isolates_needle_line(self) -> None:
+        script = "\r\n".join([
+            "~ジャンプ scene_02",
+            "~表示 キャラ名",
+            "街に行くまでの道で、牧場がある村がある。",
+            "一応、そこで馬がレンタル出来たはずだけど",
+            "~入力禁止 false",
+            "~暗転 黒",
+        ])
+        result = _refine_to_lines(script, "レンタル出来たは")
+        assert "レンタル出来たは" in result
+        # Should include the dialog line and nearby context.
+        lines = result.split("\n")
+        assert len(lines) <= 7  # context_lines=3 default
+
+    def test_trims_empty_boundary_lines(self) -> None:
+        script = "\r\n".join([
+            "",
+            "",
+            "テスト対象のテキスト",
+            "",
+            "",
+        ])
+        result = _refine_to_lines(script, "テスト対象")
+        assert result.strip() == "テスト対象のテキスト"
+
+    def test_context_lines_parameter(self) -> None:
+        lines = [f"line{i}" for i in range(20)]
+        lines[10] = "needleの入った行"
+        script = "\r\n".join(lines)
+        result = _refine_to_lines(script, "needle", context_lines=1)
+        result_lines = result.split("\n")
+        assert len(result_lines) == 3  # 1 before + needle + 1 after
+
+    def test_needle_not_found_returns_original(self) -> None:
+        text = "何もない文章"
+        assert _refine_to_lines(text, "存在しない") == text
+
+    def test_needle_at_start(self) -> None:
+        script = "\r\n".join([
+            "needleの最初の行",
+            "二行目",
+            "三行目",
+            "四行目",
+        ])
+        result = _refine_to_lines(script, "needle", context_lines=2)
+        assert result.startswith("needleの最初の行")
+
+    def test_needle_at_end(self) -> None:
+        script = "\r\n".join([
+            "一行目",
+            "二行目",
+            "三行目",
+            "needleの最後の行",
+        ])
+        result = _refine_to_lines(script, "needle", context_lines=2)
+        assert result.endswith("needleの最後の行")
 
 
 # ==========================================================================

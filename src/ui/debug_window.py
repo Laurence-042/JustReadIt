@@ -240,7 +240,7 @@ class _PipelineWorker(QObject):
                         )
                     elif results:
                         previews = "\n".join(
-                            f"  [{r.encoding}] {r.text[:80]!r}"
+                            f"  [{r.encoding}] {r.text[:200]!r}"
                             for r in results[:5]
                         )
                         mem_text = (

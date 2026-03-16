@@ -67,4 +67,22 @@ def best_match(
             best_score = score
             best_text = candidate
 
-    return best_text if best_score >= threshold else None
+    if best_score >= threshold:
+        return best_text
+
+    # Fallback: partial matching for length-mismatched pairs.
+    # Catches cases where line-level extraction yields a single dialog
+    # line while OCR captured multiple lines (or vice versa).
+    _PARTIAL_THRESHOLD = 75.0
+    best_partial = 0.0
+    best_partial_text: str | None = None
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        score = fuzz.partial_ratio(ocr_text, candidate)
+        if score > best_partial:
+            best_partial = score
+            best_partial_text = candidate
+
+    return best_partial_text if best_partial >= _PARTIAL_THRESHOLD else None
