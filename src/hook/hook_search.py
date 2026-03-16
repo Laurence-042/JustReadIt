@@ -30,6 +30,7 @@ from src.hook._win32 import (
     create_pipe_server,
     inject_dll,
     pack_disable_command,
+    pack_focus_command,
     pack_scan_next_command,
     pack_search_config,
     read_pipe_exact,
@@ -171,6 +172,9 @@ class HookSearcher:
         self._seq_counter: int = 0
         # hook_va values already sent via CMD_DISABLE (avoid re-sending).
         self._disabled_vas: set[int] = set()
+        # hook_va values already sent via CMD_FOCUS (avoid re-sending
+        # unless the focus set changes).
+        self._focused_vas: dict[int, frozenset[str]] = {}  # va → frozenset of kept patterns
         # Counter for periodic post-scan pruning (incremented on reader thread only).
         self._hit_count_since_prune: int = 0
         # Process-exit / connect-timeout detection
@@ -533,23 +537,78 @@ class HookSearcher:
             except (PipeError, OSError) as exc:
                 log.warning("CMD_DISABLE write failed: %s", exc)
 
+    def _send_focus(self, va: int, l1_masks: list[int],
+                    l2_hits: list[int]) -> None:
+        """Send CMD_FOCUS for *va* to the DLL (thread-safe)."""
+        if self._stop.is_set() or not self._h_pipe:
+            return
+        with self._write_lock:
+            if self._stop.is_set() or not self._h_pipe:
+                return
+            try:
+                write_pipe(self._h_pipe, pack_focus_command(va, l1_masks, l2_hits))
+                log.info("HookSearcher: CMD_FOCUS sent for VA %#x", va)
+            except (PipeError, OSError) as exc:
+                log.warning("CMD_FOCUS write failed: %s", exc)
+
+    @staticmethod
+    def _pattern_to_focus_bits(
+        pattern: str,
+    ) -> tuple[int, int, bool] | None:
+        """Parse an access pattern into ``(reg_code, l1_bit, needs_l2)``.
+
+        Returns ``None`` for direct-register or stack patterns (they don't
+        involve ``scan_struct_deref`` and can't be focused).
+        """
+        _DEREF_L1_BASE = 100
+        _DEREF_L2_BASE = 10000
+        _REG_MAP = {"r0": 0, "r1": 1, "r2": 2, "r3": 3}
+
+        p = pattern.strip()
+
+        # L2: "r0+0x48->0x10"
+        if "->" in p:
+            base_part, _ = p.split("->", 1)
+            reg_str, _, off_str = base_part.partition("+")
+            reg_code = _REG_MAP.get(reg_str)
+            if reg_code is None:
+                return None
+            off1 = int(off_str, 16) if off_str else 0
+            bit = off1 // 8
+            return (reg_code, bit, True)
+
+        # L1: "r0+0x48"
+        if "+" in p:
+            reg_str, _, off_str = p.partition("+")
+            reg_code = _REG_MAP.get(reg_str)
+            if reg_code is None:
+                return None
+            off1 = int(off_str, 16) if off_str else 0
+            bit = off1 // 8
+            return (reg_code, bit, False)
+
+        # Direct register (r0) or stack (s+0x28) — no struct deref
+        return None
+
     def _prune_redundant(self) -> None:
-        """Disable hooks that have never produced useful text.
+        """Pattern-level pruning with CMD_FOCUS and CMD_DISABLE.
 
-        Called on the advance-thread between batches.
+        Called periodically on a worker thread.
 
-        A ``hook_va`` is disabled if **all** its candidates have
-        ``max_score`` below the recommended threshold **and** have fired
-        at least ``_MIN_HITS_FOR_PRUNE`` times.  This is safe: a hook
-        that never scored well after several hits is genuine noise.
+        For each ``hook_va``:
 
-        Struct-redundant pruning is intentionally **not** performed here
-        because ``str_ptr`` proximity is only a heuristic — different
-        access patterns at the same function can produce completely
-        different (and valid) dialogue text.  Since the DLL has no
-        CMD_ENABLE, disabling a hook is irreversible.
+        - If **no** candidate has ``max_score >= threshold`` (and all have
+          fired at least ``_MIN_HITS_FOR_PRUNE`` times): send CMD_DISABLE
+          to remove the entire hook.
 
-        Confirmed hooks and already-disabled hooks are never re-sent.
+        - If **some** candidates are recommended: send CMD_FOCUS to lock the
+          DLL's struct-deref scan to only the access patterns that produced
+          recommended scores.  Non-struct patterns (direct register / stack)
+          are always kept because they are cheap.
+
+        Confirmed hooks and already-disabled hooks are never touched.
+        A CMD_FOCUS is only re-sent if the set of kept patterns changed
+        since the last focus for that VA.
         """
         with self._lock:
             candidates = list(self._candidates.values())
@@ -560,25 +619,77 @@ class HookSearcher:
             if c.hook_va:
                 by_va.setdefault(c.hook_va, []).append(c)
 
-        non_rec_vas: set[int] = set()
+        to_disable: set[int] = set()
+        to_focus: list[tuple[int, list[int], list[int], frozenset[str]]] = []
+
         for va, cands in by_va.items():
-            if all(
-                c.max_score < _RECOMMEND_SCORE_THRESHOLD
-                and c.hit_count >= self._MIN_HITS_FOR_PRUNE
+            if va in confirmed or va in self._disabled_vas:
+                continue
+
+            # Partition into recommended / non-recommended
+            rec = [
+                c for c in cands
+                if c.max_score >= _RECOMMEND_SCORE_THRESHOLD
+            ]
+            non_rec_ready = all(
+                c.hit_count >= self._MIN_HITS_FOR_PRUNE
                 for c in cands
-            ):
-                non_rec_vas.add(va)
-
-        to_disable = non_rec_vas - confirmed - self._disabled_vas
-        if not to_disable:
-            return
-
-        with self._lock:
-            self._disabled_vas.update(to_disable)
-            self._diags.append(
-                f"Pruned {len(to_disable)} non-recommended hook(s)"
+                if c.max_score < _RECOMMEND_SCORE_THRESHOLD
             )
-        self._send_disable(to_disable)
+
+            if not rec:
+                # No recommended patterns at all → disable entire hook
+                if non_rec_ready:
+                    to_disable.add(va)
+                continue
+
+            # Some recommended → build focus masks from their patterns
+            l1_masks = [0, 0, 0, 0]
+            l2_hits = [0, 0, 0, 0]
+            kept_patterns: set[str] = set()
+
+            for c in rec:
+                bits = self._pattern_to_focus_bits(c.access_pattern)
+                if bits is not None:
+                    reg_code, bit, needs_l2 = bits
+                    if bit < 64:
+                        l1_masks[reg_code] |= (1 << bit)
+                    if needs_l2:
+                        l2_hits[reg_code] = 1
+                    kept_patterns.add(c.access_pattern)
+
+            if not kept_patterns:
+                # All recommended patterns are direct reg/stack — no struct
+                # deref to narrow.  Send focus with empty masks to disable
+                # all struct scanning for this VA.
+                kept_key = frozenset(kept_patterns)
+                prev = self._focused_vas.get(va)
+                if prev != kept_key:
+                    to_focus.append((va, [0, 0, 0, 0], [0, 0, 0, 0], kept_key))
+                continue
+
+            kept_key = frozenset(kept_patterns)
+            prev = self._focused_vas.get(va)
+            if prev != kept_key:
+                to_focus.append((va, l1_masks, l2_hits, kept_key))
+
+        # Execute disables
+        if to_disable:
+            with self._lock:
+                self._disabled_vas.update(to_disable)
+                self._diags.append(
+                    f"Pruned {len(to_disable)} non-recommended hook(s)"
+                )
+            self._send_disable(to_disable)
+
+        # Execute focuses
+        for va, masks, l2s, kept_key in to_focus:
+            self._send_focus(va, masks, l2s)
+            with self._lock:
+                self._focused_vas[va] = kept_key
+                self._diags.append(
+                    f"Focused VA {va:#x}: {len(kept_key)} pattern(s)"
+                )
 
     def filter_to(self, candidates: list["HookCandidate"]) -> None:
         """Set the confirmed address set so the live feed receives their texts.

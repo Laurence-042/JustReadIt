@@ -135,7 +135,8 @@ typedef struct {
     uint32_t  _pad;
     uint64_t  l1_mask[4];    /* per-reg: bits 0-63 -> offsets 0x000..0x1F8 */
     uint8_t   l2_hit[4];     /* 1 if L2 ever found text for this register  */
-    uint8_t   _pad2[4];
+    uint8_t   focused;       /* 1 = Python sent CMD_FOCUS; masks are locked */
+    uint8_t   _pad2[3];
 } LayoutEntry;
 
 static LayoutEntry g_layout_cache[LAYOUT_CACHE_SIZE];
@@ -519,20 +520,35 @@ static void scan_struct_deref(uintptr_t address, uintptr_t base_ptr,
             slot->addr = address;          /* claim empty slot */
         if (slot->addr == address) {
             le = slot;
-            if (le->warmup < LAYOUT_WARMUP)
+            if (le->focused)
+                pruning = true;            /* focused: always prune */
+            else if (le->warmup < LAYOUT_WARMUP)
                 le->warmup++;
             else
                 pruning = true;
         }
     }
 
+    /* Route E: focused VA with no L1/L2 patterns for this register
+     * → skip entirely (no sptr_cache lookup, no scan loop).          */
+    if (le && le->focused
+        && le->l1_mask[reg_code] == 0
+        && !le->l2_hit[reg_code])
+        return;
+
     /* ---- struct-pointer dedup ----
      * Skip if the exact (address, base_ptr, reg_code) combination was
      * already scanned in the current rate epoch.  Epoch rotation every
      * RATE_WINDOW_MS naturally invalidates stale entries, so text
-     * changes are re-discovered within one window (~3 s).             */
+     * changes are re-discovered within one window (~3 s).
+     *
+     * Route E: focused VAs use epoch >> 1 (re-scan every ~6 s instead
+     * of ~3 s).  Focused masks are already narrow (1-3 bits), so the
+     * per-scan cost is trivial; halving frequency is a net gain.      */
     {
         LONG epoch = g_rate_epoch;          /* volatile read; atomic on x64 */
+        if (le && le->focused)
+            epoch >>= 1;                    /* coarser epoch → longer dedup */
         uint64_t h = address * 2654435761ULL;
         h ^= base_ptr * 0x9E3779B97F4A7C15ULL;
         h ^= (uint64_t)(unsigned)(reg_code + 1) * 0x517CC1B727220A95ULL;
@@ -561,8 +577,9 @@ static void scan_struct_deref(uintptr_t address, uintptr_t base_ptr,
 
         if (ptr1 < 0x10000 || ptr1 > 0x000F000000000000ULL) continue;
 
-        /* Learning: record this offset as ever holding a valid pointer. */
-        if (le && bit < 64)
+        /* Learning: record this offset as ever holding a valid pointer.
+         * Focused entries have locked masks — do not expand.           */
+        if (le && bit < 64 && !le->focused)
             le->l1_mask[reg_code] |= (1ULL << bit);
 
         /* Try as direct text pointer */
@@ -1077,6 +1094,7 @@ static long scan_next_batch(DWORD batch) {
  * ============================================================= */
 #define CMD_DISABLE   1
 #define CMD_SCAN_NEXT 2
+#define CMD_FOCUS     3
 
 static void do_search(const Config *cfg) {
     log_phase("DO_SEARCH_ENTER");
@@ -1264,6 +1282,44 @@ static void do_search(const Config *cfg) {
                         "disabled:%lu", (unsigned long)cnt);
                     pipe_write(0,0,1,dbuf, n>0?(DWORD)n:0);
                 }
+
+            } else if (cmd == CMD_FOCUS) {
+                /* CMD_FOCUS: lock a LayoutEntry's masks to only the
+                 * patterns that Python determined are worth probing.
+                 *
+                 * Payload (44 bytes):
+                 *   uint64_t  va           (hook address)
+                 *   uint64_t  l1_mask[4]   (per-reg L1 offset bitmask)
+                 *   uint8_t   l2_hit[4]    (per-reg L2 enable flag)
+                 */
+                uint64_t fva = 0;
+                uint64_t fmask[4] = {0};
+                uint8_t  fl2[4] = {0};
+                if (!pipe_read_all(&fva, 8)) break;
+                if (!pipe_read_all(fmask, 32)) break;
+                if (!pipe_read_all(fl2, 4)) break;
+
+                ULONG li = (ULONG)((((uintptr_t)fva >> 4) * 2654435761ULL)
+                                   & LAYOUT_CACHE_MASK);
+                LayoutEntry *slot = &g_layout_cache[li];
+                /* Claim or match the slot */
+                if (slot->addr == 0)
+                    slot->addr = (uintptr_t)fva;
+                if (slot->addr == (uintptr_t)fva) {
+                    for (int r = 0; r < 4; r++) {
+                        slot->l1_mask[r] = fmask[r];
+                        slot->l2_hit[r]  = fl2[r];
+                    }
+                    slot->warmup  = LAYOUT_WARMUP;  /* force pruning mode */
+                    slot->focused = 1;
+                }
+                char fbuf[80];
+                int fn = _snprintf_s(fbuf, sizeof(fbuf), _TRUNCATE,
+                    "focused:0x%llX m0=%llX m1=%llX",
+                    (unsigned long long)fva,
+                    (unsigned long long)fmask[0],
+                    (unsigned long long)fmask[1]);
+                pipe_write(0,0,1,fbuf, fn>0?(DWORD)fn:0);
 
             } else if (cmd == CMD_SCAN_NEXT) {
                 /* Payload: uint32_t batch_size */

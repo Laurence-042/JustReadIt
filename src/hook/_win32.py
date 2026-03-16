@@ -367,6 +367,42 @@ def pack_disable_command(vas: set[int] | list[int]) -> bytes:
     return struct.pack(f"<BI{len(va_list)}Q", _CMD_DISABLE, len(va_list), *va_list)
 
 
+# CMD_FOCUS: uint8_t(3) + uint64_t(va) + uint64_t(l1_mask[4]) + uint8_t(l2_hit[4])
+_CMD_FOCUS: int = 3
+
+
+def pack_focus_command(
+    va: int,
+    l1_masks: list[int],
+    l2_hits: list[int],
+) -> bytes:
+    """Pack a CMD_FOCUS command to lock a hook's struct-deref scan masks.
+
+    After CMD_FOCUS, the DLL only probes the L1 offsets set in *l1_masks*
+    and only attempts L2 scans for registers with *l2_hits* set.  Masks
+    are permanent until a new CMD_FOCUS for the same VA.
+
+    Parameters
+    ----------
+    va:
+        Absolute virtual address of the hook to focus.
+    l1_masks:
+        Per-register L1 offset bitmask (4 elements, one per arg register).
+        Bit *n* enables probing at offset ``n * 8`` in the struct.
+    l2_hits:
+        Per-register L2 enable flag (4 elements, 0 or 1 each).
+    """
+    m = [l1_masks[i] if i < len(l1_masks) else 0 for i in range(4)]
+    l = [l2_hits[i] if i < len(l2_hits) else 0 for i in range(4)]
+    return struct.pack(
+        "<BQ4Q4B",
+        _CMD_FOCUS,
+        va,
+        m[0], m[1], m[2], m[3],
+        l[0], l[1], l[2], l[3],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Module base lookup
 # ---------------------------------------------------------------------------
