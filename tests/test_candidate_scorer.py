@@ -1,12 +1,148 @@
 """Tests for src/hook/candidate_scorer.py — candidate text scoring.
 
-Covers hard-reject filters, base scoring, and per-language bonuses.
+Covers hard-reject filters, text blacklist, base scoring, and per-language bonuses.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from src.hook.candidate_scorer import score_candidate
+from src.hook.candidate_scorer import (
+    TEXT_BLACKLIST,
+    is_blacklisted,
+    score_candidate,
+)
+
+
+# ==========================================================================
+# Text blacklist
+# ==========================================================================
+
+
+class TestTextBlacklist:
+    """Verify that TEXT_BLACKLIST patterns reject engine noise and let
+    legitimate dialogue through."""
+
+    # ── script markers / comments ──────────────────────────────────────
+
+    @pytest.mark.parametrize("text", [
+        "@label_start",
+        "  @select 選択肢",
+        "*tag_opening",
+        "#define CONSTANT",
+        ";; comment line",
+        " // this is a comment",
+    ])
+    def test_script_marker_lines(self, text: str) -> None:
+        assert is_blacklisted(text)
+
+    @pytest.mark.parametrize("text", [
+        "[wait time=500]",
+        "[jump target=scene2]",
+        "  [playse file=click.ogg]",
+    ])
+    def test_bracket_commands(self, text: str) -> None:
+        assert is_blacklisted(text)
+
+    def test_bracket_dialogue_allowed(self) -> None:
+        """「brackets」 used for Japanese quotation must NOT be blacklisted."""
+        assert not is_blacklisted("「お前は誰だ」")
+
+    # ── control-flow keywords ──────────────────────────────────────────
+
+    @pytest.mark.parametrize("text", [
+        "if flag_read",
+        "goto label_end",
+        "call sub_routine",
+        "RETURN",
+        "elsif cond > 0",
+    ])
+    def test_control_flow_keywords(self, text: str) -> None:
+        assert is_blacklisted(text)
+
+    # ── comparison expressions ─────────────────────────────────────────
+
+    @pytest.mark.parametrize("text", [
+        'flag == "on"',
+        "count != 0",
+        "hp >= 100",
+        "level <= 5",
+        "x=='true'",
+        'scene_read == "done"',
+        '保存変数 現在エモーション = "会話" | 保存変数 会話相手 = "馬飼いの青年"',
+        '保存変数 会話スイッチ = "ON"',
+        'var = 42',
+    ])
+    def test_assignment_and_comparison_expressions(self, text: str) -> None:
+        assert is_blacklisted(text)
+
+    # ── resource / asset references ────────────────────────────────────
+
+    @pytest.mark.parametrize("text", [
+        "background.png",
+        "voice/chara01.ogg",
+        "scripts/scene.ks",
+        "data\\save.dat",
+    ])
+    def test_resource_references(self, text: str) -> None:
+        assert is_blacklisted(text)
+
+    def test_double_slashes_path(self) -> None:
+        assert is_blacklisted("data\\\\save")
+
+    # ── markup tags ────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("text", [
+        "<br>次の行",
+        "<ruby text='ふりがな'>",
+        "<color=#FF0000>",
+        "<font size=20>",
+    ])
+    def test_markup_tags(self, text: str) -> None:
+        assert is_blacklisted(text)
+
+    # ── variable / format templates ────────────────────────────────────
+
+    def test_printf_style(self) -> None:
+        assert is_blacklisted("HP: %d / %d")
+
+    def test_dollar_var(self) -> None:
+        assert is_blacklisted("$player_name は言った")
+
+    def test_dollar_braced_var(self) -> None:
+        assert is_blacklisted("${count}個のアイテム")
+
+    # ── legitimate text must NOT be blacklisted ────────────────────────
+
+    @pytest.mark.parametrize("text", [
+        "お前は誰だ？ここで何をしている？",
+        "「馬飼いの青年」",
+        "今日は天気がいいですね。",
+        "ゲームを始めましょう。",
+        "第一章　旅立ち",
+    ])
+    def test_legitimate_dialogue_allowed(self, text: str) -> None:
+        assert not is_blacklisted(text)
+
+    # ── integration: blacklisted text scores 0 via score_candidate ─────
+
+    def test_blacklisted_text_scores_zero(self) -> None:
+        """Ensure blacklist integrates with score_candidate pipeline."""
+        assert score_candidate("[wait time=500]テスト", "ja") == 0.0
+        assert score_candidate("@label_start", "ja") == 0.0
+
+    # ── extensibility: user can add custom patterns ────────────────────
+
+    def test_custom_blacklist_pattern(self) -> None:
+        """Users can append custom engine-specific patterns."""
+        custom = re.compile(r"^SYSCOM:")
+        TEXT_BLACKLIST.append(custom)
+        try:
+            assert is_blacklisted("SYSCOM:SAVE_GAME")
+            assert not is_blacklisted("お前は誰だ")
+        finally:
+            TEXT_BLACKLIST.remove(custom)
 
 
 # ==========================================================================

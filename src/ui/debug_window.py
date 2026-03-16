@@ -39,7 +39,7 @@ from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.hook.hook_search import (
-    HookCandidate, HookCode, HookSearcher, HookSearchError, score_candidate,
+    HookCandidate, HookCode, HookSearcher, HookSearchError,
 )
 from src.hook.hook_code import group_by_str_ptr, format_ptr_groups, TextGroup
 from .window_picker import WindowPicker
@@ -766,7 +766,6 @@ class DebugWindow(QMainWindow):
         self._last_diag_count: int = 0
         # Item dictionaries for incremental list updates (key = HookCode.to_str())
         self._rec_items: dict[str, QListWidgetItem] = {}
-        self._cand_items: dict[str, QListWidgetItem] = {}
         self._confirmed_items: dict[str, QListWidgetItem] = {}
         self._ptr_analysis_dlg: _StrPtrAnalysisDialog | None = None  # singleton
 
@@ -886,42 +885,16 @@ class DebugWindow(QMainWindow):
         )
         self._lst_recommended.itemDoubleClicked.connect(self._confirm_candidate)
         _rec_lay.addWidget(self._lst_recommended, 1)
-        _btn_confirm_rec = QPushButton("\u2713  Confirm selected recommended")
-        _btn_confirm_rec.clicked.connect(self._confirm_candidate)
-        _rec_lay.addWidget(_btn_confirm_rec)
-        self._tab_cands.addTab(_rec_widget, "Recommended (0)")
-
-        # Tab 1: All Hook Candidates (sorted by offset)
-        _cands_widget = QWidget()
-        _cands_lay = QVBoxLayout(_cands_widget)
-        _cands_lay.setContentsMargins(3, 3, 3, 3)
-        self._lbl_search_status = QLabel("No active search \u2014 pick a window first.")
-        self._lbl_search_status.setWordWrap(True)
-        _cands_lay.addWidget(self._lbl_search_status)
-        self._cands_search = QLineEdit()
-        self._cands_search.setPlaceholderText("Filter by text content\u2026")
-        self._cands_search.setClearButtonEnabled(True)
-        self._cands_search.textChanged.connect(self._apply_cands_filter)
-        _cands_lay.addWidget(self._cands_search)
-        self._lst_candidates = QListWidget()
-        self._lst_candidates.setFont(QFont("Consolas", 9))
-        self._lst_candidates.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self._lst_candidates.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._lst_candidates.customContextMenuRequested.connect(
-            lambda pos: self._on_candidate_context_menu(self._lst_candidates, pos),
-        )
-        self._lst_candidates.itemDoubleClicked.connect(self._confirm_candidate)
-        _cands_lay.addWidget(self._lst_candidates, 1)
         self._te_search_diag = QTextEdit()
         self._te_search_diag.setReadOnly(True)
         self._te_search_diag.setFont(QFont("Consolas", 8))
         self._te_search_diag.setFixedHeight(56)
         self._te_search_diag.setPlaceholderText("DLL diagnostic output\u2026")
-        _cands_lay.addWidget(self._te_search_diag)
+        _rec_lay.addWidget(self._te_search_diag)
         _btn_row = QHBoxLayout()
-        _btn_confirm = QPushButton("\u2713  Confirm selected candidate")
-        _btn_confirm.clicked.connect(self._confirm_candidate)
-        _btn_row.addWidget(_btn_confirm)
+        _btn_confirm_rec = QPushButton("\u2713  Confirm selected recommended")
+        _btn_confirm_rec.clicked.connect(self._confirm_candidate)
+        _btn_row.addWidget(_btn_confirm_rec)
         self._btn_ptr_analysis = QPushButton("\U0001f50d  Analyse PTR")
         self._btn_ptr_analysis.setToolTip(
             "Open the String Pointer Analysis window: \n"
@@ -931,10 +904,10 @@ class DebugWindow(QMainWindow):
         self._btn_ptr_analysis.setEnabled(False)
         self._btn_ptr_analysis.clicked.connect(self._open_ptr_analysis)
         _btn_row.addWidget(self._btn_ptr_analysis)
-        _cands_lay.addLayout(_btn_row)
-        self._tab_cands.addTab(_cands_widget, "All Candidates")
+        _rec_lay.addLayout(_btn_row)
+        self._tab_cands.addTab(_rec_widget, "Recommended (0)")
 
-        # Tab 2: Confirmed hooks
+        # Tab 1: Confirmed hooks
         _confirmed_widget = QWidget()
         _confirmed_lay = QVBoxLayout(_confirmed_widget)
         _confirmed_lay.setContentsMargins(3, 3, 3, 3)
@@ -1251,21 +1224,19 @@ class DebugWindow(QMainWindow):
         try:
             self._searcher = HookSearcher(self._target.pid, ocr_lang=self._selected_language)
             self._searcher.start()
-            self._lbl_search_status.setText(
+            self._lbl_rec_status.setText(
                 "Scanning…  play the game — candidates appear as dialogue fires."
             )
             self._last_cand_count = -1
             self._last_rec_count  = -1
             self._last_diag_count = 0
             self._te_search_diag.clear()
-            self._lst_candidates.clear()
             self._lst_recommended.clear()
-            self._cand_items.clear()
             self._rec_items.clear()
             self._search_timer.start()
             self._btn_ptr_analysis.setEnabled(True)
         except HookSearchError as exc:
-            self._lbl_search_status.setText(f"⚠ Search failed: {exc}")
+            self._lbl_rec_status.setText(f"⚠ Search failed: {exc}")
             self.statusBar().showMessage(f"Hook search failed: {exc}", 8000)
 
     def _stop_search(self) -> None:
@@ -1298,7 +1269,7 @@ class DebugWindow(QMainWindow):
             return
         # Detect game-exit: pipe broke without an explicit stop.
         if self._searcher.process_died:
-            self._lbl_search_status.setText(
+            self._lbl_rec_status.setText(
                 "\u26a0 Game process closed \u2014 hook search stopped."
             )
             self.statusBar().showMessage(
@@ -1323,13 +1294,10 @@ class DebugWindow(QMainWindow):
             if at_bottom:
                 sb.setValue(sb.maximum())
         if self._searcher.scan_complete:
-            self._lbl_search_status.setText(
+            self._lbl_rec_status.setText(
                 "Scan complete.  Play the game \u2014 candidates update automatically.  "
                 "Double-click or select + Confirm."
             )
-        candidates = self._searcher.ranked_candidates()  # sorted by RVA ascending
-        ocr_lang = self._selected_language
-        visible = [c for c in candidates if score_candidate(c.text, ocr_lang) > 0]
         # Always refresh confirmed labels (hit count / text preview may change
         # even when the total visible count stays the same).
         self._refresh_confirmed_tab()
@@ -1386,68 +1354,13 @@ class DebugWindow(QMainWindow):
             "No recommended candidates yet \u2014 play the game."
         )
 
-        # ── All Candidates tab (incremental update) ───────────────────────
-        current_keys = {c.to_hook_code().to_str(): c for c in visible}
-        filt = self._cands_search.text().lower()
-        
-        # Remove items no longer visible
-        for key in list(self._cand_items.keys()):
-            if key not in current_keys:
-                item = self._cand_items.pop(key)
-                row = self._lst_candidates.row(item)
-                if row >= 0:
-                    self._lst_candidates.takeItem(row)
-        
-        # Update existing or add new items
-        for key, c in current_keys.items():
-            if key in self._cand_items:
-                item = self._cand_items[key]
-                item.setText(c.display_label())
-                item.setData(33, c.text)
-                item.setToolTip(c.text)
-                # Re-apply filter visibility
-                if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
-                    item.setHidden(True)
-                else:
-                    item.setHidden(False)
-            else:
-                item = QListWidgetItem(c.display_label())
-                item.setData(32, key)
-                item.setData(33, c.text)
-                item.setToolTip(c.text)
-                self._lst_candidates.addItem(item)
-                self._cand_items[key] = item
-                if filt and filt not in c.text.lower() and filt not in c.display_label().lower():
-                    item.setHidden(True)
-        
-        if self._lst_candidates.count() > 0 and self._lst_candidates.currentItem() is None:
-            self._lst_candidates.setCurrentRow(0)
-
-    def _apply_cands_filter(self) -> None:
-        """Re-apply text filter to existing list items without a full rebuild."""
-        filt = self._cands_search.text().lower()
-        for i in range(self._lst_candidates.count()):
-            item = self._lst_candidates.item(i)
-            if item is None:
-                continue
-            label = item.text().lower()
-            item.setHidden(bool(filt) and filt not in label)
-
     @Slot()
     def _confirm_candidate(self) -> None:
-        """Confirm selected candidate(s) and route their live output into the pipeline.
-
-        Reads from the Recommended list when Tab 0 is active, otherwise from
-        the All Candidates list.
-        """
+        """Confirm selected candidate(s) and route their live output into the pipeline."""
         if self._searcher is None:
             self.statusBar().showMessage("No active search — pick a window first.", 3000)
             return
-        # Pick the active list based on the current tab.
-        if self._tab_cands.currentIndex() == 0:
-            active_list = self._lst_recommended
-        else:
-            active_list = self._lst_candidates
+        active_list = self._lst_recommended
         selected_items = active_list.selectedItems()
         if not selected_items:
             if active_list.count() > 0:
@@ -1489,8 +1402,8 @@ class DebugWindow(QMainWindow):
         confirmed = [c for c in all_candidates if c.to_hook_code().to_str() in all_code_keys]
         self._searcher.filter_to(confirmed)
         self._refresh_confirmed_tab()
-        self._tab_cands.setCurrentIndex(2)  # switch to Confirmed tab
-        self._lbl_search_status.setText(f"Confirmed {len(codes)} hook(s) — live feed active.")
+        self._tab_cands.setCurrentIndex(1)  # switch to Confirmed tab
+        self._lbl_rec_status.setText(f"Confirmed {len(codes)} hook(s) — live feed active.")
         self.statusBar().showMessage(f"{len(codes)} hook(s) confirmed — starting pipeline\u2026", 6000)
         self._run(searcher=self._searcher)
 
@@ -1600,7 +1513,7 @@ class DebugWindow(QMainWindow):
                 self._confirmed_items[code_str] = item
         
         count = len(self._confirmed_hook_codes)
-        self._tab_cands.setTabText(2, f"Confirmed ({count})")
+        self._tab_cands.setTabText(1, f"Confirmed ({count})")
         if count > 0:
             self._lbl_confirmed_status.setText(
                 f"{count} hook(s) confirmed \u2014 live feed active.  "

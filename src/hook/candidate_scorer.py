@@ -1,8 +1,18 @@
 """Candidate text scoring for hook-site selection.
 
-Contains hard-reject filters and per-language scorer classes.  Call
-:func:`score_candidate` to obtain a quality score for a raw text string
-captured by the hook engine.
+Contains hard-reject filters, a configurable text blacklist, and per-language
+scorer classes.  Call :func:`score_candidate` to obtain a quality score for a
+raw text string captured by the hook engine.
+
+Text blacklist
+--------------
+:data:`TEXT_BLACKLIST` is the single extensibility point for rejecting
+engine-specific noise (script source lines, resource tags, etc.).  Each entry
+is a compiled :class:`re.Pattern` — if **any** pattern matches, the candidate
+is instantly discarded (score 0).  Patterns are tried in order; put the most
+common ones first.
+
+To add a new filter, append a ``re.compile(...)`` call to ``TEXT_BLACKLIST``.
 
 To add support for a new language, subclass :class:`_CandidateScorer`,
 override :meth:`~_CandidateScorer._language_bonus`, and register an instance
@@ -12,6 +22,53 @@ from __future__ import annotations
 
 import math
 import re
+
+
+# ---------------------------------------------------------------------------
+# Text blacklist — extensible pattern list for engine-specific noise
+# ---------------------------------------------------------------------------
+# Each entry is a compiled regex.  If ANY pattern matches against the
+# candidate text (via ``re.search``), the text is instantly discarded.
+#
+# Guidelines for adding patterns:
+#   - Use re.IGNORECASE only when casing truly varies.
+#   - Prefer anchored patterns (^ / $) where possible to avoid
+#     false positives against legitimate dialogue.
+#   - Document what engine / noise source the pattern targets.
+#   - Place high-frequency patterns first for early-exit performance.
+
+TEXT_BLACKLIST: list[re.Pattern[str]] = [
+    # ── VN scripting language source lines ─────────────────────────────
+    # Light.VN / KiriKiri / similar engines embed script interpreter calls
+    # where source lines leak through as hooked strings.  Common markers:
+    #   @label  *tag  [command ...]  //comment  #directive  ;comment
+    re.compile(r"^\s*[@*#;]"),                       # line starts with script marker
+    re.compile(r"^\s*\[(?!「)"),                      # [...] command (but not 「 bracket dialogue)
+    re.compile(r"^\s*//"),                            # C-style line comment
+    re.compile(r"\b(?:if|else|elsif|endif|return|goto|gosub|call|jump)\b", re.IGNORECASE),
+    re.compile(r"\S+\s*[!=<>]?=\s*(?:[\"'].+?[\"']|\d+)"),  # assignments / comparisons: var = "on", flag == "on", count != 0
+
+    # ── Resource / asset references ────────────────────────────────────
+    re.compile(r"\.(png|jpg|jpeg|bmp|ogg|wav|mp3|mp4|avi|scn|ks|csv|txt|lua|dat)\b",
+               re.IGNORECASE),
+    re.compile(r"[/\\]{2,}"),                         # double slashes / backslashes (paths)
+
+    # ── Engine internal tags ───────────────────────────────────────────
+    re.compile(r"<\s*/?\s*(?:br|ruby|color|size|b|i|font|img|a)\b",
+               re.IGNORECASE),                        # HTML-like markup tags
+
+    # ── Variable / format-string templates ─────────────────────────────
+    re.compile(r"%[0-9]*[dsfx]"),                     # printf-style formatters
+    re.compile(r"\$\{?\w+\}?"),                       # $var or ${var} references
+]
+
+
+def is_blacklisted(text: str) -> bool:
+    """Return ``True`` if *text* matches any pattern in :data:`TEXT_BLACKLIST`."""
+    for pat in TEXT_BLACKLIST:
+        if pat.search(text):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +142,9 @@ class _CandidateScorer:
 
     def _hard_reject(self, text: str) -> bool:
         """Return True if *text* should be immediately discarded."""
+        # Text blacklist (engine scripting source, resource refs, etc.)
+        if is_blacklisted(text):
+            return True
         # Non-printable control characters (null residue, ESC sequences …)
         # Allow only common whitespace: \t (0x09), \n (0x0A), \r (0x0D).
         if any(ord(c) < 0x20 and c not in '\t\n\r' for c in text):
