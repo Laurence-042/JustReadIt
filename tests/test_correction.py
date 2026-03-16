@@ -3,11 +3,109 @@ from __future__ import annotations
 
 import pytest
 
-from src.correction import best_match
+from src.correction import _best_line_window, _normalize, best_match
+
+
+# ---------------------------------------------------------------------------
+# _normalize
+# ---------------------------------------------------------------------------
+
+
+class TestNormalize:
+    """Unicode normalisation used for scoring."""
+
+    def test_two_dot_leader_to_ellipsis(self) -> None:
+        # ‥ (U+2025) → … (U+2026)
+        assert _normalize("あ\u2025い") == "あ\u2026い"
+
+    def test_midline_ellipsis_to_ellipsis(self) -> None:
+        # ⋯ (U+22EF) → … (U+2026)
+        assert _normalize("あ\u22efい") == "あ\u2026い"
+
+    def test_collapse_consecutive_ellipsis(self) -> None:
+        assert _normalize("あ……い") == "あ…い"
+        assert _normalize("あ…………い") == "あ…い"
+
+    def test_strip_dialog_quote_left(self) -> None:
+        # \u201c LEFT DOUBLE QUOTATION MARK at line start
+        assert _normalize('\u201c街に行く') == "街に行く"
+
+    def test_strip_dialog_quote_multiline(self) -> None:
+        text = '\u201c一行目\n\u201c二行目'
+        assert _normalize(text) == "一行目\n二行目"
+
+    def test_strip_wait_command(self) -> None:
+        assert _normalize("テスト。\\w") == "テスト。"
+
+    def test_strip_multiple_commands(self) -> None:
+        assert _normalize("テスト\\w\\n") == "テスト"
+
+    def test_passthrough_normal_text(self) -> None:
+        text = "普通のテキスト、何も変わらない。"
+        assert _normalize(text) == text
+
+
+# ---------------------------------------------------------------------------
+# _best_line_window
+# ---------------------------------------------------------------------------
+
+
+class TestBestLineWindow:
+    """Line-window matching for VN script candidates."""
+
+    def test_single_line_returns_none(self) -> None:
+        """Single-line candidates are handled by full-text ratio."""
+        assert _best_line_window("テスト", "テスト", 60.0) is None
+
+    def test_finds_matching_window(self) -> None:
+        """Best window skips engine/name lines to match dialog."""
+        ocr = _normalize("街に行くまでの道で牧場がある\n馬がレンタル出来たはず")
+        candidate = (
+            "~【馬飼いの青年】\n"
+            "街に行くまでの道で牧場がある\n"
+            "馬がレンタル出来たはず\n"
+            "~ジャンプ"
+        )
+        result = _best_line_window(ocr, candidate, 60.0)
+        assert result is not None
+        window_text, score = result
+        assert score >= 90
+        # Window should contain the dialog lines, not the ~command lines.
+        assert "街に行くまでの道で" in window_text
+        assert "レンタル出来たはず" in window_text
+
+    def test_normalises_window_before_scoring(self) -> None:
+        """Quote markers and wait commands are stripped for scoring."""
+        ocr = _normalize("テスト文字列。")
+        candidate = '\u201cテスト文字列。\\w\nダミー行'
+        result = _best_line_window(ocr, candidate, 60.0)
+        assert result is not None
+        _, score = result
+        assert score >= 90
+
+    def test_returns_original_text(self) -> None:
+        """Returned window text is from original candidate, not normalised."""
+        ocr = _normalize("テスト")
+        candidate = '\u201cテスト\nダミー'
+        result = _best_line_window(ocr, candidate, 60.0)
+        assert result is not None
+        window_text, _ = result
+        # Original text with the " prefix should be preserved.
+        assert "\u201c" in window_text
+
+    def test_below_threshold_returns_none(self) -> None:
+        ocr = _normalize("全く違うテキスト")
+        candidate = "ABCDEF\nGHIJKL\nMNOPQR"
+        assert _best_line_window(ocr, candidate, 60.0) is None
+
+
+# ---------------------------------------------------------------------------
+# best_match — integration
+# ---------------------------------------------------------------------------
 
 
 class TestBestMatch:
-    """Tests for best_match() with ratio and partial_ratio fallback."""
+    """Tests for best_match() with normalisation + line-window + fallback."""
 
     def test_exact_match(self) -> None:
         assert best_match("テスト文字列", ["テスト文字列"]) == "テスト文字列"
@@ -31,28 +129,24 @@ class TestBestMatch:
     def test_partial_ratio_fallback_when_candidate_is_substring(self) -> None:
         """When ratio is low due to length mismatch, partial_ratio kicks in."""
         ocr = "街に行くまでの道で牧場がある村がある一応馬がレンタル出来たはずだけど"
-        # Candidate is only one dialog line (half the OCR text).
         candidate = "一応馬がレンタル出来たはずだけど"
-        # fuzz.ratio would be ~50% (below default 60 threshold) but
-        # partial_ratio should be very high because the candidate is
-        # a near-exact substring.
         result = best_match(ocr, [candidate])
         assert result == candidate
 
-    def test_partial_ratio_fallback_ocr_is_substring(self) -> None:
-        """OCR text is shorter than candidate — partial still matches."""
+    def test_line_window_returns_segment_not_whole(self) -> None:
+        """Line-window matching returns the relevant segment, not the
+        entire candidate including unrelated engine commands."""
         ocr = "レンタル出来たはず"
-        # Candidate has context lines from memory scan.
         candidate = "表示キャラ名\n街に行くまでの道で牧場がある\nレンタル出来たはずだけど"
         result = best_match(ocr, [candidate])
-        assert result == candidate
+        assert result is not None
+        # Should return a segment that contains the matching line.
+        assert "レンタル出来たはずだけど" in result
 
     def test_threshold_parameter(self) -> None:
         ocr = "テスト"
         candidates = ["テスX"]
-        # Default threshold (60) should accept this.
         assert best_match(ocr, candidates) is not None
-        # Completely different string should not match even with fallback.
         assert best_match("あいうえお", ["かきくけこさしすせそ"], threshold=90) is None
 
     def test_skip_empty_candidates(self) -> None:
@@ -60,3 +154,45 @@ class TestBestMatch:
 
     def test_all_empty_candidates(self) -> None:
         assert best_match("テスト", ["", ""]) is None
+
+    # -- VN script real-world cases ----------------------------------------
+
+    def test_lightvn_dialog_with_character_name(self) -> None:
+        """Real case: memory has ~【name】 + " prefix + \\w suffix.
+
+        OCR sees only the rendered dialog text with different ellipsis
+        unicode (‥ U+2025 instead of … U+2026).
+        """
+        ocr = (
+            "\u2025\u2025街に行くまでの道で、牧場がある村がある。\n"
+            "一応、そこで馬がレンタル出来たはずだけど\u2025\u2025"
+        )
+        candidate = (
+            "~【馬飼いの青年】\n"
+            "\u201c……街に行くまでの道で、牧場がある村がある。\n"
+            "一応、そこで馬がレンタル出来たはずだけど……。\\w"
+        )
+        result = best_match(ocr, [candidate])
+        assert result is not None
+        # Should contain the dialog text, not the character name tag.
+        assert "街に行くまでの道で" in result
+        assert "レンタル出来たはずだけど" in result
+
+    def test_lightvn_dialog_multiple_candidates(self) -> None:
+        """Pick the best segment when multiple scan results exist."""
+        ocr = "一応、そこで馬がレンタル出来たはず"
+        candidates = [
+            "~暗転解除\n~入力禁止\n~ジャンプ",
+            "~【馬飼いの青年】\n\u201c……街に行く\n一応、そこで馬がレンタル出来たはずだけど……。\\w",
+        ]
+        result = best_match(ocr, candidates)
+        assert result is not None
+        assert "レンタル出来たはず" in result
+
+    def test_ellipsis_normalisation_enables_match(self) -> None:
+        """Without normalisation, ‥‥ vs …… would drag the score below
+        threshold.  Normalisation collapses both to a single …."""
+        ocr = "テスト\u2025\u2025文字列"
+        candidate = "テスト\u2026\u2026文字列"
+        result = best_match(ocr, [candidate])
+        assert result == candidate
