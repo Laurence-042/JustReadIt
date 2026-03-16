@@ -171,6 +171,8 @@ class HookSearcher:
         self._seq_counter: int = 0
         # hook_va values already sent via CMD_DISABLE (avoid re-sending).
         self._disabled_vas: set[int] = set()
+        # Counter for periodic post-scan pruning (incremented on reader thread only).
+        self._hit_count_since_prune: int = 0
         # Process-exit / connect-timeout detection
         self._pipe_connected  = threading.Event()
         self._process_died:  bool                   = False
@@ -493,8 +495,6 @@ class HookSearcher:
             )
         if self._stop.is_set() or not self._h_pipe:
             return
-        # Prune before installing new hooks to reduce noise early.
-        self._prune_redundant()
         with self._write_lock:
             if self._stop.is_set() or not self._h_pipe:
                 with self._lock:
@@ -515,6 +515,10 @@ class HookSearcher:
     # Minimum hit count before a non-recommended hook is eligible for pruning.
     # Gives each hook a fair chance to produce representative text.
     _MIN_HITS_FOR_PRUNE: int = 3
+
+    # Periodic post-scan prune: trigger _prune_redundant every N hits received
+    # via the pipe.  Keeps noise in check even after all scan batches are done.
+    _PRUNE_INTERVAL: int = 500
 
     def _send_disable(self, vas: set[int]) -> None:
         """Send CMD_DISABLE for *vas* to the DLL (thread-safe)."""
@@ -710,6 +714,20 @@ class HookSearcher:
                 self._live_feed.append(text)
                 if len(self._live_feed) > 2048:
                     self._live_feed = self._live_feed[-2048:]
+
+        # Periodic prune: fire _prune_redundant every _PRUNE_INTERVAL hits,
+        # both during the scan phase and after it is exhausted.
+        # _hit_count_since_prune is only touched on the reader thread, so no
+        # lock is needed for the counter itself.
+        self._hit_count_since_prune += 1
+        if self._hit_count_since_prune >= self._PRUNE_INTERVAL:
+            self._hit_count_since_prune = 0
+            t = threading.Thread(
+                target=self._prune_redundant,
+                name="hook-prune-periodic",
+                daemon=True,
+            )
+            t.start()
 
 
 # ---------------------------------------------------------------------------
