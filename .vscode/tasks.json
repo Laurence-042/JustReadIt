@@ -2,9 +2,9 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build hook_engine.dll",
+            "label": "Build mem_scan.dll",
             "type": "shell",
-            "command": "${workspaceFolder}\\.vscode\\build_hook.bat",
+            "command": "${workspaceFolder}\\.vscode\\build_mem_scan.bat",
             "options": {
                 "shell": {
                     "executable": "cmd.exe",

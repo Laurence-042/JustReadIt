@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Windows-only hover-translation tool for a Light.VN-based RPG game. Combines DXGI screen capture, Windows OCR, Frida text hook, and pluggable translation backends to render context-aware translations as an overlay.
+Windows-only hover-translation tool for a Light.VN-based RPG game. Combines DXGI screen capture, Windows OCR, ReadProcessMemory text extraction, and pluggable translation backends to render context-aware translations as an overlay.
 
 ## Architecture
 
@@ -15,8 +15,9 @@ Mouse hover / Freeze hotkey
         → cache hit → show overlay
         → cache miss:
             → full-screen Windows OCR → range detection (src/ocr/range_detectors.py)
-            → Levenshtein cross-match with DLL hook output (src/correction.py)
-              → match success → use cleaned hook text
+            → pick_needle(ocr_text) → MemoryScanner.scan(needle) (src/memory/)
+            → Levenshtein best_match(ocr_text, scan_results) (src/correction.py)
+              → match success → use memory text (cleaner)
               → match failure → fall back to OCR text
             → translate (src/translators/) → cache → show overlay (src/overlay.py)
 ```
@@ -29,11 +30,10 @@ Mouse hover / Freeze hotkey
 | Screen capture | `src/capture.py` | DXGI Desktop Duplication via dxcam. Context-manager protocol. **Never** `BitBlt`/`PrintWindow` (black frames on DirectX) |
 | OCR engine | `src/ocr/windows_ocr.py` | `WindowsOcr` — sole OCR engine (no manga-ocr). Upscale-then-downscale for small fonts; PIL ↔ WinRT bitmap bridge |
 | Range detection | `src/ocr/range_detectors.py` | `RangeDetector` ABC + chain runner `run_detectors()`. Built-ins: `ParagraphDetector`, `TableRowDetector`, `SingleBoxDetector` |
-| Hook discovery | `src/hook/hook_search.py` | `HookSearcher` — bulk-hooks all EXE function prologues via `hook_engine.dll`, reads CJK strings from Named Pipe, ranks hits with `score_candidate`. Two-phase: scan → confirm. |
-| Hook value objects | `src/hook/hook_code.py` | `HookCode` (`module` + `rva` + `access_pattern` + `encoding`, frozen dataclass, serialised as `module!0xRVA:pattern:enc`). `HookCandidate` — live hit accumulator. |
-| Candidate scorer | `src/hook/candidate_scorer.py` | `score_candidate(text, lang)` — hard-reject filters + per-language `_CandidateScorer` subclasses. Register new languages in `_LANG_SCORERS`. |
-| Hook cleaner | `src/hook/cleaner.py` | `Cleaner` ABC rule chain. `src/hook/__init__.py` exports cleaner symbols only. Built-ins: `StripControlChars`, `DeduplicateLines`, `TrimWhitespace`. |
-| Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results — **stub** (`# TODO: implement match_ocr_to_hook`) |
+| Memory scanner | `src/memory/scanner.py` | `MemoryScanner` — zero-intrusion `ReadProcessMemory` scanning. `ScanResult` frozen dataclass. `pick_needle()` extracts best CJK substring from OCR text. Hot-region caching + encoding auto-learning (UTF-16LE / UTF-8 / Shift-JIS). Optional `mem_scan.dll` C accelerator. |
+| Memory Win32 | `src/memory/_win32.py` | `VirtualQueryEx` / `ReadProcessMemory` bindings. `PROCESS_VM_READ` only — read-only, zero intrusion. |
+| Memory search | `src/memory/_search.py` | `find_all_positions()` byte search. Python fallback (`bytes.find`) + optional `mem_scan.dll` via ctypes. |
+| Correction | `src/correction.py` | `best_match(ocr_text, candidates)` — Levenshtein cross-match (rapidfuzz) between OCR text and memory scan results. Returns best candidate or `None` (fall back to OCR). |
 | Cache | `src/cache.py` | phash of translated-region screenshot as key — **stub** (`# TODO: implement PhashCache`) |
 | Translation | `src/translators/` | `Translator` ABC in `base.py`. Planned: Cloud Translation API + OpenAI (with rolling summary agent) |
 | Config | `src/config.py` | `AppConfig` — typed wrapper over `QSettings`, INI at `%APPDATA%\JustReadIt\config.ini` |
@@ -42,7 +42,7 @@ Mouse hover / Freeze hotkey
 
 ### Workflows
 
-**Hover mode**: mouse large-movement → settle → small-area OCR probe → if text, phash lookup → if miss, full OCR + hook match + translate + cache → show overlay.
+**Hover mode**: mouse large-movement → settle → small-area OCR probe → if text, phash lookup → if miss, full OCR + memory scan + Levenshtein match + translate + cache → show overlay.
 
 **Freeze mode**: hotkey → DXGI capture → display frozen screenshot as topmost overlay (holds focus) → user hovers overlay for translation → right-click dismisses → `AllowSetForegroundWindow(pid)` returns focus to game.
 
@@ -74,7 +74,7 @@ Standard library → third-party → local (PEP 8). Use `TYPE_CHECKING` guard fo
 
 ### Extensibility via rule chains (chain of responsibility)
 
-Range detectors and hook cleaners implement ABCs composed as ordered lists. A runner function walks the chain and returns the first non-`None` result. New rules are appended/inserted into the module-level default list.
+Range detectors implement ABCs composed as ordered lists. A runner function walks the chain and returns the first non-`None` result. New rules are appended/inserted into the module-level default list.
 
 ```python
 # src/ocr/range_detectors.py
@@ -86,8 +86,6 @@ DEFAULT_DETECTORS: list[RangeDetector] = [ParagraphDetector(), TableRowDetector(
 def run_detectors(detectors, boxes, x, y) -> list[BoundingBox]:
     # first non-None wins; SingleBoxDetector is the fallback
 ```
-
-Same pattern in `src/hook/cleaner.py` for `Cleaner` / `DEFAULT_CLEANERS`.
 
 ### Translation plugin interface
 
@@ -104,6 +102,7 @@ Two planned built-ins: Cloud Translation API (short text) and OpenAI (dialogue/p
 - `GameTarget` (`src/target.py`) — `pid`, `hwnd`, `hmonitor`, `window_rect`, `capture_rect`, `dxcam_output_idx`, `process_name`. Constructed only via `from_pid(pid)` or `from_name(name)` classmethods. `refresh()` returns a new instance.
 - `Rect` (`src/target.py`) — `left, top, right, bottom: int`; properties `width`, `height`, `area`; `as_tuple()`.
 - `BoundingBox` (`src/ocr/range_detectors.py`) — `x, y, w, h: int`, `text: str = ""`; properties `right`, `bottom`, `center_x`, `center_y`; `contains(px, py)`, `distance_to_point(px, py)`.
+- `ScanResult` (`src/memory/scanner.py`) — `text`, `encoding`, `address`, `region_base`.
 
 All are decorated `@dataclass(frozen=True)`. Lazy DPI-awareness (`_ensure_dpi_aware()`) to avoid conflicts with Qt.
 
@@ -111,18 +110,24 @@ All are decorated `@dataclass(frozen=True)`. Lazy DPI-awareness (`_ensure_dpi_aw
 
 Use `ctypes.WinDLL` with `use_last_error=True`. Win32 structs as `ctypes.Structure`. Callbacks via `WINFUNCTYPE`. `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS=9)` preferred over `GetWindowRect`. The **only** exception is `src/ui/window_picker.py` which uses pywin32 for brevity.
 
-### Native DLL hook: HookSearcher two-phase workflow
+### Memory scanner: MemoryScanner
 
-`HookSearcher` (`src/hook/hook_search.py`) drives hook-site discovery:
+`MemoryScanner` (`src/memory/scanner.py`) provides zero-intrusion text extraction:
 
-1. **Scan phase** — `start()` injects `hook_engine.dll` (via `src/hook/_win32.py` helpers: `inject_dll`, `create_pipe_server`, `pack_search_config`). The DLL bulk-patches all EXE function prologues in configurable batches (`_DEFAULT_BATCH_SIZE = 2000`). Each trampoline scans call-stack frames for CJK UTF-16LE strings; results arrive via Named Pipe as `(address, rva, text)` records. High-frequency hooks are suppressed C-side (`SEND_CALL_LIMIT=150`).
-2. **Confirm phase** — `ranked_candidates()` returns `HookCandidate` list sorted by `score_candidate`. User picks; the choice is stored as a `HookCode` in `AppConfig.hook_code`. `filter_to()` narrows the live feed; `drain_live_feed()` yields subsequent strings.
+1. Opens target process with `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` (read-only).
+2. `VirtualQueryEx` enumerates committed readable regions.
+3. `ReadProcessMemory` reads each region; `find_all_positions()` searches for the needle.
+4. Extracts null-terminated strings around each hit; deduplicates by text.
+5. Hot-region caching: remembers regions where CJK text was found; scans them first next time.
+6. Encoding auto-learning: tries UTF-16LE → UTF-8 → Shift-JIS; after first hit, prioritises the successful encoding.
 
-`stop()` unloads the DLL, restoring all patches. Background reads use `threading.Thread`.
+`pick_needle(ocr_text)` extracts the most distinctive CJK substring (longest contiguous run, pick from middle for OCR accuracy).
 
-`HookCode` (frozen dataclass, `src/hook/hook_code.py`) identifies a confirmed site: `module`, `rva`, `access_pattern`, `encoding`. Serialised as `module!0xRVA:pattern:enc` for `AppConfig`. `frida` is a listed dependency but **not yet used** — reserved for future hook-search automation.
+`ScanResult` (frozen dataclass): `text`, `encoding`, `address`, `region_base`.
 
-`src/hook/__init__.py` exports **cleaner symbols only** (`Cleaner`, `DEFAULT_CLEANERS`, built-in rules, `run_cleaners`). Import `HookSearcher`, `HookCode`, `HookCandidate`, `score_candidate` directly from their modules.
+Optional C accelerator `mem_scan.dll` (`src/memory/mem_scan.c`) uses `memchr` + `memcmp` for ~5–15 GB/s throughput. Built via `src/memory/build.ps1` or VS Code task "Build mem_scan.dll".
+
+`src/memory/__init__.py` exports `MemoryScanner`, `ScanResult`, `pick_needle`.
 
 ### Resource management
 
@@ -144,11 +149,11 @@ Key exceptions: `ProcessNotFoundError`, `WindowNotFoundError`, `AmbiguousProcess
 
 `AppConfig` wraps `QSettings` (INI, `%APPDATA%\JustReadIt\config.ini`) — each setting is a `@property` with getter/setter, coercion, and default. Fresh `QSettings` handle per access via `_make_qsettings()`; `.sync()` after every write.
 
-Current settings: `ocr_language: str = "ja"`, `interval_ms: int = 1500`, `hook_code: str = ""`.
+Current settings: `ocr_language: str = "ja"`, `interval_ms: int = 1500`.
 
 ### Stubs
 
-Unimplemented modules (`cache.py`, `correction.py`, `overlay.py`) contain **only** a module docstring + one `# TODO` comment. Do not add placeholder classes or `pass`-only methods.
+Unimplemented modules (`cache.py`, `overlay.py`) contain **only** a module docstring + one `# TODO` comment. Do not add placeholder classes or `pass`-only methods.
 
 ## Build & Test
 
@@ -158,9 +163,9 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e ".[dev,ui]"
 
-# Build native hook DLL (requires MSVC / VS Build Tools — uses VS Code task or:
-powershell -File src/hook/build.ps1
-# Or run the "Build hook_engine.dll" VS Code build task (Ctrl+Shift+B)
+# Build optional memory scanner C accelerator
+powershell -File src/memory/build.ps1
+# Or run the "Build mem_scan.dll" VS Code build task
 
 # Install Windows OCR Japanese language pack (admin, ~6 MB, no reboot)
 powershell -ExecutionPolicy Bypass -File scripts\install_ja_ocr.ps1
@@ -172,7 +177,7 @@ pytest tests/
 python main.py --debug
 ```
 
-`hook_engine.dll` must exist at `src/hook/hook_engine.dll` before using `TextHook`. The build also copies `MinHook.x64.dll` alongside it.
+`mem_scan.dll` at `src/memory/mem_scan.dll` is optional — the scanner falls back to Python `bytes.find()` if the DLL is absent.
 
 ### Testing conventions
 
@@ -186,13 +191,12 @@ python main.py --debug
 ## Key Constraints
 
 - Screen capture **must** use DXGI Desktop Duplication API — never `BitBlt`/`PrintWindow`.
-- Hook is native Win32 DLL injection (`hook_engine.dll`), **not** Textractor/LunaTranslator (both GPL-3.0). `frida` dependency is reserved for future hook-search automation.
-- License: **MPL-2.0** (file-level weak copyleft). Frida uses wxWindows Licence 3.1 — distributing binaries requires providing source or build toolchain.
+- Text extraction: `ReadProcessMemory` scanning (`src/memory/`). Zero intrusion, read-only.
+- License: **MPL-2.0** (file-level weak copyleft).
 - Windows-only; Python ≥ 3.11.
 - OCR: Windows OCR only — no GPU dependency, no manga-ocr.
 - Focus return: `AllowSetForegroundWindow(pid)` — direct cross-process `SetForegroundWindow` is blocked by Windows.
 - phash cache key: perceptual hash of the *translated region screenshot*, not the full screen.
-- Hook results: per-translation-region text sets; region order unstable but intra-region text order reliable.
 
 ## Reference
 

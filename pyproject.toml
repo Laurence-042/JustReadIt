@@ -9,7 +9,6 @@ description = "Hover-translation tool for Light.VN-based RPG games"
 license = { text = "MPL-2.0" }
 requires-python = ">=3.11"
 dependencies = [
-    "frida",
     # Windows OCR – split packages from winrt (Microsoft-maintained)
     "winrt-runtime",
     "winrt-Windows.Media.Ocr",

@@ -1,6 +1,6 @@
 @echo off
 :: Locate the latest Visual Studio installation via vswhere, then
-:: initialize the x64 MSVC environment and invoke build.ps1.
+:: initialize the x64 MSVC environment and invoke build.ps1 for mem_scan.dll.
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" (
@@ -24,5 +24,5 @@ if errorlevel 1 (
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass ^
-    -File "%~dp0..\src\hook\build.ps1" %*
+    -File "%~dp0..\src\memory\build.ps1" %*
 exit /b %ERRORLEVEL%

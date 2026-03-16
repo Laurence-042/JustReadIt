@@ -42,10 +42,6 @@ $RECYCLE.BIN/
 *.pt
 *.pth
 
-# Frida gadgets / agent builds
-*.js.map
-_frida_agent/
-
 # Debug captures / screenshots saved during testing
 *.png
 *.jpg
