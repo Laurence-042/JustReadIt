@@ -91,11 +91,11 @@ class _PipelineWorker(QObject):
 
     Signals
     -------
-    result_ready(img_bytes, boxes, crop_rect, win_ocr_text, region_text, mem_text, elapsed_ms)
+    result_ready(img_bytes, boxes, crop_rect, win_ocr_text, region_text, detector_name, mem_text, elapsed_ms)
     error(message)
     """
 
-    result_ready = Signal(bytes, list, object, str, str, str, float)
+    result_ready = Signal(bytes, list, object, str, str, str, str, float)
     error = Signal(str)
     ready = Signal()
 
@@ -194,6 +194,7 @@ class _PipelineWorker(QObject):
 
         # ── Region detection ──────────────────────────────────────────
         region_text = ""
+        detector_name = ""
         crop_rect: tuple[int, int, int, int] | None = None
         if boxes:
             _pt = _POINT()
@@ -207,7 +208,7 @@ class _PipelineWorker(QObject):
                 cursor_x = img.width // 2
                 cursor_y = int(img.height * 0.75)
 
-            dialog_boxes = run_detectors(boxes, cursor_x, cursor_y)
+            dialog_boxes, detector_name = run_detectors(boxes, cursor_x, cursor_y)
             if dialog_boxes:
                 region_text = merge_boxes_text(dialog_boxes)
                 xs  = [b.x       for b in dialog_boxes]
@@ -273,7 +274,7 @@ class _PipelineWorker(QObject):
         img.save(buf, format="JPEG", quality=75)
         self.result_ready.emit(
             buf.getvalue(), boxes, crop_rect,
-            win_ocr_text, region_text, mem_text, elapsed_ms,
+            win_ocr_text, region_text, detector_name, mem_text, elapsed_ms,
         )
 
 
@@ -521,7 +522,8 @@ class DebugWindow(QMainWindow):
         splitter.addWidget(right)
 
         grp_wocr,   self._te_wocr   = _make_panel("Windows OCR")
-        grp_region, self._te_region = _make_panel("Detected Region")
+        self._grp_region, self._te_region = _make_panel("Detected Region")
+        grp_region = self._grp_region
         grp_mem,    self._te_mem    = _make_panel("Memory Scan")
         grp_tl,     self._te_tl     = _make_panel(
             "Translation  (not yet implemented)"
@@ -805,7 +807,7 @@ class DebugWindow(QMainWindow):
     # Result / error handlers
     # ------------------------------------------------------------------
 
-    @Slot(bytes, list, object, str, str, str, float)
+    @Slot(bytes, list, object, str, str, str, str, float)
     def _on_result(
         self,
         img_bytes: bytes,
@@ -813,12 +815,15 @@ class DebugWindow(QMainWindow):
         crop_rect: object,
         win_ocr_text: str,
         region_text: str,
+        detector_name: str,
         mem_text: str,
         elapsed_ms: float,
     ) -> None:
         self._preview.update_frame(img_bytes, boxes, crop_rect)
         header = f"[ {len(boxes)} boxes  —  {elapsed_ms:.0f} ms ]\n\n"
         self._te_wocr.setPlainText(header + win_ocr_text)
+        if detector_name:
+            self._grp_region.setTitle(f"Detected Region  [{detector_name}]")
         if region_text:
             self._te_region.setPlainText(region_text)
         if mem_text:

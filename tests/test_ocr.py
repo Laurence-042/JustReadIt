@@ -264,6 +264,52 @@ class TestParagraphDetector:
         assert result is not None
         assert len(result) == 6  # 2 lines × 3 words
 
+    def test_fragmented_line_with_title(self):
+        """OCR-fragmented scenario: a large-font name plus two dialogue
+        lines where the first dialogue line is fragmented into narrow boxes
+        (e.g. missing punctuation).  The paragraph should include both
+        dialogue lines but exclude the name.
+
+        Layout:
+          Line 0: [馬飼いの青年]           h=40  (large title)
+          Line 1: [……はあ] [僕の馬……]  h=25  (fragmented dialogue)
+          Line 2: [大事に育てたのになあ……]  h=25  (full-width dialogue)
+        """
+        det = ParagraphDetector(min_lines=2)
+        title = BoundingBox(100, 10, 200, 40, "馬飼いの青年")
+        frag1 = BoundingBox(100, 65, 60,  25, "……はあ")
+        frag2 = BoundingBox(250, 65, 80,  25, "僕の馬……")
+        line2 = BoundingBox(50,  100, 300, 25, "大事に育てたのになあ……")
+        boxes = [title, frag1, frag2, line2]
+
+        # Cursor on the second dialogue line.
+        result = det.detect(boxes, 200, 110)
+        assert result is not None
+        # Should include frag1, frag2, line2 but NOT title.
+        assert title not in result
+        assert frag1 in result
+        assert frag2 in result
+        assert line2 in result
+
+    def test_fragmented_line_cursor_on_fragment(self):
+        """Same fragmented layout, but cursor is on a narrow fragment.
+        The detector should still find the paragraph.
+        """
+        det = ParagraphDetector(min_lines=2)
+        title = BoundingBox(100, 10, 200, 40, "馬飼いの青年")
+        frag1 = BoundingBox(100, 65, 60,  25, "……はあ")
+        frag2 = BoundingBox(250, 65, 80,  25, "僕の馬……")
+        line2 = BoundingBox(50,  100, 300, 25, "大事に育てたのになあ……")
+        boxes = [title, frag1, frag2, line2]
+
+        # Cursor on the fragment "……はあ".
+        result = det.detect(boxes, 130, 75)
+        assert result is not None
+        assert title not in result
+        assert frag1 in result
+        assert frag2 in result
+        assert line2 in result
+
 
 # ==========================================================================
 # TableRowDetector
@@ -344,14 +390,15 @@ class TestTableRowDetector:
 
 class TestRunDetectors:
     def test_empty_boxes_returns_empty(self):
-        assert run_detectors([], 0, 0) == []
+        assert run_detectors([], 0, 0) == ([], "")
 
     def test_falls_through_to_single_box(self):
         # A single isolated box – ParagraphDetector and TableRowDetector miss,
         # SingleBoxDetector catches it.
         boxes = [BoundingBox(50, 50, 100, 30, "hello")]
-        result = run_detectors(boxes, 100, 65)
+        result, name = run_detectors(boxes, 100, 65)
         assert result == boxes
+        assert name == "SingleBoxDetector"
 
     def test_custom_detector_takes_priority(self):
         # RangeDetector is already imported at module level – no re-import needed.
@@ -361,14 +408,16 @@ class TestRunDetectors:
 
         boxes = _make_paragraph_boxes(n_lines=3)
         custom_chain = [AlwaysFirst(), SingleBoxDetector()]
-        result = run_detectors(boxes, 50, 20, detectors=custom_chain)
+        result, name = run_detectors(boxes, 50, 20, detectors=custom_chain)
         assert len(result) == 1
+        assert name == "AlwaysFirst"
 
     def test_paragraph_wins_over_single(self):
         boxes = _make_paragraph_boxes(n_lines=3)
         cursor_y = 10 + 5  # inside first line
-        result = run_detectors(boxes, 50, cursor_y)
+        result, name = run_detectors(boxes, 50, cursor_y)
         assert len(result) == 9  # whole paragraph, not just 1 box
+        assert name == "ParagraphDetector"
 
     def test_default_detectors_nonempty(self):
         assert len(DEFAULT_DETECTORS) == 3

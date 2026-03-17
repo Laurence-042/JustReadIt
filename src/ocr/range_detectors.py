@@ -178,13 +178,23 @@ class ParagraphDetector(RangeDetector):
     ---------
     1. Find the text line closest to the cursor (the "anchor").
     2. Grow upward and downward from the anchor, accepting each adjacent
-       line only when **both** conditions hold:
+       line only when **all three** conditions hold:
 
-       a. *Height compatibility* – adjacent lines have similar box heights
-          (within ``height_ratio``) **and** at least 30 % horizontal overlap
-          (same column, not side-by-side elements).
+       a. *Height compatibility* – the candidate line's median box height
+          is within ``height_ratio`` of the **accumulated paragraph median
+          height** (not just the adjacent line).  Using the paragraph-wide
+          median makes the check robust to OCR fragmentation where a line
+          may contain smaller or fewer recognised boxes.
 
-       b. *Gap uniformity* – the pixel gap to the candidate line is
+       b. *Horizontal overlap* – the candidate line's horizontal extent
+          overlaps at least ``overlap_ratio`` of the narrower extent when
+          compared against the **accumulated paragraph extent** (not just
+          the adjacent line).  This handles CJK text where OCR drops
+          punctuation (e.g. ``……`` and ``、``), creating narrow box
+          fragments that don't overlap with their immediate neighbour but
+          do overlap with the full paragraph column.
+
+       c. *Gap uniformity* – the pixel gap to the candidate line is
           ≤ ``gap_ratio × median_h`` (absolute ceiling) **and**, once at
           least one gap has been accepted into the block, is not more than
           ``gap_outlier_scale × median(accepted gaps)`` (relative outlier
@@ -198,8 +208,9 @@ class ParagraphDetector(RangeDetector):
     Parameters
     ----------
     height_ratio:
-        Max allowed height deviation between adjacent lines, as a fraction
-        of the reference line's median height.  Default 0.4 (±40 %).
+        Max allowed deviation between candidate line's median box height
+        and the paragraph's accumulated median box height, as a fraction.
+        Default 0.4 (±40 %).
     gap_ratio:
         Absolute ceiling: max vertical gap as a multiple of the local
         median box height.  Default 1.2.
@@ -212,6 +223,9 @@ class ParagraphDetector(RangeDetector):
     cursor_margin:
         Extra pixels around each line when testing cursor proximity.
         Default 4 px.
+    overlap_ratio:
+        Minimum horizontal overlap between candidate line and accumulated
+        paragraph extent, as a fraction of the narrower width.  Default 0.3.
     """
 
     def __init__(
@@ -221,12 +235,14 @@ class ParagraphDetector(RangeDetector):
         gap_outlier_scale: float = 2.5,
         min_lines: int = 2,
         cursor_margin: int = 4,
+        overlap_ratio: float = 0.3,
     ) -> None:
         self.height_ratio = height_ratio
         self.gap_ratio = gap_ratio
         self.gap_outlier_scale = gap_outlier_scale
         self.min_lines = min_lines
         self.cursor_margin = cursor_margin
+        self.overlap_ratio = overlap_ratio
 
     def detect(
         self,
@@ -249,20 +265,34 @@ class ParagraphDetector(RangeDetector):
         if anchor_idx is None:
             return None
 
-        def _compatible(a: list[BoundingBox], b_line: list[BoundingBox]) -> bool:
-            """Height similarity + horizontal column overlap."""
-            h_a, ax0, ax1, _ = _line_stats(a)
-            h_b, bx0, bx1, _ = _line_stats(b_line)
-            if h_a == 0:
-                return False
-            if abs(h_b - h_a) / h_a > self.height_ratio:
-                return False
-            # At least 30 % horizontal overlap — same column, not side-by-side.
-            overlap = min(ax1, bx1) - max(ax0, bx0)
-            min_width = min(ax1 - ax0, bx1 - bx0) or 1
-            return overlap / min_width >= 0.3
+        # ── Accumulated paragraph state ──────────────────────────────
+        # Starts from the anchor line and grows outward.  Height and
+        # horizontal checks compare each candidate against the *whole*
+        # paragraph built so far, not just the immediately adjacent line.
+        _, anchor_min_x, anchor_max_right, _ = _line_stats(lines[anchor_idx])
+        para_min_x: float = anchor_min_x
+        para_max_right: float = anchor_max_right
+        all_heights: list[int] = [b.h for b in lines[anchor_idx]]
 
-        def _gap_uniform(
+        def _height_ok(candidate: list[BoundingBox]) -> bool:
+            """Height compatibility against accumulated paragraph median."""
+            para_med_h = statistics.median(all_heights)
+            cand_med_h = statistics.median(b.h for b in candidate)
+            if para_med_h == 0:
+                return False
+            return abs(cand_med_h - para_med_h) / para_med_h <= self.height_ratio
+
+        def _overlap_ok(candidate: list[BoundingBox]) -> bool:
+            """Horizontal overlap against accumulated paragraph extent."""
+            cand_min_x = min(b.x for b in candidate)
+            cand_max_right = max(b.right for b in candidate)
+            overlap = min(para_max_right, cand_max_right) - max(para_min_x, cand_min_x)
+            cand_width = cand_max_right - cand_min_x
+            para_width = para_max_right - para_min_x
+            min_width = min(cand_width, para_width) or 1
+            return overlap / min_width >= self.overlap_ratio
+
+        def _gap_ok(
             upper: list[BoundingBox],
             lower: list[BoundingBox],
             accepted_gaps: list[float],
@@ -288,22 +318,36 @@ class ParagraphDetector(RangeDetector):
         def _grow(start: int, step: int) -> tuple[int, list[float]]:
             """Grow the paragraph in direction *step* (+1 down, -1 up).
 
+            Maintains ``para_min_x``, ``para_max_right`` and ``all_heights``
+            via the enclosing scope so that the accumulated paragraph state
+            is shared between the upward and downward passes.
+
             Returns (new_boundary_idx, accepted_gaps_in_this_direction).
             """
+            nonlocal para_min_x, para_max_right
             idx = start
             gaps: list[float] = []
             while True:
                 nxt = idx + step
                 if not (0 <= nxt < len(lines)):
                     break
+                candidate = lines[nxt]
                 upper = lines[min(idx, nxt)]
                 lower = lines[max(idx, nxt)]
-                if not _compatible(upper, lower):
+                if not _height_ok(candidate):
                     break
-                if not _gap_uniform(upper, lower, gaps):
+                if not _overlap_ok(candidate):
+                    break
+                if not _gap_ok(upper, lower, gaps):
                     break
                 raw_gap = min(b.y for b in lower) - max(b.bottom for b in upper)
                 gaps.append(max(0.0, raw_gap))
+                # Update accumulated paragraph state.
+                all_heights.extend(b.h for b in candidate)
+                cand_min_x = min(b.x for b in candidate)
+                cand_max_right = max(b.right for b in candidate)
+                para_min_x = min(para_min_x, cand_min_x)
+                para_max_right = max(para_max_right, cand_max_right)
                 idx = nxt
             return idx, gaps
 
@@ -554,12 +598,16 @@ def run_detectors(
     cursor_x: int,
     cursor_y: int,
     detectors: Sequence[RangeDetector] = DEFAULT_DETECTORS,
-) -> list[BoundingBox]:
+) -> tuple[list[BoundingBox], str]:
     """Walk *detectors* in order and return the first non-``None`` result.
 
-    Returns an empty list only when *boxes* is empty or all detectors return
-    ``None`` (which should not happen with the default chain that ends with
-    ``SingleBoxDetector``).
+    Returns
+    -------
+    tuple[list[BoundingBox], str]
+        The detected boxes and the class name of the detector that matched.
+        Returns ``([], "")`` when *boxes* is empty or all detectors return
+        ``None`` (which should not happen with the default chain that ends
+        with ``SingleBoxDetector``).
 
     Parameters
     ----------
@@ -573,5 +621,5 @@ def run_detectors(
     for detector in detectors:
         result = detector.detect(boxes, cursor_x, cursor_y)
         if result is not None:
-            return result
-    return []
+            return result, type(detector).__name__
+    return [], ""
