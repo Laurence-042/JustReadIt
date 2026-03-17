@@ -119,9 +119,13 @@ class RangeDetector(ABC):
 def _group_into_lines(boxes: Sequence[BoundingBox]) -> list[list[BoundingBox]]:
     """Cluster boxes into text lines by overlapping vertical extents.
 
-    Two boxes are on the same line when their y-ranges overlap by at least
-    half the smaller box's height.  Returns lines sorted top-to-bottom, each
-    line sorted left-to-right.
+    A new box is appended to the current line when its y-range overlaps the
+    **accumulated** vertical extent of all boxes already on that line by at
+    least half the smaller height.  Using the accumulated extent (rather than
+    only the first box on the line) handles punctuation and glyph variants
+    whose cap-height or baseline differs slightly from neighbouring characters
+    (e.g. full-width ellipsis ``……`` vs. regular CJK characters).
+    Returns lines sorted top-to-bottom, each line sorted left-to-right.
     """
     if not boxes:
         return []
@@ -131,10 +135,15 @@ def _group_into_lines(boxes: Sequence[BoundingBox]) -> list[list[BoundingBox]]:
     current_line: list[BoundingBox] = [sorted_boxes[0]]
 
     for box in sorted_boxes[1:]:
-        ref = current_line[0]
-        overlap_top = max(ref.y, box.y)
-        overlap_bot = min(ref.bottom, box.bottom)
-        min_h = min(ref.h, box.h) or 1
+        # Use the accumulated vertical extent of the whole current line so
+        # that boxes which drift slightly (e.g. punctuation, ellipsis glyphs)
+        # are not incorrectly split into a new line just because they don't
+        # overlap with the *first* box in the line.
+        line_top = min(b.y for b in current_line)
+        line_bot = max(b.bottom for b in current_line)
+        overlap_top = max(line_top, box.y)
+        overlap_bot = min(line_bot, box.bottom)
+        min_h = min(line_bot - line_top, box.h) or 1
         if overlap_bot - overlap_top >= 0.5 * min_h:
             current_line.append(box)
         else:
