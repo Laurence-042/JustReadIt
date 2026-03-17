@@ -26,7 +26,7 @@ from PySide6.QtGui import (
     QColor, QFont, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QGroupBox,
     QHBoxLayout, QLabel,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar,
@@ -307,6 +307,12 @@ class _PreviewLabel(QLabel):
         self._orig_w = 1
         self._orig_h = 1
 
+        # Overlay visibility flags (toggled by checkboxes in the UI).
+        self.show_image: bool = True
+        self.show_boxes: bool = True
+        self.show_labels: bool = True
+        self.show_region: bool = True
+
     def update_frame(
         self,
         img_bytes: bytes,
@@ -331,35 +337,49 @@ class _PreviewLabel(QLabel):
             return
         lw, lh = self.width(), self.height()
 
-        scaled = self._raw.scaled(
-            lw, lh,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        if self.show_image:
+            scaled = self._raw.scaled(
+                lw, lh,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        else:
+            # Compute the same size as the scaled image would have, but
+            # fill with a dark background instead of the game frame.
+            tmp = self._raw.scaled(
+                lw, lh,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            scaled = QPixmap(tmp.width(), tmp.height())
+            scaled.fill(QColor(40, 40, 40))
+
         sx = scaled.width()  / self._orig_w
         sy = scaled.height() / self._orig_h
         ox = (lw - scaled.width())  // 2
         oy = (lh - scaled.height()) // 2
 
-        if self._boxes:
+        if self._boxes and (self.show_boxes or self.show_labels):
             painter = QPainter(scaled)
             font = QFont("Consolas", 7)
             painter.setFont(font)
             for i, box in enumerate(self._boxes):
                 color = _BBOX_COLORS[i % len(_BBOX_COLORS)]
-                painter.setPen(QPen(color, 1))
                 rx = int(box.x * sx)
                 ry = int(box.y * sy)
                 rw = max(1, int(box.w * sx))
                 rh = max(1, int(box.h * sy))
-                painter.drawRect(rx, ry, rw, rh)
-                label_w = min(rw, 150)
-                painter.fillRect(rx, max(0, ry - 11), label_w, 11, QColor(0, 0, 0, 160))
-                painter.setPen(QColor(255, 255, 255))
-                painter.drawText(rx + 1, max(9, ry - 1), box.text[:24])
+                if self.show_boxes:
+                    painter.setPen(QPen(color, 1))
+                    painter.drawRect(rx, ry, rw, rh)
+                if self.show_labels:
+                    label_w = min(rw, 150)
+                    painter.fillRect(rx, max(0, ry - 11), label_w, 11, QColor(0, 0, 0, 160))
+                    painter.setPen(QColor(255, 255, 255))
+                    painter.drawText(rx + 1, max(9, ry - 1), box.text[:24])
             painter.end()
 
-        if self._crop_rect is not None:
+        if self._crop_rect is not None and self.show_region:
             cl, ct, cr, cb = self._crop_rect
             painter2 = QPainter(scaled)
             pen = QPen(QColor(255, 255, 100), 2, Qt.PenStyle.DashLine)
@@ -513,9 +533,40 @@ class DebugWindow(QMainWindow):
         central_lay.addWidget(splitter)
         self.setCentralWidget(central)
 
-        # -- Left column: game preview --
+        # -- Left column: game preview + overlay toggles --
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(2)
+
+        # Overlay-visibility checkboxes.
+        toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(4, 2, 4, 0)
+        toggle_row.setSpacing(10)
+
+        self._chk_image  = QCheckBox("画面")
+        self._chk_boxes  = QCheckBox("OCR框")
+        self._chk_labels = QCheckBox("OCR结果")
+        self._chk_region = QCheckBox("聚合范围")
+
+        for chk in (self._chk_image, self._chk_boxes,
+                    self._chk_labels, self._chk_region):
+            chk.setChecked(True)
+            toggle_row.addWidget(chk)
+        toggle_row.addStretch()
+
+        left_lay.addLayout(toggle_row)
+
         self._preview = _PreviewLabel(self)
-        splitter.addWidget(self._preview)
+        left_lay.addWidget(self._preview, 1)  # stretch=1 so preview fills space
+
+        # Wire checkboxes → preview flags; re-render on toggle.
+        self._chk_image.toggled.connect(self._on_toggle_image)
+        self._chk_boxes.toggled.connect(self._on_toggle_boxes)
+        self._chk_labels.toggled.connect(self._on_toggle_labels)
+        self._chk_region.toggled.connect(self._on_toggle_region)
+
+        splitter.addWidget(left)
 
         # -- Right column: text panels --
         right = QSplitter(Qt.Orientation.Vertical)
@@ -552,6 +603,26 @@ class DebugWindow(QMainWindow):
 
         # Connect AFTER populating to avoid spurious install prompt.
         self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
+
+    # ------------------------------------------------------------------
+    # Overlay toggle handlers
+    # ------------------------------------------------------------------
+
+    def _on_toggle_image(self, checked: bool) -> None:
+        self._preview.show_image = checked
+        self._preview._render()
+
+    def _on_toggle_boxes(self, checked: bool) -> None:
+        self._preview.show_boxes = checked
+        self._preview._render()
+
+    def _on_toggle_labels(self, checked: bool) -> None:
+        self._preview.show_labels = checked
+        self._preview._render()
+
+    def _on_toggle_region(self, checked: bool) -> None:
+        self._preview.show_region = checked
+        self._preview._render()
 
     # ------------------------------------------------------------------
     # Language helpers
