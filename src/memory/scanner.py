@@ -101,19 +101,24 @@ def _is_cjk(char: str) -> bool:
     )
 
 
-def pick_needle(
+def pick_needles(
     ocr_text: str,
     *,
     min_length: int = 3,
-    max_length: int = 8,
-) -> str:
-    """Extract the most distinctive CJK substring from *ocr_text*.
+    needle_length: int = 4,
+    max_needles: int = 3,
+) -> list[str]:
+    """Extract multiple short CJK substrings from *ocr_text* for memory search.
 
-    Picks the longest contiguous run of CJK characters (ideographs, hiragana,
-    katakana).  If the run exceeds *max_length*, a substring is taken from the
-    middle (OCR is typically most accurate in the centre of a text region).
+    Returns up to *max_needles* substrings of *needle_length* characters from
+    the longest contiguous CJK run.  Shorter needles are less likely to contain
+    OCR errors, and trying several provides redundancy — if one needle has an
+    error, the others may still produce hits.
 
-    Falls back to the first *max_length* characters of *ocr_text* if no CJK
+    Needle priority: **centre** first (OCR is most accurate in the middle of a
+    text region), then **start** and **end** of the run.
+
+    Falls back to the first *needle_length* characters of *ocr_text* if no CJK
     run meets *min_length*.
 
     Parameters
@@ -121,12 +126,14 @@ def pick_needle(
     ocr_text:
         Raw text from Windows OCR (may contain errors at boundaries).
     min_length:
-        Minimum run length to consider.  Shorter runs are ignored.
-    max_length:
-        Maximum needle length returned.
+        Minimum CJK run length to consider.  Shorter runs are ignored.
+    needle_length:
+        Length of each needle substring.
+    max_needles:
+        Maximum number of needles to return.
     """
     if not ocr_text:
-        return ""
+        return []
 
     # Collect all contiguous CJK runs.
     runs: list[str] = []
@@ -144,17 +151,32 @@ def pick_needle(
     # Filter by min_length, pick the longest.
     valid = [r for r in runs if len(r) >= min_length]
     if not valid:
-        # No qualifying CJK run — fall back to raw text.
-        return ocr_text[:max_length]
+        return [ocr_text[:needle_length]]
 
     best = max(valid, key=len)
 
-    if len(best) <= max_length:
-        return best
+    if len(best) <= needle_length:
+        return [best]
 
-    # Take from the middle for better OCR accuracy.
-    start = (len(best) - max_length) // 2
-    return best[start : start + max_length]
+    n = len(best)
+    center_start = (n - needle_length) // 2
+
+    # Run too short for two non-overlapping needles — return centre only.
+    if n < needle_length * 2:
+        return [best[center_start : center_start + needle_length]]
+
+    # Generate up to max_needles: centre, start, end — deduplicated.
+    positions = [center_start, 0, n - needle_length]
+    seen: set[str] = set()
+    result: list[str] = []
+    for pos in positions:
+        substr = best[pos : pos + needle_length]
+        if substr not in seen:
+            seen.add(substr)
+            result.append(substr)
+        if len(result) >= max_needles:
+            break
+    return result
 
 
 # ---------------------------------------------------------------------------

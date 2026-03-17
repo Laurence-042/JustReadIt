@@ -9,12 +9,15 @@ fall back to the original OCR text.
 
 Usage::
 
-    from src.memory import MemoryScanner, pick_needle
+    from src.memory import MemoryScanner, pick_needles
     from src.correction import best_match
 
     ocr_text = "テスト文字列"
     with MemoryScanner(pid=target.pid) as ms:
-        results = ms.scan(pick_needle(ocr_text))
+        for needle in pick_needles(ocr_text):
+            results = ms.scan(needle)
+            if results:
+                break
 
     clean = best_match(ocr_text, [r.text for r in results])
     final = clean if clean is not None else ocr_text

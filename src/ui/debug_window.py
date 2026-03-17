@@ -38,7 +38,7 @@ from src.capture import Capturer
 from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
-from src.memory import MemoryScanner, pick_needle
+from src.memory import MemoryScanner, pick_needles
 from src.correction import best_match
 from .window_picker import WindowPicker
 
@@ -226,29 +226,42 @@ class _PipelineWorker(QObject):
         mem_text = ""
         if region_text and self._scanner is not None:
             try:
-                needle = pick_needle(region_text)
-                if needle:
+                needles = pick_needles(region_text)
+                results: list = []
+                used_needle = ""
+                for needle in needles:
                     results = self._scanner.scan(needle)
-                    candidates = [r.text for r in results]
-                    matched = best_match(region_text, candidates)
-                    if matched is not None:
-                        enc = results[0].encoding if results else "?"
-                        mem_text = (
-                            f"[match ✓  enc={enc}  "
-                            f"hits={len(results)}  "
-                            f"needle={needle!r}]\n\n{matched}"
-                        )
-                    elif results:
-                        previews = "\n".join(
-                            f"  [{r.encoding}] {r.text[:200]!r}"
-                            for r in results[:5]
-                        )
-                        mem_text = (
-                            f"[no match  hits={len(results)}  "
-                            f"needle={needle!r}]\n{previews}"
-                        )
-                    else:
-                        mem_text = f"[no hits  needle={needle!r}]"
+                    if results:
+                        used_needle = needle
+                        break
+                    used_needle = needle  # remember last tried
+
+                candidates = [r.text for r in results]
+                matched = best_match(region_text, candidates)
+                if matched is not None:
+                    enc = results[0].encoding if results else "?"
+                    mem_text = (
+                        f"[match ✓  enc={enc}  "
+                        f"hits={len(results)}  "
+                        f"needle={used_needle!r}  "
+                        f"tried={len(needles)}]\n\n{matched}"
+                    )
+                elif results:
+                    previews = "\n".join(
+                        f"  [{r.encoding}] {r.text[:200]!r}"
+                        for r in results[:5]
+                    )
+                    mem_text = (
+                        f"[no match  hits={len(results)}  "
+                        f"needle={used_needle!r}  "
+                        f"tried={len(needles)}]\n{previews}"
+                    )
+                elif needles:
+                    mem_text = (
+                        f"[no hits  needles={needles!r}]"
+                    )
+                else:
+                    mem_text = "[no needles from OCR text]"
             except Exception as exc:
                 mem_text = f"[scan error: {exc}]"
 

@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from src.memory import MemoryScanner, ScanResult, pick_needle
+from src.memory import MemoryScanner, ScanResult, pick_needles
 from src.memory._search import find_all_positions
 from src.memory.scanner import (
     _extract_string,
@@ -58,49 +58,74 @@ class TestIsCjk:
 
 
 # ==========================================================================
-# pick_needle
+# pick_needles
 # ==========================================================================
 
 
-class TestPickNeedle:
-    def test_pure_cjk(self) -> None:
-        assert pick_needle("テスト文字列") == "テスト文字列"
-
-    def test_mixed_text_picks_cjk_run(self) -> None:
-        result = pick_needle("Hello テスト World")
-        assert result == "テスト"
-
-    def test_prefers_longest_run(self) -> None:
-        result = pick_needle("aテストbこんにちはc")
-        assert "こんにちは" in result
-
-    def test_long_run_picks_from_middle(self) -> None:
-        text = "あいうえおかきくけこさしすせそ"  # 15 chars
-        result = pick_needle(text, max_length=6)
-        assert len(result) == 6
-        # Middle of 15 with length 6: start = (15-6)//2 = 4 → chars 4-9
-        assert result == "おかきくけこ"
-
-    def test_short_run_below_min_length(self) -> None:
-        # CJK run length 2, below default min_length=3
-        result = pick_needle("abテスcd")
-        # Falls back to raw text
-        assert result == "abテスcd"
-
-    def test_min_length_override(self) -> None:
-        result = pick_needle("abテスcd", min_length=2)
-        assert result == "テス"
-
+class TestPickNeedles:
     def test_empty_string(self) -> None:
-        assert pick_needle("") == ""
+        assert pick_needles("") == []
+
+    def test_short_cjk_returns_single(self) -> None:
+        # 3 chars <= needle_length=4 → returns as-is
+        assert pick_needles("テスト") == ["テスト"]
+
+    def test_medium_run_returns_centre_only(self) -> None:
+        # 7 chars, needle_length=4 → n < needle_length*2=8 → centre only
+        result = pick_needles("あいうえおかき")
+        assert len(result) == 1
+        # center = (7-4)//2 = 1 → "いうえお"
+        assert result[0] == "いうえお"
+
+    def test_long_run_returns_three_needles(self) -> None:
+        text = "あいうえおかきくけこさしすせそ"  # 15 chars
+        result = pick_needles(text)
+        assert len(result) == 3
+        # centre: (15-4)//2 = 5 → "かきくけ"
+        # start: 0 → "あいうえ"
+        # end: 15-4=11 → "しすせそ"
+        assert result[0] == "かきくけ"
+        assert result[1] == "あいうえ"
+        assert result[2] == "しすせそ"
+
+    def test_eight_char_run_returns_two_needles(self) -> None:
+        text = "あいうえおかきく"  # 8 chars, >= needle_length*2
+        result = pick_needles(text)
+        # centre: (8-4)//2 = 2 → "うえおか"
+        # start: 0 → "あいうえ"
+        # end: 8-4=4 → "おかきく"
+        assert len(result) == 3
+        assert result[0] == "うえおか"
+        assert result[1] == "あいうえ"
+        assert result[2] == "おかきく"
+
+    def test_deduplicates_identical_needles(self) -> None:
+        # 8 chars with needle_length=4 — centre=2, start=0, end=4
+        # All different, but for a shorter run they might collide.
+        text = "あいうえおかきく"  # exactly 8, center=2 start=0 end=4
+        result = pick_needles(text, needle_length=4)
+        assert len(result) == len(set(result))
 
     def test_no_cjk_falls_back(self) -> None:
-        result = pick_needle("Hello World!", max_length=5)
-        assert result == "Hello"
+        result = pick_needles("Hello World!", needle_length=5)
+        assert result == ["Hello"]
 
-    def test_max_length_caps_result(self) -> None:
-        result = pick_needle("テスト文字列", max_length=4)
-        assert len(result) == 4
+    def test_custom_needle_length(self) -> None:
+        text = "あいうえおかきくけこさし"  # 12 chars
+        result = pick_needles(text, needle_length=3)
+        assert all(len(n) == 3 for n in result)
+        assert len(result) == 3
+
+    def test_max_needles_limits_output(self) -> None:
+        text = "あいうえおかきくけこさしすせそ"  # 15 chars
+        result = pick_needles(text, max_needles=2)
+        assert len(result) == 2
+
+    def test_mixed_text_uses_longest_run(self) -> None:
+        result = pick_needles("aテストbこんにちはc")
+        # こんにちは (5 chars) > テスト (3 chars)
+        # 5 < 4*2=8 → centre only: (5-4)//2=0 → "こんにち"
+        assert result == ["こんにち"]
 
 
 # ==========================================================================

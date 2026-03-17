@@ -8,14 +8,14 @@ Public API
 ----------
 .. autoclass:: MemoryScanner
 .. autoclass:: ScanResult
-.. autofunction:: pick_needle
+.. autofunction:: pick_needles
 """
 from __future__ import annotations
 
-from .scanner import MemoryScanner, ScanResult, pick_needle
+from .scanner import MemoryScanner, ScanResult, pick_needles
 
 __all__ = [
     "MemoryScanner",
     "ScanResult",
-    "pick_needle",
+    "pick_needles",
 ]
