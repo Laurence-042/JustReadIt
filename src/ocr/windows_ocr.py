@@ -37,8 +37,9 @@ def _ensure_apartment() -> None:
     """Initialise COM STA for the current thread (idempotent)."""
     try:
         _winrt.init_apartment(_winrt.STA)
-    except Exception:
-        pass  # already initialised on this thread
+    except Exception as exc:
+        # Expected when the apartment is already initialised on this thread.
+        _log.debug("init_apartment: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +170,10 @@ class WindowsOcr:
 
         Returns
         -------
-        list[BoundingBox]
-            One entry per recognised word, in reading order.
+        tuple[list[BoundingBox], list[BoundingBox]]
+            ``(word_boxes, line_boxes)`` — word_boxes has one entry per
+            recognised word; line_boxes has one entry per OCR line, with
+            the line text joined by spaces.  Both are in reading order.
         """
         # Compute effective scale — clamp so neither dimension exceeds 4096 px.
         max_dim = max(image.width, image.height)
@@ -185,20 +188,34 @@ class WindowsOcr:
 
         bmp = _pil_to_software_bitmap(ocr_img)
         result: wocr.OcrResult = asyncio.run(self._engine.recognize_async(bmp))
-        boxes: list[BoundingBox] = []
+        word_boxes: list[BoundingBox] = []
+        line_boxes: list[BoundingBox] = []
         for line in result.lines:
+            line_words: list[BoundingBox] = []
             for word in line.words:
                 r = word.bounding_rect  # windows_foundation.Rect (floats)
-                boxes.append(
+                wb = BoundingBox(
+                    x=int(r.x       / scale),
+                    y=int(r.y       / scale),
+                    w=int(r.width   / scale),
+                    h=int(r.height  / scale),
+                    text=word.text,
+                )
+                word_boxes.append(wb)
+                line_words.append(wb)
+            # OcrLine has no bounding_rect — derive it from the word union.
+            if line_words:
+                lx = min(b.x for b in line_words)
+                ly = min(b.y for b in line_words)
+                lr = max(b.right  for b in line_words)
+                lb = max(b.bottom for b in line_words)
+                line_boxes.append(
                     BoundingBox(
-                        x=int(r.x       / scale),
-                        y=int(r.y       / scale),
-                        w=int(r.width   / scale),
-                        h=int(r.height  / scale),
-                        text=word.text,
+                        x=lx, y=ly, w=lr - lx, h=lb - ly,
+                        text=" ".join(w.text for w in line.words),
                     )
                 )
-        return boxes
+        return word_boxes, line_boxes
 
     def recognise_text(self, image: Image.Image) -> str:
         """Return the full recognised text string (no bounding boxes)."""

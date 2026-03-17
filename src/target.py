@@ -49,7 +49,10 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import logging
 from dataclasses import dataclass
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DPI awareness helpers
@@ -77,13 +80,14 @@ def _ensure_dpi_aware() -> None:
         ctypes.windll.user32.SetProcessDpiAwarenessContext(
             _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
         )
-    except (OSError, AttributeError):
+    except (OSError, AttributeError) as exc:
         # Already set (e.g. by Qt), or Windows < 10 1703.  Fall back to the
         # older shcore API — safe to call when V2 is already active (no-op).
+        _log.debug("SetProcessDpiAwarenessContext V2 unavailable (%s), trying shcore", exc)
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
-        except OSError:
-            pass
+        except OSError as exc2:
+            _log.debug("SetProcessDpiAwareness also failed: %s", exc2)
     _dpi_aware = True
 
 # ---------------------------------------------------------------------------
@@ -443,6 +447,7 @@ class GameTarget:
         try:
             dxcam_output_idx = monitor_rects.index(monitor_rect)
         except ValueError:
+            _log.debug("Monitor rect not found in dxcam outputs, falling back to output 0")
             dxcam_output_idx = 0  # fallback: primary
         name = _pid_to_name(pid) or f"<PID {pid}>"
         return cls(
@@ -492,6 +497,7 @@ class GameTarget:
         try:
             dxcam_output_idx = monitor_rects.index(monitor_rect)
         except ValueError:
+            _log.debug("Monitor rect not found in dxcam outputs on refresh, falling back to output 0")
             dxcam_output_idx = 0
         return GameTarget(
             pid=self.pid,

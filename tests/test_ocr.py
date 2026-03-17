@@ -477,10 +477,11 @@ class TestWindowsOcrRecognise:
     def test_recognise_returns_boxes(self):
         from src.ocr.windows_ocr import WindowsOcr
         ocr = WindowsOcr("ja")
-        # Create a blank white image – should return empty list, not crash.
+        # Create a blank white image – should return empty lists, not crash.
         img = Image.new("RGB", (320, 100), (255, 255, 255))
-        boxes = ocr.recognise(img)
-        assert isinstance(boxes, list)
+        word_boxes, line_boxes = ocr.recognise(img)
+        assert isinstance(word_boxes, list)
+        assert isinstance(line_boxes, list)
 
     def test_recognise_text_returns_str(self):
         from src.ocr.windows_ocr import WindowsOcr

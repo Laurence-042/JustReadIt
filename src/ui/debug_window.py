@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import io
+import logging
 import time
 
 from PySide6.QtCore import (
@@ -22,6 +23,7 @@ from PySide6.QtCore import (
 from src.config import AppConfig
 
 _cfg = AppConfig()
+_log = logging.getLogger(__name__)
 from PySide6.QtGui import (
     QColor, QFont, QImage, QPainter, QPen, QPixmap,
 )
@@ -91,11 +93,11 @@ class _PipelineWorker(QObject):
 
     Signals
     -------
-    result_ready(img_bytes, boxes, crop_rect, win_ocr_text, region_text, detector_name, mem_text, elapsed_ms)
+    result_ready(img_bytes, word_boxes, line_boxes, crop_rect, win_ocr_text, region_text, detector_name, mem_text, elapsed_ms)
     error(message)
     """
 
-    result_ready = Signal(bytes, list, object, str, str, str, str, float)
+    result_ready = Signal(bytes, list, list, object, str, str, str, str, float)
     error = Signal(str)
     ready = Signal()
 
@@ -159,8 +161,8 @@ class _PipelineWorker(QObject):
         # window position / size (handles window moves, resizes, DPI changes).
         try:
             self._target = self._target.refresh()
-        except Exception:
-            pass  # use last known position on transient failure
+        except Exception as exc:
+            _log.warning("target.refresh() failed, using last known position: %s", exc)
 
         t0 = time.monotonic()
         try:
@@ -180,10 +182,10 @@ class _PipelineWorker(QObject):
             return
 
         try:
-            boxes: list[BoundingBox] = self._ocr.recognise(img)
+            boxes, line_boxes = self._ocr.recognise(img)
         except Exception as exc:
             self.error.emit(f"Windows OCR failed: {exc}")
-            boxes = []
+            boxes, line_boxes = [], []
 
         win_ocr_lines = [
             f"[{b.x:4},{b.y:4}  {b.w:3}×{b.h:3}]  {b.text}"
@@ -273,7 +275,7 @@ class _PipelineWorker(QObject):
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=75)
         self.result_ready.emit(
-            buf.getvalue(), boxes, crop_rect,
+            buf.getvalue(), boxes, line_boxes, crop_rect,
             win_ocr_text, region_text, detector_name, mem_text, elapsed_ms,
         )
 
@@ -312,11 +314,14 @@ class _PreviewLabel(QLabel):
         self.show_boxes: bool = True
         self.show_labels: bool = True
         self.show_region: bool = True
+        self.show_lines: bool = True
+        self._line_boxes: list[BoundingBox] = []
 
     def update_frame(
         self,
         img_bytes: bytes,
         boxes: list[BoundingBox],
+        line_boxes: list[BoundingBox],
         crop_rect: tuple[int, int, int, int] | None = None,
     ) -> None:
         qimg = QImage.fromData(img_bytes)
@@ -324,6 +329,7 @@ class _PreviewLabel(QLabel):
         self._orig_w = qimg.width()
         self._orig_h = qimg.height()
         self._boxes = boxes
+        self._line_boxes = line_boxes
         self._crop_rect = crop_rect
         self._render()
 
@@ -378,6 +384,17 @@ class _PreviewLabel(QLabel):
                     painter.setPen(QColor(255, 255, 255))
                     painter.drawText(rx + 1, max(9, ry - 1), box.text[:24])
             painter.end()
+
+        if self._line_boxes and self.show_lines:
+            plines = QPainter(scaled)
+            pen_line = QPen(QColor(80, 255, 200), 1, Qt.PenStyle.DotLine)
+            plines.setPen(pen_line)
+            for lb in self._line_boxes:
+                plines.drawRect(
+                    int(lb.x * sx), int(lb.y * sy),
+                    max(1, int(lb.w * sx)), max(1, int(lb.h * sy)),
+                )
+            plines.end()
 
         if self._crop_rect is not None and self.show_region:
             cl, ct, cr, cb = self._crop_rect
@@ -545,11 +562,12 @@ class DebugWindow(QMainWindow):
         toggle_row.setSpacing(10)
 
         self._chk_image  = QCheckBox("画面")
+        self._chk_lines  = QCheckBox("OCR行")
         self._chk_boxes  = QCheckBox("OCR框")
         self._chk_labels = QCheckBox("OCR结果")
         self._chk_region = QCheckBox("聚合范围")
 
-        for chk in (self._chk_image, self._chk_boxes,
+        for chk in (self._chk_image, self._chk_lines, self._chk_boxes,
                     self._chk_labels, self._chk_region):
             chk.setChecked(True)
             toggle_row.addWidget(chk)
@@ -562,6 +580,7 @@ class DebugWindow(QMainWindow):
 
         # Wire checkboxes → preview flags; re-render on toggle.
         self._chk_image.toggled.connect(self._on_toggle_image)
+        self._chk_lines.toggled.connect(self._on_toggle_lines)
         self._chk_boxes.toggled.connect(self._on_toggle_boxes)
         self._chk_labels.toggled.connect(self._on_toggle_labels)
         self._chk_region.toggled.connect(self._on_toggle_region)
@@ -612,6 +631,10 @@ class DebugWindow(QMainWindow):
         self._preview.show_image = checked
         self._preview._render()
 
+    def _on_toggle_lines(self, checked: bool) -> None:
+        self._preview.show_lines = checked
+        self._preview._render()
+
     def _on_toggle_boxes(self, checked: bool) -> None:
         self._preview.show_boxes = checked
         self._preview._render()
@@ -648,7 +671,8 @@ class DebugWindow(QMainWindow):
                     continue
                 try:
                     display = glob.Language(tag).display_name
-                except Exception:
+                except Exception as exc:
+                    _log.debug("Could not get display name for lang %r: %s", tag, exc)
                     display = tag
                 self._cmb_lang.addItem(
                     f"{tag}  ({display})  ⬇ select to install via DISM (~6 MB)",
@@ -680,8 +704,8 @@ class DebugWindow(QMainWindow):
                 if not wocr.OcrEngine.is_language_supported(glob.Language(tag)):
                     self._start_install(tag)
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning("WinRT OCR language check failed for %r: %s", tag, exc)
 
         if self._worker_thread is not None and self._worker_thread.isRunning():
             self.statusBar().showMessage(
@@ -878,11 +902,12 @@ class DebugWindow(QMainWindow):
     # Result / error handlers
     # ------------------------------------------------------------------
 
-    @Slot(bytes, list, object, str, str, str, str, float)
+    @Slot(bytes, list, list, object, str, str, str, str, float)
     def _on_result(
         self,
         img_bytes: bytes,
         boxes: list,
+        line_boxes: list,
         crop_rect: object,
         win_ocr_text: str,
         region_text: str,
@@ -890,7 +915,7 @@ class DebugWindow(QMainWindow):
         mem_text: str,
         elapsed_ms: float,
     ) -> None:
-        self._preview.update_frame(img_bytes, boxes, crop_rect)
+        self._preview.update_frame(img_bytes, boxes, line_boxes, crop_rect)
         header = f"[ {len(boxes)} boxes  —  {elapsed_ms:.0f} ms ]\n\n"
         self._te_wocr.setPlainText(header + win_ocr_text)
         if detector_name:
