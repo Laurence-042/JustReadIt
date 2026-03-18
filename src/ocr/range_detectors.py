@@ -7,11 +7,16 @@ non-``None`` result.
 Built-in rules (priority order)
 --------------------------------
 1. :class:`ParagraphDetector`
-   Uniform line width / height + tight vertical spacing → whole paragraph.
+   Uniform line height + tight vertical spacing → whole paragraph.
 2. :class:`TableRowDetector`
-   2-4 boxes aligned on the same horizontal baseline → full table row.
-3. :class:`SingleBoxDetector`
-   Fallback: the single bounding box nearest to the cursor.
+   2-4 lines aligned on the same horizontal baseline → full table row.
+3. :class:`SingleLineDetector`
+   Fallback: the single OCR line nearest to the cursor.
+   ``SingleBoxDetector`` is a backwards-compatible alias.
+
+All detectors receive *line* bounding boxes (one :class:`BoundingBox` per
+OCR-recognised text line) rather than individual word boxes.  Word-to-line
+grouping is performed upstream by :class:`~src.ocr.windows_ocr.WindowsOcr`.
 
 Adding a custom detector
 ------------------------
@@ -21,7 +26,7 @@ the desired priority position in ``DEFAULT_DETECTORS``::
     from src.ocr.range_detectors import RangeDetector, DEFAULT_DETECTORS
 
     class MyDetector(RangeDetector):
-        def detect(self, boxes, cursor_x, cursor_y):
+        def detect(self, lines, cursor_x, cursor_y):
             ...
 
     DEFAULT_DETECTORS.insert(0, MyDetector())
@@ -90,7 +95,7 @@ class RangeDetector(ABC):
     @abstractmethod
     def detect(
         self,
-        boxes: Sequence[BoundingBox],
+        lines: Sequence[BoundingBox],
         cursor_x: int,
         cursor_y: int,
     ) -> list[BoundingBox] | None:
@@ -98,69 +103,19 @@ class RangeDetector(ABC):
 
         Parameters
         ----------
-        boxes:
-            All bounding boxes returned by Windows OCR for the current frame.
+        lines:
+            OCR-provided line bounding boxes for the current frame (one box
+            per text line, as returned by :meth:`~src.ocr.windows_ocr.WindowsOcr.recognise`).
         cursor_x, cursor_y:
-            Current cursor position in the same coordinate space as the boxes
+            Current cursor position in the same coordinate space as *lines*
             (i.e. relative to the captured game-window image).
 
         Returns
         -------
         list[BoundingBox] | None
-            The boxes that form the detected translation range, or ``None``
-            when this detector's conditions are not satisfied.
+            The line boxes that form the detected translation range, or
+            ``None`` when this detector's conditions are not satisfied.
         """
-
-
-# ---------------------------------------------------------------------------
-# Internal geometry helpers
-# ---------------------------------------------------------------------------
-
-def _group_into_lines(boxes: Sequence[BoundingBox]) -> list[list[BoundingBox]]:
-    """Cluster boxes into text lines by overlapping vertical extents.
-
-    A new box is appended to the current line when its y-range overlaps the
-    **accumulated** vertical extent of all boxes already on that line by at
-    least half the smaller height.  Using the accumulated extent (rather than
-    only the first box on the line) handles punctuation and glyph variants
-    whose cap-height or baseline differs slightly from neighbouring characters
-    (e.g. full-width ellipsis ``……`` vs. regular CJK characters).
-    Returns lines sorted top-to-bottom, each line sorted left-to-right.
-    """
-    if not boxes:
-        return []
-
-    sorted_boxes = sorted(boxes, key=lambda b: b.y)
-    lines: list[list[BoundingBox]] = []
-    current_line: list[BoundingBox] = [sorted_boxes[0]]
-
-    for box in sorted_boxes[1:]:
-        # Use the accumulated vertical extent of the whole current line so
-        # that boxes which drift slightly (e.g. punctuation, ellipsis glyphs)
-        # are not incorrectly split into a new line just because they don't
-        # overlap with the *first* box in the line.
-        line_top = min(b.y for b in current_line)
-        line_bot = max(b.bottom for b in current_line)
-        overlap_top = max(line_top, box.y)
-        overlap_bot = min(line_bot, box.bottom)
-        min_h = min(line_bot - line_top, box.h) or 1
-        if overlap_bot - overlap_top >= 0.5 * min_h:
-            current_line.append(box)
-        else:
-            lines.append(sorted(current_line, key=lambda b: b.x))
-            current_line = [box]
-
-    lines.append(sorted(current_line, key=lambda b: b.x))
-    return lines
-
-
-def _line_stats(line: list[BoundingBox]) -> tuple[float, float, float, float]:
-    """Return (median_h, min_x, max_right, center_y) for a line."""
-    median_h = statistics.median(b.h for b in line) if line else 0
-    min_x = min(b.x for b in line)
-    max_right = max(b.right for b in line)
-    center_y = statistics.median(b.center_y for b in line)
-    return median_h, min_x, max_right, center_y
 
 
 # ---------------------------------------------------------------------------
@@ -168,145 +123,94 @@ def _line_stats(line: list[BoundingBox]) -> tuple[float, float, float, float]:
 # ---------------------------------------------------------------------------
 
 class ParagraphDetector(RangeDetector):
-    """Detect a block of paragraph text using Gestalt proximity.
+    """Detect a paragraph: consecutive OCR lines with uniform height and tight
+    vertical spacing.
 
-    The core idea mirrors the **Gestalt principle of proximity**: elements
-    with small, *uniform* separations belong to the same group; a sudden
-    increase in separation signals a group boundary.
+    The input *lines* are OCR-provided line bounding boxes (one box per text
+    line).  No word-level re-grouping is performed; that is handled upstream
+    by :class:`~src.ocr.windows_ocr.WindowsOcr`.
 
     Algorithm
     ---------
-    1. Find the text line closest to the cursor (the "anchor").
-    2. Grow upward and downward from the anchor, accepting each adjacent
-       line only when **all three** conditions hold:
+    1. Sort lines top-to-bottom and find the anchor (the line whose vertical
+       extent ± ``cursor_margin`` contains *cursor_y*).
+    2. Grow upward and downward from the anchor, accepting each adjacent line
+       only when **both** conditions hold:
 
-       a. *Height compatibility* – the candidate line's median box height
-          is within ``height_ratio`` of the **accumulated paragraph median
-          height** (not just the adjacent line).  Using the paragraph-wide
-          median makes the check robust to OCR fragmentation where a line
-          may contain smaller or fewer recognised boxes.
+       a. *Height compatibility* – the candidate line's height is within
+          ``height_ratio`` of the **accumulated paragraph median** height.
 
-       b. *Horizontal overlap* – the candidate line's horizontal extent
-          overlaps at least ``overlap_ratio`` of the narrower extent when
-          compared against the **accumulated paragraph extent** (not just
-          the adjacent line).  This handles CJK text where OCR drops
-          punctuation (e.g. ``……`` and ``、``), creating narrow box
-          fragments that don't overlap with their immediate neighbour but
-          do overlap with the full paragraph column.
-
-       c. *Gap uniformity* – the pixel gap to the candidate line is
-          ≤ ``gap_ratio × median_h`` (absolute ceiling) **and**, once at
-          least one gap has been accepted into the block, is not more than
-          ``gap_outlier_scale × median(accepted gaps)`` (relative outlier
-          test).  A gap that jumps well above the uniform spacing already
-          seen inside the block is treated as a visual boundary even if it
-          still passes the absolute ceiling.
-
-    The combination is language and script agnostic — it works on CJK
-    dialog text, Latin menus, and mixed-content screens equally.
+       b. *Gap uniformity* – the pixel gap to the candidate is ≤
+          ``gap_ratio × local_median_h`` (absolute) **and** (once at least
+          one gap has been accepted) ≤ ``gap_outlier_scale × median(accepted
+          gaps)`` (relative outlier
+          gap).  Only applied once at least one gap is already accepted.
 
     Parameters
     ----------
     height_ratio:
-        Max allowed deviation between candidate line's median box height
-        and the paragraph's accumulated median box height, as a fraction.
-        Default 0.4 (±40 %).
+        Max allowed fractional deviation of candidate height vs accumulated
+        paragraph median height.  Default 0.5.
     gap_ratio:
-        Absolute ceiling: max vertical gap as a multiple of the local
-        median box height.  Default 1.2.
+        Absolute ceiling: max vertical gap as a multiple of local median line
+        height.  Default 1.5.
     gap_outlier_scale:
-        Relative outlier threshold: a gap is rejected when it exceeds this
-        multiple of the median of previously accepted intra-paragraph gaps.
-        Default 2.5.  Set to 0 to disable the relative check.
+        Relative outlier threshold.  Set to 0 to disable.  Default 2.5.
     min_lines:
         Minimum number of consecutive matching lines to qualify.  Default 2.
     cursor_margin:
-        Extra pixels around each line when testing cursor proximity.
-        Default 4 px.
-    overlap_ratio:
-        Minimum horizontal overlap between candidate line and accumulated
-        paragraph extent, as a fraction of the narrower width.  Default 0.3.
+        Extra pixels around each line when testing cursor proximity.  Default 8.
     """
 
     def __init__(
         self,
-        height_ratio: float = 0.4,
-        gap_ratio: float = 1.2,
+        height_ratio: float = 0.5,
+        gap_ratio: float = 1.5,
         gap_outlier_scale: float = 2.5,
         min_lines: int = 2,
-        cursor_margin: int = 4,
-        overlap_ratio: float = 0.3,
+        cursor_margin: int = 8,
     ) -> None:
         self.height_ratio = height_ratio
         self.gap_ratio = gap_ratio
         self.gap_outlier_scale = gap_outlier_scale
         self.min_lines = min_lines
         self.cursor_margin = cursor_margin
-        self.overlap_ratio = overlap_ratio
 
     def detect(
         self,
-        boxes: Sequence[BoundingBox],
+        lines: Sequence[BoundingBox],
         cursor_x: int,
         cursor_y: int,
     ) -> list[BoundingBox] | None:
-        lines = _group_into_lines(boxes)
-        if len(lines) < self.min_lines:
+        sorted_lines = sorted(lines, key=lambda b: b.y)
+        if len(sorted_lines) < self.min_lines:
             return None
 
-        # Find the line that contains the cursor (vertical proximity).
+        # Find the anchor line whose vertical extent contains the cursor.
         anchor_idx: int | None = None
-        for i, line in enumerate(lines):
-            top = min(b.y for b in line) - self.cursor_margin
-            bot = max(b.bottom for b in line) + self.cursor_margin
-            if top <= cursor_y <= bot:
+        for i, line in enumerate(sorted_lines):
+            if line.y - self.cursor_margin <= cursor_y <= line.bottom + self.cursor_margin:
                 anchor_idx = i
                 break
         if anchor_idx is None:
             return None
 
-        # ── Accumulated paragraph state ──────────────────────────────
-        # Starts from the anchor line and grows outward.  Height and
-        # horizontal checks compare each candidate against the *whole*
-        # paragraph built so far, not just the immediately adjacent line.
-        _, anchor_min_x, anchor_max_right, _ = _line_stats(lines[anchor_idx])
-        para_min_x: float = anchor_min_x
-        para_max_right: float = anchor_max_right
-        all_heights: list[int] = [b.h for b in lines[anchor_idx]]
+        # Accumulated paragraph heights (shared between both grow passes).
+        all_heights: list[int] = [sorted_lines[anchor_idx].h]
 
-        def _height_ok(candidate: list[BoundingBox]) -> bool:
-            """Height compatibility against accumulated paragraph median."""
+        def _height_ok(candidate: BoundingBox) -> bool:
             para_med_h = statistics.median(all_heights)
-            cand_med_h = statistics.median(b.h for b in candidate)
             if para_med_h == 0:
                 return False
-            return abs(cand_med_h - para_med_h) / para_med_h <= self.height_ratio
-
-        def _overlap_ok(candidate: list[BoundingBox]) -> bool:
-            """Horizontal overlap against accumulated paragraph extent."""
-            cand_min_x = min(b.x for b in candidate)
-            cand_max_right = max(b.right for b in candidate)
-            overlap = min(para_max_right, cand_max_right) - max(para_min_x, cand_min_x)
-            cand_width = cand_max_right - cand_min_x
-            para_width = para_max_right - para_min_x
-            min_width = min(cand_width, para_width) or 1
-            return overlap / min_width >= self.overlap_ratio
+            return abs(candidate.h - para_med_h) / para_med_h <= self.height_ratio
 
         def _gap_ok(
-            upper: list[BoundingBox],
-            lower: list[BoundingBox],
+            upper: BoundingBox,
+            lower: BoundingBox,
             accepted_gaps: list[float],
         ) -> bool:
-            """True when the inter-line gap passes both absolute and relative tests.
-
-            Absolute: gap ≤ gap_ratio × local median box height.
-            Relative: gap ≤ gap_outlier_scale × median(accepted_gaps).
-                      Only applied once at least one gap is already accepted,
-                      so the very first expansion is governed by the absolute
-                      ceiling alone.
-            """
-            gap = min(b.y for b in lower) - max(b.bottom for b in upper)
-            med_h = statistics.median([b.h for b in upper] + [b.h for b in lower])
+            gap = lower.y - upper.bottom
+            med_h = statistics.median([upper.h, lower.h])
             if gap > self.gap_ratio * med_h:
                 return False
             if accepted_gaps and self.gap_outlier_scale > 0:
@@ -316,54 +220,32 @@ class ParagraphDetector(RangeDetector):
             return True
 
         def _grow(start: int, step: int) -> tuple[int, list[float]]:
-            """Grow the paragraph in direction *step* (+1 down, -1 up).
-
-            Maintains ``para_min_x``, ``para_max_right`` and ``all_heights``
-            via the enclosing scope so that the accumulated paragraph state
-            is shared between the upward and downward passes.
-
-            Returns (new_boundary_idx, accepted_gaps_in_this_direction).
-            """
-            nonlocal para_min_x, para_max_right
+            nonlocal all_heights
             idx = start
             gaps: list[float] = []
             while True:
                 nxt = idx + step
-                if not (0 <= nxt < len(lines)):
+                if not (0 <= nxt < len(sorted_lines)):
                     break
-                candidate = lines[nxt]
-                upper = lines[min(idx, nxt)]
-                lower = lines[max(idx, nxt)]
+                candidate = sorted_lines[nxt]
+                upper = sorted_lines[min(idx, nxt)]
+                lower = sorted_lines[max(idx, nxt)]
                 if not _height_ok(candidate):
-                    break
-                if not _overlap_ok(candidate):
                     break
                 if not _gap_ok(upper, lower, gaps):
                     break
-                raw_gap = min(b.y for b in lower) - max(b.bottom for b in upper)
-                gaps.append(max(0.0, raw_gap))
-                # Update accumulated paragraph state.
-                all_heights.extend(b.h for b in candidate)
-                cand_min_x = min(b.x for b in candidate)
-                cand_max_right = max(b.right for b in candidate)
-                para_min_x = min(para_min_x, cand_min_x)
-                para_max_right = max(para_max_right, cand_max_right)
+                gaps.append(max(0.0, lower.y - upper.bottom))
+                all_heights.append(candidate.h)
                 idx = nxt
             return idx, gaps
 
-        para_start, gaps_up   = _grow(anchor_idx, -1)
-        para_end,   gaps_down = _grow(anchor_idx, +1)
+        para_start, _ = _grow(anchor_idx, -1)
+        para_end,   _ = _grow(anchor_idx, +1)
 
-        n_lines = para_end - para_start + 1
-        if n_lines < self.min_lines:
+        if para_end - para_start + 1 < self.min_lines:
             return None
 
-        result = [
-            box
-            for line in lines[para_start : para_end + 1]
-            for box in line
-        ]
-        return result if result else None
+        return sorted_lines[para_start : para_end + 1]
 
 
 # ---------------------------------------------------------------------------
@@ -409,26 +291,26 @@ class TableRowDetector(RangeDetector):
 
     def detect(
         self,
-        boxes: Sequence[BoundingBox],
+        lines: Sequence[BoundingBox],
         cursor_x: int,
         cursor_y: int,
     ) -> list[BoundingBox] | None:
-        if not boxes:
+        if not lines:
             return None
 
-        # Cursor must be inside a box.
+        # Cursor must be inside a line box.
         anchor = next(
-            (b for b in boxes if b.contains(cursor_x, cursor_y)), None
+            (b for b in lines if b.contains(cursor_x, cursor_y)), None
         )
         if anchor is None:
             return None
 
-        med_h = statistics.median(b.h for b in boxes)
+        med_h = statistics.median(b.h for b in lines)
         band_half = self.band_ratio * med_h
 
-        # Candidate boxes in the same horizontal band.
+        # Candidate lines in the same horizontal band.
         row_candidates = [
-            b for b in boxes
+            b for b in lines
             if abs(b.center_y - anchor.center_y) <= band_half
         ]
         if not (self.min_cols <= len(row_candidates) <= self.max_cols):
@@ -454,102 +336,42 @@ class TableRowDetector(RangeDetector):
 
 
 # ---------------------------------------------------------------------------
-# Internal helper – character-width estimator
+# Built-in detector 3 – Single line (default fallback)
 # ---------------------------------------------------------------------------
 
-def _estimate_char_width(anchor: BoundingBox, line: list[BoundingBox]) -> float:
-    """Estimate the character width (pixels/char) from boxes on *line*.
+class SingleLineDetector(RangeDetector):
+    """Return the single OCR line nearest to the cursor.
 
-    For each box with non-empty text the per-character width is
-    ``box.w / len(box.text)``.  The median over all such boxes on the line
-    is returned.  Falls back to ``anchor.h`` (reasonable for square CJK
-    glyphs) when no box on the line has usable text.
-    """
-    widths: list[float] = []
-    for b in line:
-        n = len(b.text.strip())
-        if n > 0:
-            widths.append(b.w / n)
-    if widths:
-        return statistics.median(widths)
-    return float(anchor.h) if anchor.h > 0 else 16.0
-
-
-# ---------------------------------------------------------------------------
-# Built-in detector 3 – Single box (default fallback)
-# ---------------------------------------------------------------------------
-
-class SingleBoxDetector(RangeDetector):
-    """Return boxes near the cursor, clustered by estimated character width.
-
-    This is the guaranteed fallback.  It finds the nearest box, estimates
-    the local character width from that box's visual line, then collects all
-    boxes on that line whose horizontal gap to their immediate neighbour is
-    ≤ ``gap_chars × char_width``.  Only the cluster containing the nearest
-    box is returned, so separate UI elements on the same horizontal band
-    (e.g. a player name on the left vs. an HP number on the right) are not
-    merged together.
-
-    Example: ``AUTO`` is recognized as ``A [ 0`` by OCR — three tightly packed boxes of width ≈ 16 px each.
-    ``char_width ≈ 16``, ``threshold = 3 × 16 = 48 px``.  The pixel gaps
-    between the boxes are « 48, so all three are included, so the area includes ``AUTO``.
+    This is the guaranteed fallback.  It finds the line whose bounding box
+    is closest to the cursor and returns it as a single-element list.  When
+    the nearest line is further than ``max_distance`` pixels, ``None`` is
+    returned.
 
     Parameters
     ----------
     max_distance:
-        Maximum distance (pixels) from the cursor to the nearest point on the
-        nearest box.  Returns ``None`` when exceeded.  Default 80 px.
-    gap_chars:
-        Maximum inter-box gap expressed in estimated character widths.
-        Default 3.
+        Maximum distance (pixels) from the cursor to the nearest point on
+        the nearest line box.  Returns ``None`` when exceeded.  Default 80 px.
     """
 
-    def __init__(self, max_distance: float = 80.0, gap_chars: float = 3.0) -> None:
+    def __init__(self, max_distance: float = 80.0) -> None:
         self.max_distance = max_distance
-        self.gap_chars = gap_chars
 
     def detect(
         self,
-        boxes: Sequence[BoundingBox],
+        lines: Sequence[BoundingBox],
         cursor_x: int,
         cursor_y: int,
     ) -> list[BoundingBox] | None:
-        if not boxes:
+        if not lines:
             return None
-        nearest = min(
-            boxes, key=lambda b: b.distance_to_point(cursor_x, cursor_y)
-        )
+        nearest = min(lines, key=lambda b: b.distance_to_point(cursor_x, cursor_y))
         if nearest.distance_to_point(cursor_x, cursor_y) > self.max_distance:
             return None
+        return [nearest]
 
-        # Identify the visual line containing *nearest*.
-        lines = _group_into_lines(list(boxes))
-        cursor_line: list[BoundingBox] = [nearest]
-        for line in lines:
-            if nearest in line:
-                cursor_line = sorted(line, key=lambda b: b.x)
-                break
 
-        char_width = _estimate_char_width(nearest, cursor_line)
-        threshold = self.gap_chars * char_width
-
-        # Split the line into gap-separated clusters.
-        clusters: list[list[BoundingBox]] = []
-        current: list[BoundingBox] = [cursor_line[0]]
-        for prev, cur in zip(cursor_line, cursor_line[1:]):
-            gap = cur.x - prev.right
-            if gap <= threshold:
-                current.append(cur)
-            else:
-                clusters.append(current)
-                current = [cur]
-        clusters.append(current)
-
-        # Return the cluster that contains *nearest*.
-        for cluster in clusters:
-            if nearest in cluster:
-                return cluster
-        return [nearest]  # unreachable in practice
+SingleBoxDetector = SingleLineDetector  # backwards-compatible alias
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +381,7 @@ class SingleBoxDetector(RangeDetector):
 DEFAULT_DETECTORS: list[RangeDetector] = [
     ParagraphDetector(),
     TableRowDetector(),
-    SingleBoxDetector(),
+    SingleLineDetector(),
 ]
 """Default rule chain, priority high → low.
 
@@ -568,33 +390,29 @@ Append or insert custom detectors to customise behaviour per game layout.
 """
 
 
-def merge_boxes_text(boxes: Sequence[BoundingBox]) -> str:
-    """Merge bounding-box texts into a single string, grouped by visual line.
+def merge_boxes_text(lines: Sequence[BoundingBox]) -> str:
+    """Merge OCR line texts into a single string.
 
-    Boxes on the same visual line (determined by vertical overlap) are
-    concatenated left-to-right **without** a space separator — appropriate
-    for CJK scripts where characters are not space-delimited.  Lines are
-    joined with ``\\n``.
+    Lines are sorted top-to-bottom and joined with ``\\n``.
 
     Parameters
     ----------
-    boxes:
-        The bounding boxes whose ``.text`` to merge (typically the output
-        of :func:`run_detectors`).
+    lines:
+        The line bounding boxes whose ``.text`` to merge (typically the
+        output of :func:`run_detectors`).
 
     Returns
     -------
     str
-        The merged text.  Empty string when *boxes* is empty.
+        The merged text.  Empty string when *lines* is empty.
     """
-    if not boxes:
+    if not lines:
         return ""
-    lines = _group_into_lines(list(boxes))
-    return "\n".join("".join(b.text for b in line) for line in lines)
+    return "\n".join(b.text for b in sorted(lines, key=lambda b: b.y))
 
 
 def run_detectors(
-    boxes: Sequence[BoundingBox],
+    lines: Sequence[BoundingBox],
     cursor_x: int,
     cursor_y: int,
     detectors: Sequence[RangeDetector] = DEFAULT_DETECTORS,
@@ -604,22 +422,22 @@ def run_detectors(
     Returns
     -------
     tuple[list[BoundingBox], str]
-        The detected boxes and the class name of the detector that matched.
-        Returns ``([], "")`` when *boxes* is empty or all detectors return
-        ``None`` (which should not happen with the default chain that ends
-        with ``SingleBoxDetector``).
+        The detected line boxes and the class name of the detector that
+        matched.  Returns ``([], "")`` when *lines* is empty or all
+        detectors return ``None`` (which should not happen with the default
+        chain that ends with :class:`SingleLineDetector`).
 
     Parameters
     ----------
-    boxes:
-        All bounding boxes for the current OCR frame.
+    lines:
+        OCR-provided line bounding boxes for the current frame.
     cursor_x, cursor_y:
-        Cursor position in the same coordinate space as *boxes*.
+        Cursor position in the same coordinate space as *lines*.
     detectors:
         Detector chain to use.  Defaults to :data:`DEFAULT_DETECTORS`.
     """
     for detector in detectors:
-        result = detector.detect(boxes, cursor_x, cursor_y)
+        result = detector.detect(lines, cursor_x, cursor_y)
         if result is not None:
             return result, type(detector).__name__
     return [], ""

@@ -15,9 +15,9 @@ from src.ocr.range_detectors import (
     DEFAULT_DETECTORS,
     ParagraphDetector,
     RangeDetector,
-    SingleBoxDetector,
+    SingleBoxDetector,  # backwards-compat alias
+    SingleLineDetector,
     TableRowDetector,
-    _group_into_lines,
     run_detectors,
 )
 
@@ -68,247 +68,147 @@ class TestBoundingBox:
 
 
 # ==========================================================================
-# _group_into_lines
+# SingleLineDetector
 # ==========================================================================
 
-class TestGroupIntoLines:
-    def test_empty(self):
-        assert _group_into_lines([]) == []
-
-    def test_single_box(self):
-        boxes = [BoundingBox(0, 0, 50, 20)]
-        lines = _group_into_lines(boxes)
-        assert len(lines) == 1
-        assert lines[0] == boxes
-
-    def test_two_separate_lines(self):
-        # Line 1: y=0-20; Line 2: y=30-50 — no overlap
-        a = BoundingBox(0, 0, 50, 20)
-        b = BoundingBox(0, 30, 50, 20)
-        lines = _group_into_lines([a, b])
-        assert len(lines) == 2
-
-    def test_same_line_overlap(self):
-        # Both at y=5-25 and y=8-28 — overlap > 50 % of smaller height
-        a = BoundingBox(0, 5, 50, 20)
-        b = BoundingBox(60, 8, 50, 20)
-        lines = _group_into_lines([a, b])
-        assert len(lines) == 1
-        assert len(lines[0]) == 2
-
-    def test_line_sorted_left_to_right(self):
-        a = BoundingBox(100, 0, 50, 20)
-        b = BoundingBox(0, 2, 50, 20)
-        lines = _group_into_lines([a, b])
-        assert lines[0][0].x == 0
-        assert lines[0][1].x == 100
-
-    def test_three_lines(self):
-        boxes = [
-            BoundingBox(0, 0, 100, 20),
-            BoundingBox(100, 2, 100, 20),   # same line as above
-            BoundingBox(0, 35, 100, 20),    # new line
-            BoundingBox(0, 70, 100, 20),    # new line
-        ]
-        lines = _group_into_lines(boxes)
-        assert len(lines) == 3
-        assert len(lines[0]) == 2
-
-
-# ==========================================================================
-# SingleBoxDetector
-# ==========================================================================
-
-class TestSingleBoxDetector:
-    def _make_boxes(self):
-        # A (0–50) and B (100–150) share the same visual line (y 0–20).
-        # char_width = median(50/1, 50/1) = 50 → threshold = 3×50 = 150.
-        # Gap between A and B = 100-50 = 50 ≤ 150 → same cluster.
-        # C (0–50, y 50–70) is on a separate line below.
-        return [
-            BoundingBox(0, 0, 50, 20, "A"),
-            BoundingBox(100, 0, 50, 20, "B"),
-            BoundingBox(0, 50, 50, 20, "C"),
-        ]
-
-    def test_cursor_inside_box_clusters_nearby(self):
-        det = SingleBoxDetector()
-        boxes = self._make_boxes()
-        # Cursor inside A — gap(A,B)=50 ≤ threshold(150), so [A, B] returned.
-        result = det.detect(boxes, 25, 10)
-        assert result == [boxes[0], boxes[1]]
-
-    def test_cursor_nearest_box_clusters_nearby(self):
-        det = SingleBoxDetector()
-        boxes = self._make_boxes()
-        # Cursor closer to B — nearest=B; same cluster as A since gap ≤ threshold.
-        result = det.detect(boxes, 90, 10)
-        assert result == [boxes[0], boxes[1]]
-
-    def test_single_line_tight_glyphs(self):
-        """Regression: tightly packed single-line glyphs like 'A [ 0'.
-
-        char_width = median(19/1, 12/1, 18/1) = 18  →  threshold = 54 px.
-        gap(A,[) = 0, gap([,0) = 22 — both ≤ 54 → all three in one cluster.
-        """
-        det = SingleBoxDetector()
-        a = BoundingBox(755, 634, 19, 20, "A")
-        bracket = BoundingBox(774, 634, 12, 20, "[")
-        zero = BoundingBox(808, 634, 18, 20, "0")
-        boxes = [a, bracket, zero]
-        result = det.detect(boxes, 760, 640)
-        assert result == [a, bracket, zero]
-
-    def test_large_gap_separates_clusters(self):
-        """Two groups on the same horizontal band separated by a large gap
-        should each be returned independently depending on cursor position.
-
-        char_width = 50 → threshold = 150.
-        gap between X and Y = 300 - 50 = 250 > 150 → separate clusters.
-        """
-        det = SingleBoxDetector()
-        x_box = BoundingBox(0,   0, 50, 20, "X")
-        y_box = BoundingBox(300, 0, 50, 20, "Y")
-        boxes = [x_box, y_box]
-        assert det.detect(boxes, 25, 10) == [x_box]
-        assert det.detect(boxes, 320, 10) == [y_box]
-
-    def test_empty_boxes(self):
-        det = SingleBoxDetector()
+class TestSingleLineDetector:
+    def test_empty_returns_none(self):
+        det = SingleLineDetector()
         assert det.detect([], 50, 50) is None
 
-    def test_beyond_max_distance(self):
-        det = SingleBoxDetector(max_distance=10.0)
-        boxes = [BoundingBox(0, 0, 50, 20)]
-        result = det.detect(boxes, 200, 200)
-        assert result is None
+    def test_nearest_line_above(self):
+        det = SingleLineDetector()
+        a = BoundingBox(0, 0, 100, 20, "line A")
+        b = BoundingBox(0, 50, 100, 20, "line B")
+        result = det.detect([a, b], 50, 5)
+        assert result == [a]
 
-    def test_within_max_distance_single_box(self):
-        det = SingleBoxDetector(max_distance=100.0)
+    def test_nearest_line_below(self):
+        det = SingleLineDetector()
+        a = BoundingBox(0, 0, 100, 20, "line A")
+        b = BoundingBox(0, 50, 100, 20, "line B")
+        result = det.detect([a, b], 50, 55)
+        assert result == [b]
+
+    def test_beyond_max_distance_returns_none(self):
+        det = SingleLineDetector(max_distance=10.0)
+        boxes = [BoundingBox(0, 0, 50, 20)]
+        assert det.detect(boxes, 200, 200) is None
+
+    def test_within_max_distance(self):
+        det = SingleLineDetector(max_distance=100.0)
         boxes = [BoundingBox(0, 0, 50, 20)]
         result = det.detect(boxes, 80, 10)
         assert result == [boxes[0]]
 
+    def test_single_box_alias(self):
+        """SingleBoxDetector is a backwards-compat alias for SingleLineDetector."""
+        assert SingleBoxDetector is SingleLineDetector
 
-# ==========================================================================
-# ParagraphDetector
-# ==========================================================================
 
-def _make_paragraph_boxes(
+
+def _make_paragraph_lines(
     n_lines: int = 3,
-    n_words: int = 3,
     line_h: int = 20,
     line_gap: int = 5,
-    word_w: int = 80,
-    word_gap: int = 5,
+    line_w: int = 240,
     x0: int = 10,
     y0: int = 10,
 ) -> list[BoundingBox]:
-    """Build a synthetic paragraph layout."""
-    boxes = []
-    for row in range(n_lines):
-        y = y0 + row * (line_h + line_gap)
-        for col in range(n_words):
-            x = x0 + col * (word_w + word_gap)
-            boxes.append(BoundingBox(x, y, word_w, line_h))
-    return boxes
+    """Build a synthetic paragraph as one BoundingBox per OCR line."""
+    return [
+        BoundingBox(x0, y0 + i * (line_h + line_gap), line_w, line_h)
+        for i in range(n_lines)
+    ]
 
 
 class TestParagraphDetector:
     def test_detects_paragraph(self):
         det = ParagraphDetector()
-        boxes = _make_paragraph_boxes(n_lines=3)
-        # Cursor inside middle line
-        mid_y = 10 + 25 + 10  # y0 + (line_h + gap) + some offset
-        result = det.detect(boxes, 50, mid_y)
+        lines = _make_paragraph_lines(n_lines=3)
+        # Cursor inside the first line (y=10..30 → center=15)
+        result = det.detect(lines, 50, 15)
         assert result is not None
-        assert len(result) == 9  # 3 lines × 3 words
+        assert len(result) == 3
 
     def test_single_line_below_min(self):
         det = ParagraphDetector(min_lines=2)
-        boxes = _make_paragraph_boxes(n_lines=1)
-        result = det.detect(boxes, 50, 20)
+        lines = _make_paragraph_lines(n_lines=1)
+        result = det.detect(lines, 50, 20)
         assert result is None
 
     def test_cursor_far_from_text(self):
         det = ParagraphDetector()
-        boxes = _make_paragraph_boxes(n_lines=3, y0=10)
-        # Cursor at y=500, far below all text
-        result = det.detect(boxes, 50, 500)
+        lines = _make_paragraph_lines(n_lines=3, y0=10)
+        result = det.detect(lines, 50, 500)
         assert result is None
 
     def test_height_mismatch_breaks_paragraph(self):
-        """Lines with inconsistent heights should not be merged."""
+        """A title line with very different height is excluded from paragraph."""
         det = ParagraphDetector(height_ratio=0.1)
-        # Two lines with very different heights
-        line1 = [BoundingBox(0, 0, 100, 20)]
-        line2 = [BoundingBox(0, 30, 100, 80)]  # 80 px height vs 20 → mismatch
-        result = det.detect(line1 + line2, 50, 10)
-        # Should not merge into 2 lines because height differs > 10%
-        assert result is None  # only 1 line → below min_lines
+        title = BoundingBox(0, 0,  200, 40, "title")
+        line1 = BoundingBox(0, 50, 200, 20, "dialog 1")
+        line2 = BoundingBox(0, 75, 200, 20, "dialog 2")
+        # Cursor on line1 → anchor=line1; growing up, title h=40 vs median=20 → mismatch
+        result = det.detect([title, line1, line2], 50, 55)
+        assert result is not None
+        assert title not in result
+        assert line1 in result
+        assert line2 in result
 
     def test_large_gap_breaks_paragraph(self):
         """Lines separated by a large gap should not be merged."""
         det = ParagraphDetector(gap_ratio=0.5)
-        # Line 1 at y=0, line 2 at y=200 (gap=180, way > 0.5 * 20)
-        box1 = BoundingBox(0, 0, 100, 20)
-        box2 = BoundingBox(0, 200, 100, 20)
-        result = det.detect([box1, box2], 50, 10)
+        line1 = BoundingBox(0, 0,   200, 20)
+        line2 = BoundingBox(0, 200, 200, 20)  # gap=180 >> 0.5×20=10
+        result = det.detect([line1, line2], 50, 10)
         assert result is None
 
     def test_two_line_paragraph(self):
         det = ParagraphDetector(min_lines=2)
-        boxes = _make_paragraph_boxes(n_lines=2)
-        cursor_y = 10 + 5  # inside first line
-        result = det.detect(boxes, 50, cursor_y)
+        lines = _make_paragraph_lines(n_lines=2)
+        result = det.detect(lines, 50, 15)
         assert result is not None
-        assert len(result) == 6  # 2 lines × 3 words
+        assert len(result) == 2
 
-    def test_fragmented_line_with_title(self):
-        """OCR-fragmented scenario: a large-font name plus two dialogue
-        lines where the first dialogue line is fragmented into narrow boxes
-        (e.g. missing punctuation).  The paragraph should include both
-        dialogue lines but exclude the name.
+    def test_title_excluded_from_paragraph(self):
+        """A large-font title above the dialog should be excluded.
 
-        Layout:
-          Line 0: [馬飼いの青年]           h=40  (large title)
-          Line 1: [……はあ] [僕の馬……]  h=25  (fragmented dialogue)
-          Line 2: [大事に育てたのになあ……]  h=25  (full-width dialogue)
+        Layout (OCR line boxes):
+          line 0: y=10,  h=40  (large title)
+          line 1: y=60,  h=20  (dialog)
+          line 2: y=85,  h=20  (dialog)
         """
         det = ParagraphDetector(min_lines=2)
         title = BoundingBox(100, 10, 200, 40, "馬飼いの青年")
-        frag1 = BoundingBox(100, 65, 60,  25, "……はあ")
-        frag2 = BoundingBox(250, 65, 80,  25, "僕の馬……")
-        line2 = BoundingBox(50,  100, 300, 25, "大事に育てたのになあ……")
-        boxes = [title, frag1, frag2, line2]
-
-        # Cursor on the second dialogue line.
-        result = det.detect(boxes, 200, 110)
+        line1 = BoundingBox(50,  60, 300, 20, "……はあ、僕の馬……")
+        line2 = BoundingBox(50,  85, 300, 20, "大事に育てたのになあ……")
+        result = det.detect([title, line1, line2], 200, 90)
         assert result is not None
-        # Should include frag1, frag2, line2 but NOT title.
         assert title not in result
-        assert frag1 in result
-        assert frag2 in result
+        assert line1 in result
         assert line2 in result
 
-    def test_fragmented_line_cursor_on_fragment(self):
-        """Same fragmented layout, but cursor is on a narrow fragment.
-        The detector should still find the paragraph.
-        """
-        det = ParagraphDetector(min_lines=2)
+    def test_cursor_on_title_detects_title_only(self):
+        """Cursor on the title: anchor=title, dialog lines have different height
+        so they are excluded; only 1 line → below min_lines → None."""
+        det = ParagraphDetector(min_lines=2, height_ratio=0.1)
         title = BoundingBox(100, 10, 200, 40, "馬飼いの青年")
-        frag1 = BoundingBox(100, 65, 60,  25, "……はあ")
-        frag2 = BoundingBox(250, 65, 80,  25, "僕の馬……")
-        line2 = BoundingBox(50,  100, 300, 25, "大事に育てたのになあ……")
-        boxes = [title, frag1, frag2, line2]
+        line1 = BoundingBox(50,  60, 300, 20, "……はあ、僕の馬……")
+        line2 = BoundingBox(50,  85, 300, 20, "大事に育てたのになあ……")
+        result = det.detect([title, line1, line2], 200, 30)
+        # title alone does not reach min_lines=2
+        assert result is None
 
-        # Cursor on the fragment "……はあ".
-        result = det.detect(boxes, 130, 75)
+    def test_cursor_on_anchor_in_middle_expands_both_ways(self):
+        """Cursor on the middle line; paragraph should grow both up and down."""
+        det = ParagraphDetector(min_lines=2)
+        lines = _make_paragraph_lines(n_lines=5)
+        # line index 2: y = 10 + 2*25 = 60, center ≈ 70
+        mid = 10 + 2 * 25 + 8
+        result = det.detect(lines, 50, mid)
         assert result is not None
-        assert title not in result
-        assert frag1 in result
-        assert frag2 in result
-        assert line2 in result
+        assert len(result) == 5
 
 
 # ==========================================================================
@@ -392,31 +292,31 @@ class TestRunDetectors:
     def test_empty_boxes_returns_empty(self):
         assert run_detectors([], 0, 0) == ([], "")
 
-    def test_falls_through_to_single_box(self):
-        # A single isolated box – ParagraphDetector and TableRowDetector miss,
-        # SingleBoxDetector catches it.
-        boxes = [BoundingBox(50, 50, 100, 30, "hello")]
-        result, name = run_detectors(boxes, 100, 65)
-        assert result == boxes
-        assert name == "SingleBoxDetector"
+    def test_falls_through_to_single_line(self):
+        # A single isolated line – ParagraphDetector and TableRowDetector miss,
+        # SingleLineDetector catches it.
+        lines = [BoundingBox(50, 50, 100, 30, "hello")]
+        result, name = run_detectors(lines, 100, 65)
+        assert result == lines
+        assert name == "SingleLineDetector"
 
     def test_custom_detector_takes_priority(self):
         # RangeDetector is already imported at module level – no re-import needed.
         class AlwaysFirst(RangeDetector):
-            def detect(self, boxes, cx, cy):
-                return [boxes[0]] if boxes else None
+            def detect(self, lines, cx, cy):
+                return [lines[0]] if lines else None
 
-        boxes = _make_paragraph_boxes(n_lines=3)
-        custom_chain = [AlwaysFirst(), SingleBoxDetector()]
-        result, name = run_detectors(boxes, 50, 20, detectors=custom_chain)
+        lines = _make_paragraph_lines(n_lines=3)
+        custom_chain = [AlwaysFirst(), SingleLineDetector()]
+        result, name = run_detectors(lines, 50, 20, detectors=custom_chain)
         assert len(result) == 1
         assert name == "AlwaysFirst"
 
     def test_paragraph_wins_over_single(self):
-        boxes = _make_paragraph_boxes(n_lines=3)
+        lines = _make_paragraph_lines(n_lines=3)
         cursor_y = 10 + 5  # inside first line
-        result, name = run_detectors(boxes, 50, cursor_y)
-        assert len(result) == 9  # whole paragraph, not just 1 box
+        result, name = run_detectors(lines, 50, cursor_y)
+        assert len(result) == 3  # whole paragraph, not just 1 line
         assert name == "ParagraphDetector"
 
     def test_default_detectors_nonempty(self):

@@ -198,7 +198,7 @@ class _PipelineWorker(QObject):
         region_text = ""
         detector_name = ""
         crop_rect: tuple[int, int, int, int] | None = None
-        if boxes:
+        if line_boxes:
             _pt = _POINT()
             _user32_ui.GetCursorPos(ctypes.byref(_pt))
             cr = self._target.capture_rect
@@ -210,7 +210,7 @@ class _PipelineWorker(QObject):
                 cursor_x = img.width // 2
                 cursor_y = int(img.height * 0.75)
 
-            dialog_boxes, detector_name = run_detectors(boxes, cursor_x, cursor_y)
+            dialog_boxes, detector_name = run_detectors(line_boxes, cursor_x, cursor_y)
             if dialog_boxes:
                 region_text = merge_boxes_text(dialog_boxes)
                 xs  = [b.x       for b in dialog_boxes]
