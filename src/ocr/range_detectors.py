@@ -7,10 +7,9 @@ non-``None`` result.
 Built-in rules (priority order)
 --------------------------------
 1. :class:`ParagraphDetector`
-   Uniform line height + tight vertical spacing → whole paragraph.
-2. :class:`TableRowDetector`
-   2-4 lines aligned on the same horizontal baseline → full table row.
-3. :class:`SingleLineDetector`
+   Character-size proximity BFS → paragraph text and table rows alike.
+   ``TableRowDetector`` is a backwards-compatible alias.
+2. :class:`SingleLineDetector`
    Fallback: the single OCR line nearest to the cursor.
    ``SingleBoxDetector`` is a backwards-compatible alias.
 
@@ -34,7 +33,6 @@ the desired priority position in ``DEFAULT_DETECTORS``::
 from __future__ import annotations
 
 import math
-import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Sequence
@@ -119,175 +117,91 @@ class RangeDetector(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Built-in detector 1 – Paragraph
+# Character-size estimator
+# ---------------------------------------------------------------------------
+
+def _char_size(line: BoundingBox) -> tuple[float, float]:
+    """Estimate ``(char_height, char_width)`` from a line bounding box.
+
+    *char_height* is the line's pixel height, which matches the font cap
+    height for CJK glyphs.  *char_width* is derived from the line width
+    divided by the character count found in ``.text``; when the text is
+    empty (e.g. a box with no recognised text) the line height is used as
+    a fallback (CJK characters are approximately square).
+    """
+    char_h = float(line.h)
+    n = len(line.text.replace(" ", ""))
+    char_w = line.w / n if n > 0 else char_h
+    return char_h, char_w
+
+
+# ---------------------------------------------------------------------------
+# Built-in detector 1 – Paragraph / table row (unified)
 # ---------------------------------------------------------------------------
 
 class ParagraphDetector(RangeDetector):
-    """Detect a paragraph: consecutive OCR lines with uniform height and tight
-    vertical spacing.
+    """Detect a group of OCR lines that belong together using character-size
+    proximity.
 
-    The input *lines* are OCR-provided line bounding boxes (one box per text
-    line).  No word-level re-grouping is performed; that is handled upstream
-    by :class:`~src.ocr.windows_ocr.WindowsOcr`.
+    This single detector handles both vertically-stacked paragraph text and
+    horizontally-arranged table rows because the same two-axis proximity
+    test naturally covers both layouts.
 
     Algorithm
     ---------
-    1. Sort lines top-to-bottom and find the anchor (the line whose vertical
-       extent ± ``cursor_margin`` contains *cursor_y*).
-    2. Grow upward and downward from the anchor, accepting each adjacent line
-       only when **both** conditions hold:
+    1. **Anchor**: find the OCR line whose bounding box contains the cursor
+       (expanded by ``cursor_margin`` pixels on each side).  If no line
+       contains the cursor, return ``None`` and let :class:`SingleLineDetector`
+       handle the fall-through.
+    2. **Character-size reference**: estimate ``(char_h, char_w)`` from the
+       anchor line via :func:`_char_size`.
+    3. **BFS flood-fill**: starting from the anchor, iteratively examine
+       every not-yet-grouped line against the *current frontier*.  A
+       candidate is added to the group when **all three** conditions hold:
 
-       a. *Height compatibility* – the candidate line's height is within
-          ``height_ratio`` of the **accumulated paragraph median** height.
+       a. *Font-size compatibility* – the candidate’s char height deviates
+          from the anchor’s by at most ``size_ratio`` (default ±40 %).
 
-       b. *Gap uniformity* – the pixel gap to the candidate is ≤
-          ``gap_ratio × local_median_h`` (absolute) **and** (once at least
-          one gap has been accepted) ≤ ``gap_outlier_scale × median(accepted
-          gaps)`` (relative outlier
-          gap).  Only applied once at least one gap is already accepted.
+       b. *Vertical proximity* – the pixel gap between the candidate and the
+          current frontier box is ≤ ``max_v_gap_chars × char_h``
+          (default 1 char height).
+
+       c. *Horizontal proximity* – the pixel gap is ≤
+          ``max_h_gap_chars × char_w`` (default 4 char widths).
+
+       Both gap tests use the *minimum* positive distance between the two
+       box edges (0 when the boxes overlap on that axis), so overlapping
+       boxes always pass.
+
+    The flood-fill propagates through intermediate lines, so a 5-line
+    paragraph is fully captured even though lines 1 and 5 are not directly
+    adjacent.
 
     Parameters
     ----------
-    height_ratio:
-        Max allowed fractional deviation of candidate height vs accumulated
-        paragraph median height.  Default 0.5.
-    gap_ratio:
-        Absolute ceiling: max vertical gap as a multiple of local median line
-        height.  Default 1.5.
-    gap_outlier_scale:
-        Relative outlier threshold.  Set to 0 to disable.  Default 2.5.
-    min_lines:
-        Minimum number of consecutive matching lines to qualify.  Default 2.
+    max_v_gap_chars:
+        Maximum vertical gap in units of anchor char height.  Default 1.0.
+    max_h_gap_chars:
+        Maximum horizontal gap in units of anchor char width.  Default 4.0.
+    size_ratio:
+        Maximum relative deviation of a candidate’s char height from the
+        anchor’s.  Default 0.4 (±40 %).
     cursor_margin:
-        Extra pixels around each line when testing cursor proximity.  Default 8.
+        Extra pixels added around each line when testing cursor containment.
+        Default 8 px.
     """
 
     def __init__(
         self,
-        height_ratio: float = 0.5,
-        gap_ratio: float = 1.5,
-        gap_outlier_scale: float = 2.5,
-        min_lines: int = 2,
+        max_v_gap_chars: float = 0.5,
+        max_h_gap_chars: float = 4.0,
+        size_ratio: float = 0.4,
         cursor_margin: int = 8,
     ) -> None:
-        self.height_ratio = height_ratio
-        self.gap_ratio = gap_ratio
-        self.gap_outlier_scale = gap_outlier_scale
-        self.min_lines = min_lines
+        self.max_v_gap_chars = max_v_gap_chars
+        self.max_h_gap_chars = max_h_gap_chars
+        self.size_ratio = size_ratio
         self.cursor_margin = cursor_margin
-
-    def detect(
-        self,
-        lines: Sequence[BoundingBox],
-        cursor_x: int,
-        cursor_y: int,
-    ) -> list[BoundingBox] | None:
-        sorted_lines = sorted(lines, key=lambda b: b.y)
-        if len(sorted_lines) < self.min_lines:
-            return None
-
-        # Find the anchor line whose vertical extent contains the cursor.
-        anchor_idx: int | None = None
-        for i, line in enumerate(sorted_lines):
-            if line.y - self.cursor_margin <= cursor_y <= line.bottom + self.cursor_margin:
-                anchor_idx = i
-                break
-        if anchor_idx is None:
-            return None
-
-        # Accumulated paragraph heights (shared between both grow passes).
-        all_heights: list[int] = [sorted_lines[anchor_idx].h]
-
-        def _height_ok(candidate: BoundingBox) -> bool:
-            para_med_h = statistics.median(all_heights)
-            if para_med_h == 0:
-                return False
-            return abs(candidate.h - para_med_h) / para_med_h <= self.height_ratio
-
-        def _gap_ok(
-            upper: BoundingBox,
-            lower: BoundingBox,
-            accepted_gaps: list[float],
-        ) -> bool:
-            gap = lower.y - upper.bottom
-            med_h = statistics.median([upper.h, lower.h])
-            if gap > self.gap_ratio * med_h:
-                return False
-            if accepted_gaps and self.gap_outlier_scale > 0:
-                ref = statistics.median(accepted_gaps)
-                if ref > 0 and gap > self.gap_outlier_scale * ref:
-                    return False
-            return True
-
-        def _grow(start: int, step: int) -> tuple[int, list[float]]:
-            nonlocal all_heights
-            idx = start
-            gaps: list[float] = []
-            while True:
-                nxt = idx + step
-                if not (0 <= nxt < len(sorted_lines)):
-                    break
-                candidate = sorted_lines[nxt]
-                upper = sorted_lines[min(idx, nxt)]
-                lower = sorted_lines[max(idx, nxt)]
-                if not _height_ok(candidate):
-                    break
-                if not _gap_ok(upper, lower, gaps):
-                    break
-                gaps.append(max(0.0, lower.y - upper.bottom))
-                all_heights.append(candidate.h)
-                idx = nxt
-            return idx, gaps
-
-        para_start, _ = _grow(anchor_idx, -1)
-        para_end,   _ = _grow(anchor_idx, +1)
-
-        if para_end - para_start + 1 < self.min_lines:
-            return None
-
-        return sorted_lines[para_start : para_end + 1]
-
-
-# ---------------------------------------------------------------------------
-# Built-in detector 2 – Table row
-# ---------------------------------------------------------------------------
-
-class TableRowDetector(RangeDetector):
-    """Detect a table row: 2-4 boxes on the same horizontal band.
-
-    Conditions
-    ----------
-    * The cursor must be over one of the candidate boxes.
-    * 2-4 boxes share a y-band (centers within ``band_ratio * h`` of each
-      other) AND have roughly aligned bottom edges.
-    * Boxes are horizontally separated (not merged into one cluster).
-
-    Parameters
-    ----------
-    band_ratio:
-        Vertical band half-width as a multiple of median box height.  Default 0.5.
-    bottom_align_ratio:
-        Max bottom-edge misalignment as a fraction of median height.  Default 0.3.
-    min_cols, max_cols:
-        Accepted column count.  Default 2–4.
-    min_h_gap_ratio:
-        Minimum horizontal gap between adjacent row boxes as a fraction of
-        median box width.  Ensures boxes are truly separate columns.  Default 0.3.
-    """
-
-    def __init__(
-        self,
-        band_ratio: float = 0.5,
-        bottom_align_ratio: float = 0.3,
-        min_cols: int = 2,
-        max_cols: int = 4,
-        min_h_gap_ratio: float = 0.3,
-    ) -> None:
-        self.band_ratio = band_ratio
-        self.bottom_align_ratio = bottom_align_ratio
-        self.min_cols = min_cols
-        self.max_cols = max_cols
-        self.min_h_gap_ratio = min_h_gap_ratio
 
     def detect(
         self,
@@ -298,41 +212,58 @@ class TableRowDetector(RangeDetector):
         if not lines:
             return None
 
-        # Cursor must be inside a line box.
-        anchor = next(
-            (b for b in lines if b.contains(cursor_x, cursor_y)), None
-        )
+        # 1. Find anchor: OCR line whose box (expanded by cursor_margin) contains
+        #    the cursor.  If the cursor is not on any line, yield to SingleLineDetector.
+        m = self.cursor_margin
+        anchor: BoundingBox | None = None
+        for line in lines:
+            if (line.x - m <= cursor_x <= line.right  + m
+                    and line.y - m <= cursor_y <= line.bottom + m):
+                anchor = line
+                break
         if anchor is None:
             return None
 
-        med_h = statistics.median(b.h for b in lines)
-        band_half = self.band_ratio * med_h
+        # 2. Derive per-character dimensions from the anchor line.
+        anchor_char_h, anchor_char_w = _char_size(anchor)
+        max_v = self.max_v_gap_chars * anchor_char_h
+        max_h = self.max_h_gap_chars * anchor_char_w
 
-        # Candidate lines in the same horizontal band.
-        row_candidates = [
-            b for b in lines
-            if abs(b.center_y - anchor.center_y) <= band_half
-        ]
-        if not (self.min_cols <= len(row_candidates) <= self.max_cols):
-            return None
+        # 3. BFS flood-fill.  Track membership by object identity (BoundingBox
+        #    is a plain @dataclass so it is not hashable; id() is safe here).
+        seen: set[int] = {id(anchor)}
+        group: list[BoundingBox] = [anchor]
+        queue: list[BoundingBox] = [anchor]
 
-        # Bottom-edge alignment check.
-        med_bottom = statistics.median(b.bottom for b in row_candidates)
-        if any(
-            abs(b.bottom - med_bottom) > self.bottom_align_ratio * med_h
-            for b in row_candidates
-        ):
-            return None
+        while queue:
+            current = queue.pop(0)
+            for candidate in lines:
+                if id(candidate) in seen:
+                    continue
 
-        # Ensure boxes are genuinely spaced (not one fused cluster).
-        sorted_row = sorted(row_candidates, key=lambda b: b.x)
-        med_w = statistics.median(b.w for b in sorted_row)
-        for a, b in zip(sorted_row, sorted_row[1:]):
-            gap = b.x - a.right
-            if gap < self.min_h_gap_ratio * med_w:
-                return None
+                # Font-size gate: compare candidate height against anchor's.
+                cand_h, _ = _char_size(candidate)
+                if anchor_char_h > 0:
+                    if abs(cand_h - anchor_char_h) / anchor_char_h > self.size_ratio:
+                        continue
 
-        return sorted_row
+                # Proximity gate: both axes must pass.
+                v_gap = max(0.0, candidate.y - current.bottom,
+                            current.y - candidate.bottom)
+                h_gap = max(0.0, candidate.x - current.right,
+                            current.x - candidate.right)
+                if v_gap <= max_v and h_gap <= max_h:
+                    seen.add(id(candidate))
+                    group.append(candidate)
+                    queue.append(candidate)
+
+        return sorted(group, key=lambda b: b.y)
+
+
+# ``TableRowDetector`` is now a backwards-compatible alias: the BFS proximity
+# algorithm in ``ParagraphDetector`` naturally handles both paragraph-style
+# (vertically stacked) and table-row-style (horizontally arranged) layouts.
+TableRowDetector = ParagraphDetector
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +311,6 @@ SingleBoxDetector = SingleLineDetector  # backwards-compatible alias
 
 DEFAULT_DETECTORS: list[RangeDetector] = [
     ParagraphDetector(),
-    TableRowDetector(),
     SingleLineDetector(),
 ]
 """Default rule chain, priority high → low.
