@@ -25,6 +25,7 @@ Usage::
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -51,13 +52,23 @@ def _normalize(text: str) -> str:
     cosmetic differences (different ellipsis code-points, Light.VN
     dialog quote markers, wait commands) do not drag scores down.
     """
+    # NFKC first: fullwidth → ASCII (！？ → !?), but also decomposes
+    # … (U+2026) → ... and ‥ (U+2025) → ..  — fixed in the next steps.
+    text = unicodedata.normalize("NFKC", text)
+    # _NORM_TABLE handles ⋯ (U+22EF) which NFKC does not decompose.
     text = text.translate(_NORM_TABLE)
-    # Collapse runs of … into one.
+    # Re-collapse 2+ dots (NFKC-decomposed ellipses) back to single ….
+    text = re.sub(r"\.{2,}", "\u2026", text)
+    # Collapse consecutive … into one.
     text = re.sub("\u2026{2,}", "\u2026", text)
-    # Strip leading " " " (Light.VN dialog quote markers, not rendered).
+    # Strip leading " \u201c \u201d (Light.VN dialog quote markers, not rendered).
     text = re.sub(r'^["\u201c\u201d]', "", text, flags=re.MULTILINE)
     # Strip literal \w \n etc. (Light.VN wait/control commands).
     text = re.sub(r"\\[a-z]", "", text)
+    # Strip spaces that Windows OCR inserts between punctuation marks,
+    # e.g. "! ?" → "!?" or "( )" → "()".  Japanese text has no word spaces
+    # so removing isolated spaces between non-alphanumeric chars is safe.
+    text = re.sub(r'(?<=[^\w\s]) (?=[^\w\s])', '', text)
     return text
 
 
@@ -209,8 +220,15 @@ def best_match_with_details(
             best_partial_text = candidate
 
     if best_partial_text is not None and best_partial_score >= _PARTIAL_THRESHOLD:
+        # Refine multi-line partial winners to the best matching window so
+        # that a short single-line candidate cannot beat a richer multi-line
+        # candidate just because partial_ratio ignores length differences.
+        partial_output = best_partial_text
+        win_result = _best_line_window(ocr_norm, best_partial_text)
+        if win_result is not None:
+            partial_output = win_result[0]
         accepted.append(MatchResult(
-            text=best_partial_text,
+            text=partial_output,
             score=best_partial_score,
             phase="partial",
             threshold=_PARTIAL_THRESHOLD,

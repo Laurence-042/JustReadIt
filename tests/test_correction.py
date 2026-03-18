@@ -44,6 +44,14 @@ class TestNormalize:
         text = "普通のテキスト、何も変わらない。"
         assert _normalize(text) == text
 
+    def test_fullwidth_punctuation_nfkc(self) -> None:
+        # NFKC converts fullwidth ！？ → ASCII !?  so OCR and memory score equally.
+        assert _normalize("馬小屋！？") == "馬小屋!?"
+
+    def test_ocr_space_between_punctuation_stripped(self) -> None:
+        # Windows OCR sometimes inserts a space between punctuation marks.
+        assert _normalize("馬小屋! ?") == "馬小屋!?"
+
 
 # ---------------------------------------------------------------------------
 # _best_line_window
@@ -225,3 +233,20 @@ class TestBestMatchWithDetails:
         assert result is not None
         assert result.score >= result.threshold
         assert "た、確かに誰も居ないけど" in result.text
+
+    def test_realworld_ocr_fullwidth_vs_ascii_punctuation(self) -> None:
+        """Real-world case: OCR transcribes ！？ as '! ?' (ASCII + space).
+
+        The full dialog block is in memory; a short clean single-line copy
+        is also present. Corrected result must include BOTH dialog lines,
+        not just the last line that happened to score best on partial_ratio.
+        """
+        ocr = "1馬飼いの青年\nう、馬小屋! ?\nた、確かに誰も居ないけど・・"
+        candidates = [
+            "~【馬飼いの青年】\n\u201cう、馬小屋！？\nた、確かに誰も居ないけど……！！\\w",
+            "た、確かに誰も居ないけど……！！",  # single-line clean copy — must NOT win alone
+        ]
+        result = best_match_with_details(ocr, candidates)
+        assert result is not None
+        assert "う、馬小屋" in result.text, "First dialog line must be present"
+        assert "た、確かに誰も居ないけど" in result.text, "Second dialog line must be present"
