@@ -55,3 +55,9 @@ $RECYCLE.BIN/
 secrets.toml
 
 tmp/
+
+# mem_scan C accelerator build outputs
+src/memory/mem_scan.dll
+src/memory/mem_scan.obj
+src/memory/mem_scan.lib
+src/memory/mem_scan.exp
