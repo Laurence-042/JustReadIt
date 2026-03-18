@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.correction import _best_line_window, _normalize, best_match
+from src.correction import _best_line_window, _normalize, best_match, best_match_with_details
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,7 @@ class TestBestLineWindow:
 
     def test_single_line_returns_none(self) -> None:
         """Single-line candidates are handled by full-text ratio."""
-        assert _best_line_window("テスト", "テスト", 60.0) is None
+        assert _best_line_window("テスト", "テスト") is None
 
     def test_finds_matching_window(self) -> None:
         """Best window skips engine/name lines to match dialog."""
@@ -66,7 +66,7 @@ class TestBestLineWindow:
             "馬がレンタル出来たはず\n"
             "~ジャンプ"
         )
-        result = _best_line_window(ocr, candidate, 60.0)
+        result = _best_line_window(ocr, candidate)
         assert result is not None
         window_text, score = result
         assert score >= 90
@@ -78,7 +78,7 @@ class TestBestLineWindow:
         """Quote markers and wait commands are stripped for scoring."""
         ocr = _normalize("テスト文字列。")
         candidate = '\u201cテスト文字列。\\w\nダミー行'
-        result = _best_line_window(ocr, candidate, 60.0)
+        result = _best_line_window(ocr, candidate)
         assert result is not None
         _, score = result
         assert score >= 90
@@ -87,16 +87,22 @@ class TestBestLineWindow:
         """Returned window text is from original candidate, not normalised."""
         ocr = _normalize("テスト")
         candidate = '\u201cテスト\nダミー'
-        result = _best_line_window(ocr, candidate, 60.0)
+        result = _best_line_window(ocr, candidate)
         assert result is not None
         window_text, _ = result
         # Original text with the " prefix should be preserved.
         assert "\u201c" in window_text
 
     def test_below_threshold_returns_none(self) -> None:
+        # _best_line_window always returns best window (no threshold here);
+        # threshold filtering happens in best_match_with_details.
         ocr = _normalize("全く違うテキスト")
         candidate = "ABCDEF\nGHIJKL\nMNOPQR"
-        assert _best_line_window(ocr, candidate, 60.0) is None
+        result = _best_line_window(ocr, candidate)
+        # Either no result (ASCII lines have no unicode match) or score very low.
+        if result is not None:
+            _, score = result
+            assert score < 60
 
 
 # ---------------------------------------------------------------------------
@@ -196,3 +202,26 @@ class TestBestMatch:
         candidate = "テスト\u2026\u2026文字列"
         result = best_match(ocr, [candidate])
         assert result == candidate
+
+
+class TestBestMatchWithDetails:
+    def test_reports_phase_and_score(self) -> None:
+        ocr = "た、確かに誰も居ないけど・・"
+        candidates = [
+            "幅聲■退う、馬小屋！？\nた、確かに誰も居ないけど……！！",
+            "全然違う候補",
+        ]
+        result = best_match_with_details(ocr, candidates)
+        assert result is not None
+        assert result.phase in {"line-window", "full", "partial"}
+        assert result.score >= result.threshold
+
+    def test_matched_text_contains_dialog(self) -> None:
+        """The matched result must contain the core dialog text regardless
+        of which scoring phase wins."""
+        ocr = "う、馬小屋！？\nた、確かに誰も居ないけど・・"
+        candidate = "幅聲■退う、馬小屋！？\nた、確かに誰も居ないけど……！！"
+        result = best_match_with_details(ocr, [candidate])
+        assert result is not None
+        assert result.score >= result.threshold
+        assert "た、確かに誰も居ないけど" in result.text

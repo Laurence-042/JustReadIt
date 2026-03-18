@@ -284,6 +284,41 @@ def _is_quality_text(text: str) -> bool:
     return printable >= _MIN_TEXT_LENGTH
 
 
+def _is_japanese_or_common_text_char(char: str) -> bool:
+    """Return ``True`` for chars commonly seen in JP VN dialog text."""
+    cp = ord(char)
+
+    if char.isspace():
+        return True
+
+    if _is_cjk(char):
+        return True
+
+    if 0x0020 <= cp <= 0x007E:  # Basic ASCII printable
+        return True
+
+    if 0x3000 <= cp <= 0x303F:  # CJK symbols and punctuation
+        return True
+
+    if 0xFF00 <= cp <= 0xFFEF:  # Fullwidth forms
+        return True
+
+    if cp in {0x2025, 0x2026, 0x201C, 0x201D}:  # ‥ … “ ”
+        return True
+
+    return False
+
+
+def _is_noisy_line(line: str) -> bool:
+    """Heuristic: line contains many chars unlikely for JP dialog text."""
+    non_space = [ch for ch in line if not ch.isspace()]
+    if not non_space:
+        return False
+
+    noisy_count = sum(1 for ch in non_space if not _is_japanese_or_common_text_char(ch))
+    return noisy_count >= 2 and (noisy_count / len(non_space)) >= 0.15
+
+
 def _refine_to_lines(
     text: str,
     needle: str,
@@ -319,7 +354,23 @@ def _refine_to_lines(
     while hi > center + 1 and not lines[hi - 1].strip():
         hi -= 1
 
-    return "\n".join(lines[lo:hi])
+    selected = lines[lo:hi]
+
+    # Drop noisy surrounding lines (keep center line even if noisy).
+    center_rel = center - lo
+    if len(selected) > 1:
+        filtered: list[str] = []
+        for i, line in enumerate(selected):
+            if i == center_rel:
+                filtered.append(line)
+                continue
+            if _is_noisy_line(line):
+                continue
+            filtered.append(line)
+        if filtered:
+            selected = filtered
+
+    return "\n".join(selected)
 
 
 # ---------------------------------------------------------------------------
@@ -520,9 +571,10 @@ class MemoryScanner:
             if text is None or not _is_quality_text(text):
                 continue
 
-            # Refine large blocks (e.g. entire VN script files) to the
-            # paragraph surrounding the needle.
-            if len(text) > _LINE_REFINE_THRESHOLD:
+            # Refine large blocks (e.g. entire VN script files) and also
+            # refine multiline candidates containing the needle. This removes
+            # nearby binary noise lines while keeping relevant dialog context.
+            if len(text) > _LINE_REFINE_THRESHOLD or ("\n" in text and needle_text in text):
                 text = _refine_to_lines(text, needle_text)
                 if not _is_quality_text(text):
                     continue

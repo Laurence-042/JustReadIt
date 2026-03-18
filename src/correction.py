@@ -25,11 +25,13 @@ Usage::
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Sequence
 
 from rapidfuzz import fuzz
 
 _DEFAULT_THRESHOLD: float = 60.0
+_PARTIAL_THRESHOLD: float = 75.0
 
 # ---------------------------------------------------------------------------
 # Unicode normalisation — scoring only
@@ -67,7 +69,6 @@ def _normalize(text: str) -> str:
 def _best_line_window(
     ocr_norm: str,
     candidate: str,
-    threshold: float,
 ) -> tuple[str, float] | None:
     """Find the contiguous line window in *candidate* best matching OCR text.
 
@@ -103,9 +104,19 @@ def _best_line_window(
                 best_score = score
                 best_text = window_text
 
-    if best_score >= threshold and best_text is not None:
+    if best_text is not None:
         return best_text, best_score
     return None
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    """Levenshtein matching result with provenance details."""
+
+    text: str
+    score: float
+    phase: str
+    threshold: float
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +124,12 @@ def _best_line_window(
 # ---------------------------------------------------------------------------
 
 
-def best_match(
+def best_match_with_details(
     ocr_text: str,
     candidates: Sequence[str],
     threshold: float = _DEFAULT_THRESHOLD,
-) -> str | None:
-    """Return the best-matching text *segment* from *candidates*, or ``None``.
+) -> MatchResult | None:
+    """Return the best-matching text segment with score/phase metadata.
 
     Three-phase matching:
 
@@ -134,56 +145,90 @@ def best_match(
     VN script markers) so that cosmetic differences don't drag scores
     down.
 
-    Returns the matched *segment* (possibly a subset of lines from the
-    original candidate), not necessarily the whole candidate string.
+    Returns ``None`` when no strategy reaches its threshold.
     """
     if not candidates or not ocr_text:
         return None
 
     ocr_norm = _normalize(ocr_text)
 
-    best_score = 0.0
-    best_text: str | None = None
+    accepted: list[MatchResult] = []
 
     # Phase 1: full-text ratio with normalisation.
+    best_full_score = 0.0
+    best_full_text: str | None = None
     for candidate in candidates:
         if not candidate:
             continue
         cand_norm = _normalize(candidate)
         score = fuzz.ratio(ocr_norm, cand_norm)
-        if score > best_score:
-            best_score = score
-            best_text = candidate
+        if score > best_full_score:
+            best_full_score = score
+            best_full_text = candidate
 
-    if best_score >= threshold:
-        return best_text
+    if best_full_text is not None and best_full_score >= threshold:
+        accepted.append(MatchResult(
+            text=best_full_text,
+            score=best_full_score,
+            phase="full",
+            threshold=threshold,
+        ))
 
     # Phase 2: line-window matching — best contiguous segment.
+    best_line_score = 0.0
+    best_line_text: str | None = None
     for candidate in candidates:
         if not candidate:
             continue
-        result = _best_line_window(ocr_norm, candidate, threshold)
-        if result is not None:
-            window_text, window_score = result
-            if window_score > best_score:
-                best_score = window_score
-                best_text = window_text
+        result = _best_line_window(ocr_norm, candidate)
+        if result is None:
+            continue
+        window_text, window_score = result
+        if window_score > best_line_score:
+            best_line_score = window_score
+            best_line_text = window_text
 
-    if best_score >= threshold:
-        return best_text
+    if best_line_text is not None and best_line_score >= threshold:
+        accepted.append(MatchResult(
+            text=best_line_text,
+            score=best_line_score,
+            phase="line-window",
+            threshold=threshold,
+        ))
 
     # Phase 3: partial ratio fallback for substring relationships.
-    _PARTIAL_THRESHOLD = 75.0
-    best_partial = 0.0
+    best_partial_score = 0.0
     best_partial_text: str | None = None
-
     for candidate in candidates:
         if not candidate:
             continue
         cand_norm = _normalize(candidate)
         score = fuzz.partial_ratio(ocr_norm, cand_norm)
-        if score > best_partial:
-            best_partial = score
+        if score > best_partial_score:
+            best_partial_score = score
             best_partial_text = candidate
 
-    return best_partial_text if best_partial >= _PARTIAL_THRESHOLD else None
+    if best_partial_text is not None and best_partial_score >= _PARTIAL_THRESHOLD:
+        accepted.append(MatchResult(
+            text=best_partial_text,
+            score=best_partial_score,
+            phase="partial",
+            threshold=_PARTIAL_THRESHOLD,
+        ))
+
+    if not accepted:
+        return None
+
+    # Prefer the highest score; on tie, prefer line-window over full over partial.
+    phase_priority = {"line-window": 3, "full": 2, "partial": 1}
+    return max(accepted, key=lambda r: (r.score, phase_priority.get(r.phase, 0)))
+
+
+def best_match(
+    ocr_text: str,
+    candidates: Sequence[str],
+    threshold: float = _DEFAULT_THRESHOLD,
+) -> str | None:
+    """Compatibility wrapper returning only matched text."""
+    result = best_match_with_details(ocr_text, candidates, threshold)
+    return result.text if result is not None else None

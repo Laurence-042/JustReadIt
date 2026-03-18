@@ -4,6 +4,7 @@ Provides a live view of the pipeline:
   - Capture preview with OCR bounding-box overlay
   - Windows OCR text output panel
   - Memory scan result panel
+    - Levenshtein corrected text panel
   - Translation panel (placeholder until translators are implemented)
 
 Launch via ``python main.py --debug``.
@@ -41,7 +42,7 @@ from src.target import GameTarget
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.memory import MemoryScanner, pick_needles
-from src.correction import best_match
+from src.correction import best_match_with_details
 from .window_picker import WindowPicker
 
 
@@ -93,11 +94,12 @@ class _PipelineWorker(QObject):
 
     Signals
     -------
-    result_ready(img_bytes, word_boxes, line_boxes, crop_rect, win_ocr_text, region_text, detector_name, mem_text, elapsed_ms)
+    result_ready(img_bytes, word_boxes, line_boxes, crop_rect, win_ocr_text,
+                 region_text, detector_name, mem_text, corrected_text, elapsed_ms)
     error(message)
     """
 
-    result_ready = Signal(bytes, list, list, object, str, str, str, str, float)
+    result_ready = Signal(bytes, list, list, object, str, str, str, str, str, float)
     error = Signal(str)
     ready = Signal()
 
@@ -227,6 +229,7 @@ class _PipelineWorker(QObject):
 
         # ── Memory scan ──────────────────────────────────────────────
         mem_text = ""
+        corrected_text = region_text
         if region_text and self._scanner is not None:
             try:
                 needles = pick_needles(region_text)
@@ -240,14 +243,21 @@ class _PipelineWorker(QObject):
                     used_needle = needle  # remember last tried
 
                 candidates = [r.text for r in results]
-                matched = best_match(region_text, candidates)
+                matched = best_match_with_details(region_text, candidates)
                 if matched is not None:
                     enc = results[0].encoding if results else "?"
+                    corrected_text = matched.text
+                    previews = "\n\n".join(
+                        r.text[:400] for r in results[:5]
+                    )
                     mem_text = (
                         f"[match ✓  enc={enc}  "
                         f"hits={len(results)}  "
                         f"needle={used_needle!r}  "
-                        f"tried={len(needles)}]\n\n{matched}"
+                        f"tried={len(needles)}  "
+                        f"phase={matched.phase}  "
+                        f"score={matched.score:.1f}/{matched.threshold:.1f}]"
+                        f"\n\n{previews}"
                     )
                 elif results:
                     previews = "\n".join(
@@ -267,6 +277,7 @@ class _PipelineWorker(QObject):
                     mem_text = "[no needles from OCR text]"
             except Exception as exc:
                 mem_text = f"[scan error: {exc}]"
+                corrected_text = region_text
 
         elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -276,7 +287,7 @@ class _PipelineWorker(QObject):
         img.save(buf, format="JPEG", quality=75)
         self.result_ready.emit(
             buf.getvalue(), boxes, line_boxes, crop_rect,
-            win_ocr_text, region_text, detector_name, mem_text, elapsed_ms,
+            win_ocr_text, region_text, detector_name, mem_text, corrected_text, elapsed_ms,
         )
 
 
@@ -595,6 +606,7 @@ class DebugWindow(QMainWindow):
         self._grp_region, self._te_region = _make_panel("Detected Region")
         grp_region = self._grp_region
         grp_mem,    self._te_mem    = _make_panel("Memory Scan")
+        grp_corr,   self._te_corr   = _make_panel("Levenshtein Corrected")
         grp_tl,     self._te_tl     = _make_panel(
             "Translation  (not yet implemented)"
         )
@@ -606,13 +618,18 @@ class DebugWindow(QMainWindow):
             "Memory scan results appear here.\n"
             "ReadProcessMemory scans the game's heap for OCR text substrings."
         )
+        self._te_corr.setPlaceholderText(
+            "Corrected text (best OCR↔memory match) appears here.\n"
+            "Falls back to OCR region text when no confident match is found."
+        )
         self._te_tl.setPlaceholderText("Translation plugin not yet implemented.")
 
         right.addWidget(grp_wocr)
         right.addWidget(grp_region)
         right.addWidget(grp_mem)
+        right.addWidget(grp_corr)
         right.addWidget(grp_tl)
-        right.setSizes([280, 160, 200, 120])
+        right.setSizes([260, 140, 120, 160, 120])
 
         splitter.setStretchFactor(0, 6)
         splitter.setStretchFactor(1, 4)
@@ -902,7 +919,7 @@ class DebugWindow(QMainWindow):
     # Result / error handlers
     # ------------------------------------------------------------------
 
-    @Slot(bytes, list, list, object, str, str, str, str, float)
+    @Slot(bytes, list, list, object, str, str, str, str, str, float)
     def _on_result(
         self,
         img_bytes: bytes,
@@ -913,6 +930,7 @@ class DebugWindow(QMainWindow):
         region_text: str,
         detector_name: str,
         mem_text: str,
+        corrected_text: str,
         elapsed_ms: float,
     ) -> None:
         self._preview.update_frame(img_bytes, boxes, line_boxes, crop_rect)
@@ -920,10 +938,9 @@ class DebugWindow(QMainWindow):
         self._te_wocr.setPlainText(header + win_ocr_text)
         if detector_name:
             self._grp_region.setTitle(f"Detected Region  [{detector_name}]")
-        if region_text:
-            self._te_region.setPlainText(region_text)
-        if mem_text:
-            self._te_mem.setPlainText(mem_text)
+        self._te_region.setPlainText(region_text)
+        self._te_mem.setPlainText(mem_text)
+        self._te_corr.setPlainText(corrected_text)
         self.statusBar().showMessage(
             f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
         )

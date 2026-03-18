@@ -17,6 +17,7 @@ from src.memory.scanner import (
     _extract_utf16le,
     _extract_byte_delimited,
     _is_cjk,
+    _is_noisy_line,
     _is_quality_text,
     _refine_to_lines,
     _try_encode,
@@ -313,6 +314,23 @@ class TestRefineToLines:
         ])
         result = _refine_to_lines(script, "needle", context_lines=2)
         assert result.endswith("needleの最後の行")
+
+    def test_drops_noisy_surrounding_line(self) -> None:
+        text = "\n".join([
+            "뿅臥ᨀ阀う、馬小屋！？",
+            "た、確かに誰も居ないけど……！！",
+        ])
+        result = _refine_to_lines(text, "も居ない", context_lines=1)
+        assert "た、確かに誰も居ないけど" in result
+        assert "뿅臥ᨀ阀" not in result
+
+
+class TestNoiseLineHeuristic:
+    def test_noisy_line_true(self) -> None:
+        assert _is_noisy_line("뿅臥ᨀ阀う、馬小屋！？")
+
+    def test_normal_japanese_line_false(self) -> None:
+        assert not _is_noisy_line("馬飼いの青年")
 
 
 # ==========================================================================
