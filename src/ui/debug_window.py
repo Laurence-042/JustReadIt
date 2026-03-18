@@ -30,7 +30,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QGroupBox,
-    QHBoxLayout, QLabel,
+    QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar,
     QVBoxLayout, QWidget,
@@ -43,6 +43,9 @@ from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apa
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.memory import MemoryScanner, pick_needles
 from src.correction import best_match_with_details
+from src.translators.base import Translator
+from src.translators.factory import build_translator
+from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT
 from .window_picker import WindowPicker
 
 
@@ -90,23 +93,32 @@ class _POINT(ctypes.Structure):
 # ---------------------------------------------------------------------------
 
 class _PipelineWorker(QObject):
-    """Runs capture + OCR + memory scan on a background QThread.
+    """Runs capture + OCR + memory scan + translation on a background QThread.
 
     Signals
     -------
     result_ready(img_bytes, word_boxes, line_boxes, crop_rect, win_ocr_text,
-                 region_text, detector_name, mem_text, corrected_text, elapsed_ms)
+                 region_text, detector_name, mem_text, corrected_text,
+                 translated_text, elapsed_ms)
     error(message)
     """
 
-    result_ready = Signal(bytes, list, list, object, str, str, str, str, str, float)
+    result_ready = Signal(bytes, list, list, object, str, str, str, str, str, str, float)
     error = Signal(str)
     ready = Signal()
 
-    def __init__(self, target: GameTarget, language_tag: str) -> None:
+    def __init__(
+        self,
+        target: GameTarget,
+        language_tag: str,
+        translator: Translator | None = None,
+        target_lang: str = "en",
+    ) -> None:
         super().__init__()
         self._target = target
         self._language_tag = language_tag
+        self._translator = translator
+        self._target_lang = target_lang
         self._capturer: Capturer | None = None
         self._ocr: WindowsOcr | None = None
         self._scanner: MemoryScanner | None = None
@@ -279,6 +291,16 @@ class _PipelineWorker(QObject):
                 mem_text = f"[scan error: {exc}]"
                 corrected_text = region_text
 
+        # ── Translation ──────────────────────────────────────────────
+        translated_text = ""
+        if self._translator is not None and corrected_text:
+            try:
+                translated_text = self._translator.translate(
+                    corrected_text, target_lang=self._target_lang
+                )
+            except Exception as exc:
+                translated_text = f"[translation error: {exc}]"
+
         elapsed_ms = (time.monotonic() - t0) * 1000
 
         # Encode frame as JPEG bytes so the PIL object doesn't cross
@@ -287,7 +309,8 @@ class _PipelineWorker(QObject):
         img.save(buf, format="JPEG", quality=75)
         self.result_ready.emit(
             buf.getvalue(), boxes, line_boxes, crop_rect,
-            win_ocr_text, region_text, detector_name, mem_text, corrected_text, elapsed_ms,
+            win_ocr_text, region_text, detector_name, mem_text, corrected_text,
+            translated_text, elapsed_ms,
         )
 
 
@@ -478,6 +501,7 @@ class DebugWindow(QMainWindow):
         self._target: GameTarget | None = None
         self._worker: _PipelineWorker | None = None
         self._worker_thread: QThread | None = None
+        self._translator: Translator | None = None
 
         self._run_timer = QTimer(self)
         self._run_timer.timeout.connect(self._request_tick)
@@ -607,9 +631,7 @@ class DebugWindow(QMainWindow):
         grp_region = self._grp_region
         grp_mem,    self._te_mem    = _make_panel("Memory Scan")
         grp_corr,   self._te_corr   = _make_panel("Levenshtein Corrected")
-        grp_tl,     self._te_tl     = _make_panel(
-            "Translation  (not yet implemented)"
-        )
+        grp_tl,     self._te_tl     = _make_panel("Translation")
 
         self._te_region.setPlaceholderText(
             "Region text will appear after range detection."
@@ -619,17 +641,20 @@ class DebugWindow(QMainWindow):
             "ReadProcessMemory scans the game's heap for OCR text substrings."
         )
         self._te_corr.setPlaceholderText(
-            "Corrected text (best OCR↔memory match) appears here.\n"
+            "Corrected text (best OCR\u2194memory match) appears here.\n"
             "Falls back to OCR region text when no confident match is found."
         )
-        self._te_tl.setPlaceholderText("Translation plugin not yet implemented.")
+        self._te_tl.setPlaceholderText(
+            "Configure a translator backend below and click \"Apply\" to enable."
+        )
 
         right.addWidget(grp_wocr)
         right.addWidget(grp_region)
         right.addWidget(grp_mem)
         right.addWidget(grp_corr)
+        right.addWidget(self._build_translator_settings_panel())
         right.addWidget(grp_tl)
-        right.setSizes([260, 140, 120, 160, 120])
+        right.setSizes([220, 120, 100, 140, 180, 100])
 
         splitter.setStretchFactor(0, 6)
         splitter.setStretchFactor(1, 4)
@@ -873,7 +898,10 @@ class DebugWindow(QMainWindow):
         self._stop()
 
         lang = self._selected_language
-        self._worker = _PipelineWorker(self._target, lang)
+        target_lang = _cfg.translator_target_lang
+        self._worker = _PipelineWorker(
+            self._target, lang, self._translator, target_lang
+        )
         self._worker_thread = QThread(self)
         self._worker.moveToThread(self._worker_thread)
 
@@ -919,7 +947,7 @@ class DebugWindow(QMainWindow):
     # Result / error handlers
     # ------------------------------------------------------------------
 
-    @Slot(bytes, list, list, object, str, str, str, str, str, float)
+    @Slot(bytes, list, list, object, str, str, str, str, str, str, float)
     def _on_result(
         self,
         img_bytes: bytes,
@@ -931,6 +959,7 @@ class DebugWindow(QMainWindow):
         detector_name: str,
         mem_text: str,
         corrected_text: str,
+        translated_text: str,
         elapsed_ms: float,
     ) -> None:
         self._preview.update_frame(img_bytes, boxes, line_boxes, crop_rect)
@@ -941,6 +970,8 @@ class DebugWindow(QMainWindow):
         self._te_region.setPlainText(region_text)
         self._te_mem.setPlainText(mem_text)
         self._te_corr.setPlainText(corrected_text)
+        if translated_text:
+            self._te_tl.setPlainText(translated_text)
         self.statusBar().showMessage(
             f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
         )
@@ -958,3 +989,236 @@ class DebugWindow(QMainWindow):
         self._stop()
         _cfg.interval_ms = self._spn_interval.value()
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Translator settings panel
+    # ------------------------------------------------------------------
+
+    def _build_translator_settings_panel(self) -> QWidget:
+        """Build the collapsible translator configuration group box."""
+        grp = QGroupBox("Translation Settings")
+        lay = QVBoxLayout(grp)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+
+        # Row 1: backend + target lang
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Backend:"))
+        self._cmb_backend = QComboBox()
+        for label, val in [
+            ("\u2014 None \u2014", "none"),
+            ("Google Cloud Translation", "cloud"),
+            ("OpenAI", "openai"),
+        ]:
+            self._cmb_backend.addItem(label, userData=val)
+        row1.addWidget(self._cmb_backend)
+        row1.addSpacing(12)
+        row1.addWidget(QLabel("Target lang:"))
+        self._le_target_lang = QLineEdit()
+        self._le_target_lang.setMaximumWidth(70)
+        self._le_target_lang.setPlaceholderText("en")
+        row1.addWidget(self._le_target_lang)
+        row1.addStretch()
+        lay.addLayout(row1)
+
+        # Row 2: API key (used by both backends)
+        self._row_api_key = QWidget()
+        r2 = QHBoxLayout(self._row_api_key)
+        r2.setContentsMargins(0, 0, 0, 0)
+        r2.addWidget(QLabel("API Key:"))
+        self._le_api_key = QLineEdit()
+        self._le_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._le_api_key.setPlaceholderText("Paste API key here")
+        r2.addWidget(self._le_api_key)
+        lay.addWidget(self._row_api_key)
+
+        # Rows 3-4: OpenAI-only fields
+        self._openai_fields = QWidget()
+        of_lay = QVBoxLayout(self._openai_fields)
+        of_lay.setContentsMargins(0, 0, 0, 0)
+        of_lay.setSpacing(4)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Model:"))
+        self._le_model = QLineEdit()
+        self._le_model.setPlaceholderText("gpt-4o-mini")
+        self._le_model.setMaximumWidth(160)
+        row3.addWidget(self._le_model)
+        row3.addSpacing(12)
+        row3.addWidget(QLabel("Base URL:"))
+        self._le_base_url = QLineEdit()
+        self._le_base_url.setPlaceholderText(
+            "https://api.openai.com/v1  (leave blank for default)"
+        )
+        row3.addWidget(self._le_base_url)
+        of_lay.addLayout(row3)
+
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("System Prompt:"))
+        prompt_col = QVBoxLayout()
+        self._te_system_prompt = QTextEdit()
+        self._te_system_prompt.setPlaceholderText(
+            "Leave blank to use the built-in default prompt.\n"
+            "Supports {source_lang} and {target_lang} placeholders."
+        )
+        self._te_system_prompt.setFixedHeight(72)
+        self._btn_reset_prompt = QPushButton("Reset to default")
+        self._btn_reset_prompt.setToolTip(
+            "Clear the system prompt field so the built-in default is used.\n"
+            "Click again to preview the default template in the field."
+        )
+        self._btn_reset_prompt.setFlat(True)
+        self._btn_reset_prompt.clicked.connect(self._on_reset_system_prompt)
+        prompt_col.addWidget(self._te_system_prompt)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_reset_prompt)
+        prompt_col.addLayout(btn_row)
+        row4.addLayout(prompt_col)
+        of_lay.addLayout(row4)
+
+        lay.addWidget(self._openai_fields)
+
+        # Row 5: Apply / Test + status
+        row5 = QHBoxLayout()
+        self._btn_apply_tl = QPushButton("Apply")
+        self._btn_apply_tl.setToolTip(
+            "Save settings and (re-)initialise the translator.\n"
+            "Missing packages are installed automatically."
+        )
+        self._btn_test_tl = QPushButton("Test")
+        self._btn_test_tl.setToolTip("Send a short test string to verify the translator is working.")
+        self._lbl_tl_status = QLabel("")
+        self._lbl_tl_status.setWordWrap(True)
+        row5.addWidget(self._btn_apply_tl)
+        row5.addWidget(self._btn_test_tl)
+        row5.addWidget(self._lbl_tl_status, 1)
+        lay.addLayout(row5)
+
+        # Wire up
+        self._cmb_backend.currentIndexChanged.connect(self._on_backend_changed)
+        self._btn_apply_tl.clicked.connect(self._on_apply_translator)
+        self._btn_test_tl.clicked.connect(self._on_test_translator)
+
+        self._restore_translator_settings()
+        self._on_backend_changed(self._cmb_backend.currentIndex())
+        # Auto-build translator from saved config (non-blocking: errors shown in label)
+        if _cfg.translator_backend not in ("none", ""):
+            self._build_translator_from_config()
+        return grp
+
+    def _restore_translator_settings(self) -> None:
+        """Populate translator settings widgets from persisted config."""
+        backend = _cfg.translator_backend
+        for i in range(self._cmb_backend.count()):
+            if self._cmb_backend.itemData(i) == backend:
+                self._cmb_backend.setCurrentIndex(i)
+                break
+        self._le_target_lang.setText(_cfg.translator_target_lang)
+        # API key: show whichever is set
+        if backend == "openai":
+            self._le_api_key.setText(_cfg.openai_api_key)
+            self._le_model.setText(_cfg.openai_model)
+            self._le_base_url.setText(_cfg.openai_base_url)
+            self._te_system_prompt.setPlainText(_cfg.openai_system_prompt)
+        else:
+            self._le_api_key.setText(_cfg.cloud_api_key)
+
+    @Slot(int)
+    def _on_backend_changed(self, index: int) -> None:
+        """Show/hide backend-specific fields based on the selected backend."""
+        backend = self._cmb_backend.itemData(index) or "none"
+        self._row_api_key.setVisible(backend != "none")
+        self._openai_fields.setVisible(backend == "openai")
+        # Repopulate API key field with the relevant stored value
+        if backend == "openai":
+            self._le_api_key.setText(_cfg.openai_api_key)
+        elif backend == "cloud":
+            self._le_api_key.setText(_cfg.cloud_api_key)
+
+    @Slot()
+    def _on_reset_system_prompt(self) -> None:
+        """Clear the system prompt field (so the built-in default is used).
+
+        If the field is already empty, fill it with the default template so
+        the user can inspect and customise it.
+        """
+        current = self._te_system_prompt.toPlainText().strip()
+        if current:
+            self._te_system_prompt.clear()
+            self._btn_reset_prompt.setText("Reset to default")
+        else:
+            self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
+            self._btn_reset_prompt.setText("Clear (use default)")
+
+    @Slot()
+    def _on_apply_translator(self) -> None:
+        """Persist settings and (re-)build the translator.  Auto-installs deps."""
+        backend = self._cmb_backend.currentData() or "none"
+        target_lang = self._le_target_lang.text().strip() or "en"
+        api_key = self._le_api_key.text().strip()
+
+        # Persist ALL fields first, regardless of backend
+        _cfg.translator_backend = backend
+        _cfg.translator_target_lang = target_lang
+        if backend == "cloud":
+            _cfg.cloud_api_key = api_key
+        elif backend == "openai":
+            _cfg.openai_api_key = api_key
+            _cfg.openai_model = self._le_model.text().strip() or "gpt-4o-mini"
+            _cfg.openai_base_url = self._le_base_url.text().strip()
+            _cfg.openai_system_prompt = self._te_system_prompt.toPlainText().strip()
+
+        if backend == "none":
+            self._translator = None
+            self._lbl_tl_status.setText("Translator disabled.")
+            self._restart_worker_with_translator()
+            return
+
+        self._build_translator_from_config()
+        self._restart_worker_with_translator()
+
+    def _build_translator_from_config(self) -> None:
+        """(Re-)build ``self._translator`` from current config.  Updates status label."""
+        backend = _cfg.translator_backend
+        target_lang = _cfg.translator_target_lang or "en"
+        self._lbl_tl_status.setText("Building translator\u2026")
+        QApplication.processEvents()
+        try:
+            self._translator = build_translator(
+                _cfg,
+                progress=lambda msg: (
+                    self._lbl_tl_status.setText(msg),
+                    QApplication.processEvents(),
+                ),
+            )
+            if self._translator is not None:
+                self._lbl_tl_status.setText(
+                    f"\u2713 {backend.title()} translator ready  \u2192  {target_lang}"
+                )
+            else:
+                self._lbl_tl_status.setText("Translator disabled.")
+        except RuntimeError as exc:
+            self._translator = None
+            self._lbl_tl_status.setText(f"\u26a0 {exc}")
+
+    def _restart_worker_with_translator(self) -> None:
+        """Restart the pipeline worker so it picks up the new translator."""
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            self._run()
+
+    @Slot()
+    def _on_test_translator(self) -> None:
+        """Translate a short fixed string to verify the backend is working."""
+        if self._translator is None:
+            self._lbl_tl_status.setText("No active translator \u2014 click Apply first.")
+            return
+        target_lang = _cfg.translator_target_lang or "en"
+        test_src = "\u3053\u3093\u306b\u3061\u306f\u3001\u4e16\u754c\uff01"  # "こんにちは、世界！"
+        self._lbl_tl_status.setText("Testing\u2026")
+        QApplication.processEvents()
+        try:
+            result = self._translator.translate(test_src, target_lang=target_lang)
+            self._lbl_tl_status.setText(f"Test \u2713  {test_src!r} \u2192 {result!r}")
+        except Exception as exc:
+            self._lbl_tl_status.setText(f"Test failed: {exc}")

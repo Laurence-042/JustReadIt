@@ -229,12 +229,12 @@ Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"
 - [x] 实现 `best_match`：OCR ↔ 内存扫描结果 Levenshtein 匹配（`src/correction.py`）
 
 ### 缓存
-- [ ] 实现翻译区域截图 phash 计算与缓存层
+- [x] 实现翻译区域截图 phash 计算与缓存层
 
 ### 翻译插件
-- [ ] 定义翻译插件接口（`Translator` ABC，`src/translators/base.py`）
-- [ ] 实现 Cloud Translation API 插件
-- [ ] 实现 OpenAI 接入点插件（含前文摘要 Agent、全局 prompt 配置）
+- [x] 定义翻译插件接口（`Translator` ABC，`src/translators/base.py`）
+- [x] 实现 Cloud Translation API 插件
+- [x] 实现 OpenAI 接入点插件（含前文摘要 Agent、全局 prompt 配置）
 
 ### 遮罩与交互
 - [ ] 实现翻译结果置顶遮罩窗口（透明背景，文字叠加）

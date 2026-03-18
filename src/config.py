@@ -61,4 +61,109 @@ class AppConfig:
         s.setValue("pipeline/interval_ms", value)
         s.sync()
 
+    # ── Translation backend ────────────────────────────────────────────
+
+    @property
+    def translator_backend(self) -> str:
+        """Active translation backend: ``"cloud"`` or ``"openai"``."""
+        return str(_make_qsettings().value("translator/backend", "cloud"))
+
+    @translator_backend.setter
+    def translator_backend(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("translator/backend", value)
+        s.sync()
+
+    @property
+    def translator_target_lang(self) -> str:
+        """BCP-47 target language code (default ``"en"``)."""
+        return str(_make_qsettings().value("translator/target_lang", "en"))
+
+    @translator_target_lang.setter
+    def translator_target_lang(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("translator/target_lang", value)
+        s.sync()
+
+    # ── Cloud Translation API ──────────────────────────────────────────
+
+    @property
+    def cloud_api_key(self) -> str:
+        """Google Cloud Translation restricted API key (empty = use ADC)."""
+        return str(_make_qsettings().value("cloud/api_key", ""))
+
+    @cloud_api_key.setter
+    def cloud_api_key(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("cloud/api_key", value)
+        s.sync()
+
+    # ── OpenAI ────────────────────────────────────────────────────────
+
+    @property
+    def openai_api_key(self) -> str:
+        """OpenAI API key (``sk-...")."""
+        return str(_make_qsettings().value("openai/api_key", ""))
+
+    @openai_api_key.setter
+    def openai_api_key(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/api_key", value)
+        s.sync()
+
+    @property
+    def openai_model(self) -> str:
+        """OpenAI chat model name (default ``"gpt-4o-mini"``)."""
+        return str(_make_qsettings().value("openai/model", "gpt-4o-mini"))
+
+    @openai_model.setter
+    def openai_model(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/model", value)
+        s.sync()
+
+    @property
+    def openai_base_url(self) -> str:
+        """OpenAI-compatible base URL override (empty = default OpenAI endpoint)."""
+        return str(_make_qsettings().value("openai/base_url", ""))
+
+    @openai_base_url.setter
+    def openai_base_url(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/base_url", value)
+        s.sync()
+
+    @property
+    def openai_system_prompt(self) -> str:
+        """User-configured system prompt for the OpenAI translator."""
+        return str(_make_qsettings().value("openai/system_prompt", ""))
+
+    @openai_system_prompt.setter
+    def openai_system_prompt(self, value: str) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/system_prompt", value)
+        s.sync()
+
+    @property
+    def openai_context_window(self) -> int:
+        """Number of recent dialogue pairs included as context (default 10)."""
+        return int(_make_qsettings().value("openai/context_window", 10))
+
+    @openai_context_window.setter
+    def openai_context_window(self, value: int) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/context_window", value)
+        s.sync()
+
+    @property
+    def openai_summary_trigger(self) -> int:
+        """History length that triggers summarisation of the oldest chunk (default 20)."""
+        return int(_make_qsettings().value("openai/summary_trigger", 20))
+
+    @openai_summary_trigger.setter
+    def openai_summary_trigger(self, value: int) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/summary_trigger", value)
+        s.sync()
+
 

@@ -34,6 +34,12 @@ dev = [
 ui = [
     "PySide6",
 ]
+translators-cloud = [
+    "google-cloud-translate>=3.0",
+]
+translators-openai = [
+    "openai>=1.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
