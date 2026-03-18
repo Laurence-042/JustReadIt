@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from PIL import Image
 
@@ -31,6 +32,33 @@ import winrt.windows.storage.streams as wss
 from .range_detectors import BoundingBox
 
 _log = logging.getLogger(__name__)
+
+# Matches any CJK / kana / fullwidth character.
+_CJK_RE = re.compile(r"[\u3000-\u9fff\uf900-\ufaff\uff00-\uffef]")
+
+
+def _join_ocr_words(words: list[str]) -> str:
+    """Join OCR word tokens without inserting a space when adjacent tokens are
+    CJK characters.
+
+    Windows OCR for Japanese/Chinese often returns every character as its own
+    ``OcrWord``.  Joining naively with ``" ".join(...)`` produces
+    ``"何 も 言 わ な い"``; this helper suppresses the separator whenever
+    either neighbouring token contains a CJK character.
+    """
+    if not words:
+        return ""
+    parts: list[str] = [words[0]]
+    for tok in words[1:]:
+        prev = parts[-1]
+        if prev and tok and (
+            _CJK_RE.search(prev[-1]) or _CJK_RE.search(tok[0])
+        ):
+            parts.append(tok)
+        else:
+            parts.append(" ")
+            parts.append(tok)
+    return "".join(parts)
 
 
 def _ensure_apartment() -> None:
@@ -212,7 +240,7 @@ class WindowsOcr:
                 line_boxes.append(
                     BoundingBox(
                         x=lx, y=ly, w=lr - lx, h=lb - ly,
-                        text=" ".join(w.text for w in line.words),
+                        text=_join_ocr_words([w.text for w in line.words]),
                     )
                 )
         return word_boxes, line_boxes
