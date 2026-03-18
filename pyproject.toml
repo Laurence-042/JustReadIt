@@ -37,6 +37,9 @@ ui = [
 translators-cloud = [
     "google-cloud-translate>=3.0",
 ]
+translators-free = [
+    "deep-translator>=1.11",
+]
 translators-openai = [
     "openai>=1.0",
 ]

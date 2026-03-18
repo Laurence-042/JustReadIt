@@ -1007,7 +1007,8 @@ class DebugWindow(QMainWindow):
         self._cmb_backend = QComboBox()
         for label, val in [
             ("\u2014 None \u2014", "none"),
-            ("Google Cloud Translation", "cloud"),
+            ("Google Translate (free, no key)", "google_free"),
+            ("Google Cloud Translation (API key)", "cloud"),
             ("OpenAI", "openai"),
         ]:
             self._cmb_backend.addItem(label, userData=val)
@@ -1058,14 +1059,12 @@ class DebugWindow(QMainWindow):
         prompt_col = QVBoxLayout()
         self._te_system_prompt = QTextEdit()
         self._te_system_prompt.setPlaceholderText(
-            "Leave blank to use the built-in default prompt.\n"
             "Supports {source_lang} and {target_lang} placeholders."
         )
         self._te_system_prompt.setFixedHeight(72)
         self._btn_reset_prompt = QPushButton("Reset to default")
         self._btn_reset_prompt.setToolTip(
-            "Clear the system prompt field so the built-in default is used.\n"
-            "Click again to preview the default template in the field."
+            "Restore the built-in default system prompt template."
         )
         self._btn_reset_prompt.setFlat(True)
         self._btn_reset_prompt.clicked.connect(self._on_reset_system_prompt)
@@ -1120,7 +1119,7 @@ class DebugWindow(QMainWindow):
             self._le_api_key.setText(_cfg.openai_api_key)
             self._le_model.setText(_cfg.openai_model)
             self._le_base_url.setText(_cfg.openai_base_url)
-            self._te_system_prompt.setPlainText(_cfg.openai_system_prompt)
+            self._te_system_prompt.setPlainText(_cfg.openai_system_prompt or DEFAULT_SYSTEM_PROMPT)
         else:
             self._le_api_key.setText(_cfg.cloud_api_key)
 
@@ -1128,7 +1127,7 @@ class DebugWindow(QMainWindow):
     def _on_backend_changed(self, index: int) -> None:
         """Show/hide backend-specific fields based on the selected backend."""
         backend = self._cmb_backend.itemData(index) or "none"
-        self._row_api_key.setVisible(backend != "none")
+        self._row_api_key.setVisible(backend == "cloud")
         self._openai_fields.setVisible(backend == "openai")
         # Repopulate API key field with the relevant stored value
         if backend == "openai":
@@ -1138,18 +1137,8 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _on_reset_system_prompt(self) -> None:
-        """Clear the system prompt field (so the built-in default is used).
-
-        If the field is already empty, fill it with the default template so
-        the user can inspect and customise it.
-        """
-        current = self._te_system_prompt.toPlainText().strip()
-        if current:
-            self._te_system_prompt.clear()
-            self._btn_reset_prompt.setText("Reset to default")
-        else:
-            self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
-            self._btn_reset_prompt.setText("Clear (use default)")
+        """Restore the built-in default system prompt template."""
+        self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
 
     @Slot()
     def _on_apply_translator(self) -> None:

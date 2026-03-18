@@ -19,11 +19,13 @@ from __future__ import annotations
 from src.translators.base import Translator
 from src.translators.cloud_translation import CloudTranslationTranslator
 from src.translators.factory import build_translator
+from src.translators.google_free import GoogleFreeTranslator
 from src.translators.openai_translator import OpenAITranslator
 
 __all__ = [
     "Translator",
     "CloudTranslationTranslator",
+    "GoogleFreeTranslator",
     "OpenAITranslator",
     "build_translator",
 ]

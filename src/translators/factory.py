@@ -57,6 +57,11 @@ def build_translator(
         api_key = config.cloud_api_key.strip() or None
         return CloudTranslationTranslator(api_key=api_key, progress=progress)
 
+    if backend == "google_free":
+        from src.translators.google_free import GoogleFreeTranslator
+
+        return GoogleFreeTranslator(progress=progress)
+
     if backend == "openai":
         from src.translators.openai_translator import OpenAITranslator
 
@@ -78,5 +83,5 @@ def build_translator(
 
     raise RuntimeError(
         f"Unknown translator backend: {backend!r}.  "
-        f"Valid values are: 'none', 'cloud', 'openai'."
+        f"Valid values are: 'none', 'cloud', 'google_free', 'openai'."
     )
