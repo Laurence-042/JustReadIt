@@ -1,7 +1,12 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-"""OpenAI translation backend with rolling summary context agent.
+"""OpenAI-compatible API translation backend with rolling summary context agent.
+
+Works with any endpoint that implements the OpenAI Chat Completions API,
+including OpenAI itself, OpenRouter, local Ollama proxies, Azure OpenAI, etc.
+Point ``base_url`` at the desired endpoint; the ``api_key`` format is
+provider-specific.
 
 Suitable for dialogue, plot text and long-form content where understanding
 previous exchanges improves translation quality.
@@ -23,10 +28,11 @@ Requirements::
 
 Usage::
 
-    from src.translators.openai_translator import OpenAITranslator
+    from src.translators.openai_translator import OpenAICompatTranslator
 
-    translator = OpenAITranslator(
+    translator = OpenAICompatTranslator(
         api_key="sk-...",
+        # base_url="https://openrouter.ai/api/v1",  # any compatible endpoint
         system_prompt="You are translating a Japanese fantasy RPG into English.",
         context_window=8,
     )
@@ -73,20 +79,29 @@ class _HistoryEntry:
 # Translator implementation
 # ---------------------------------------------------------------------------
 
-class OpenAITranslator(Translator):
-    """Translation backend backed by OpenAI Chat Completions API.
+class OpenAICompatTranslator(Translator):
+    """Translation backend for any OpenAI-compatible Chat Completions API.
+
+    Tested with: OpenAI, OpenRouter, Ollama (OpenAI proxy mode), Azure OpenAI.
+    Leave ``base_url`` as ``None`` for the default OpenAI endpoint
+    (``https://api.openai.com/v1``).
 
     Args:
-        api_key: OpenAI API key (``sk-...``).
-        model: Chat model name (default ``"gpt-4o-mini"``).
+        api_key: Provider API key.  Format is provider-specific
+            (``sk-...`` for OpenAI, Bearer token for OpenRouter, etc.).
+        model: Model name as accepted by the provider (default ``"gpt-4o-mini"``).
         system_prompt: User-supplied system prompt prepended to every request.
             Describe the game world, character names, writing style, etc.
         context_window: Number of most-recent (source, translation) pairs
             included verbatim in each request (default 10).
         summary_trigger: When the total history length reaches this value,
             the oldest half is condensed into a summary paragraph (default 20).
-        base_url: Override OpenAI-compatible endpoint URL (e.g. local
-            proxy or Azure OpenAI deployment).
+        base_url: OpenAI-compatible endpoint URL.  Examples::
+
+                https://openrouter.ai/api/v1          # OpenRouter
+                http://localhost:11434/v1              # Ollama
+                https://<resource>.openai.azure.com/  # Azure OpenAI
+
         timeout: Per-request timeout in seconds (default 30).
     """
 
@@ -287,3 +302,7 @@ class OpenAITranslator(Translator):
             self._summary = self._summary + "\n" + new_summary
         else:
             self._summary = new_summary
+
+
+# Backward-compatible alias
+OpenAITranslator = OpenAICompatTranslator

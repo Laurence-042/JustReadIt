@@ -1210,8 +1210,8 @@ class DebugWindow(QMainWindow):
             from src.translators.google_free import GoogleFreeTranslator
             return GoogleFreeTranslator(progress=progress)
         if backend == "openai":
-            from src.translators.openai_translator import OpenAITranslator
-            return OpenAITranslator(
+            from src.translators.openai_translator import OpenAICompatTranslator
+            return OpenAICompatTranslator(
                 api_key=api_key,
                 model=self._le_model.text().strip() or "gpt-4o-mini",
                 system_prompt=self._te_system_prompt.toPlainText().strip(),

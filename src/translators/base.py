@@ -76,7 +76,7 @@ PROVIDERS: list[ProviderInfo] = [
     ),
     ProviderInfo(
         key="openai",
-        display_name="OpenAI",
+        display_name="OpenAI-compatible API (OpenAI, OpenRouter, …)",
         needs_api_key=True,
         pip_extras="translators-openai",
     ),
