@@ -1,142 +1,174 @@
 # JustReadIt
 
-> Windows-only hover-translation tool for Light.VN-based RPG games.
+> 专为 Light.VN 引擎 RPG 游戏设计的 Windows 悬停翻译工具。
+
+中文 | [English](README.en.md)
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg)]()
 
-JustReadIt is a real-time translation overlay for Windows. Move your mouse over in-game text, and a transparent overlay instantly shows you the translation — no copy-paste, no alt-tabbing.
+JustReadIt 是一个 Windows 实时翻译悬浮窗工具。将鼠标移到游戏文字上，透明悬浮窗即时显示翻译结果——无需复制粘贴，无需切换窗口。
 
 ---
 
-## Features
+## 功能特性
 
-- **DXGI Desktop Duplication capture** — works on DirectX games where `BitBlt`/`PrintWindow` produce black frames
-- **Windows OCR** — built-in, no external model downloads required; upscales small fonts for accuracy
-- **Native text hook** — uses Frida to hook EXE function prologues and read CJK strings directly from game memory via a Named Pipe, then cross-validates with OCR output using Levenshtein matching
-- **Freeze mode** — hotkey freezes a screenshot as a topmost overlay so you can hover-translate at your own pace; right-click to dismiss and return focus to the game
-- **Pluggable translation backends** — clean `Translator` ABC; Cloud Translation API and OpenAI (with rolling context summary) planned
-- **Perceptual-hash cache** — phash of the translation region avoids redundant OCR and translation calls for unchanged text
-- **PySide6 debug window** — capture preview, OCR bounding-box overlay, hook output viewer
+- **DXGI Desktop Duplication 截图** — 专为 DirectX 游戏设计，彻底避免 `BitBlt`/`PrintWindow` 截黑屏的问题
+- **Windows OCR** — 使用系统内置 OCR，无需下载外部模型；对小字体自动超分辨率提升识别精度
+- **ReadProcessMemory 内存扫描** — 零注入读取游戏进程堆内存，含热区缓存约 10–50 ms 提取原始 CJK 文本，再与 OCR 结果做 Levenshtein 交叉验证
+- **冻结模式** — 快捷键将当前画面冻结为置顶悬浮截图，可随意悬停翻译；右键关闭并将焦点归还游戏
+- **可扩展翻译后端** — 干净的 `Translator` 抽象基类；已实现：免费 Google、Cloud Translation API、OpenAI 兼容接口（RAG + 函数调用，基于 `KnowledgeBase`）
+- **双层翻译缓存** — 感知哈希（phash）内存去重 + SQLite 持久化文本缓存（以源文本为键），跨会话避免重复翻译请求
+- **MCP 知识库** — 游戏专属术语词典与剧情事件日志，进程内翻译器与外部 MCP 客户端（Claude Desktop、Cursor 等）共享同一数据库
+- **PySide6 调试窗口** — 截图预览、OCR 边框叠层、内存扫描结果面板
 
 ---
 
-## Architecture
+## 架构
 
 ```
-Mouse hover / Freeze hotkey
-  -> DXGI Desktop Duplication capture (src/capture.py)
-    -> Windows OCR small-area probe (src/ocr/windows_ocr.py)
-      -> no text -> return to idle
-      -> text found -> phash of translation region (src/cache.py)
-        -> cache hit -> show overlay
-        -> cache miss:
-            -> full-screen Windows OCR -> range detection (src/ocr/range_detectors.py)
-            -> Levenshtein cross-match with DLL hook output (src/correction.py)
-              -> match success -> use cleaned hook text
-              -> match failure -> fall back to OCR text
-            -> translate (src/translators/) -> cache -> show overlay (src/overlay.py)
+鼠标移动 / 冻结快捷键
+  -> DXGI Desktop Duplication 截图 (src/capture.py)
+    -> Windows OCR 小区域探测 (src/ocr/windows_ocr.py)
+      -> 无文字 -> 返回空闲
+      -> 有文字 -> 对翻译区域计算 phash (src/cache.py)
+        -> 缓存命中 -> 显示悬浮窗
+        -> 缓存未命中:
+            -> 全屏 OCR -> 范围检测 (src/ocr/range_detectors.py)
+            -> 文本缓存查询 (src/cache.py TranslationCache)
+              -> 缓存命中 -> 显示悬浮窗
+              -> 缓存未命中:
+                  -> pick_needle(ocr_text) -> MemoryScanner.scan(needle) (src/memory/)
+                  -> Levenshtein 交叉匹配 (src/correction.py)
+                    -> 匹配成功 -> 使用内存扫描得到的干净文本
+                    -> 匹配失败 -> 回退到 OCR 文本
+                  -> 翻译 (src/translators/) -> 写入缓存 -> 显示悬浮窗 (src/overlay.py)
 ```
 
-### Component map
+### 模块一览
 
-| Component | Path | Role |
+| 模块 | 路径 | 作用 |
 |---|---|---|
-| Target process | `src/target.py` | `GameTarget` frozen dataclass — PID, HWND, window/capture rects, dxcam output index |
-| Screen capture | `src/capture.py` | DXGI Desktop Duplication via dxcam |
-| OCR engine | `src/ocr/windows_ocr.py` | `WindowsOcr` — upscale-then-downscale for small fonts; PIL ↔ WinRT bitmap bridge |
-| Range detection | `src/ocr/range_detectors.py` | `RangeDetector` ABC + `run_detectors()` chain runner |
-| Hook discovery | `src/hook/hook_search.py` | `HookSearcher` — bulk-hooks EXE function prologues, reads CJK strings from Named Pipe |
-| Hook value objects | `src/hook/hook_code.py` | `HookCode` frozen dataclass; `HookCandidate` live hit accumulator |
-| Candidate scorer | `src/hook/candidate_scorer.py` | `score_candidate(text, lang)` — hard-reject filters + per-language subclasses |
-| Hook cleaner | `src/hook/cleaner.py` | `Cleaner` ABC rule chain — `StripControlChars`, `DeduplicateLines`, `TrimWhitespace` |
-| Correction | `src/correction.py` | Levenshtein cross-match between OCR and hook results |
-| Cache | `src/cache.py` | Perceptual-hash keyed translation cache |
-| Translation | `src/translators/` | `Translator` ABC; Cloud Translation API + OpenAI planned |
-| Config | `src/config.py` | `AppConfig` — typed `QSettings` wrapper, INI at `%APPDATA%\JustReadIt\config.ini` |
-| Debug UI | `src/ui/` | PySide6 debug window + window picker |
-| Overlay | `src/overlay.py` | Topmost transparent overlay, Freeze mode |
+| 目标进程 | `src/target.py` | `GameTarget` 冻结数据类 — PID、HWND、窗口/捕获矩形、dxcam 输出索引 |
+| 屏幕截图 | `src/capture.py` | 基于 dxcam 的 DXGI Desktop Duplication |
+| OCR 引擎 | `src/ocr/windows_ocr.py` | `WindowsOcr` — 小字体超分后缩放；PIL ↔ WinRT 位图桥接 |
+| 范围检测 | `src/ocr/range_detectors.py` | `RangeDetector` 抽象基类 + `run_detectors()` 责任链 |
+| 内存扫描 | `src/memory/scanner.py` | `MemoryScanner` — 零注入 `ReadProcessMemory`；热区缓存；编码自学习（UTF-16LE / UTF-8 / Shift-JIS）；可选 `mem_scan.dll` C 加速器 |
+| 内存 Win32 | `src/memory/_win32.py` | `VirtualQueryEx` / `ReadProcessMemory` ctypes 绑定 — 仅 `PROCESS_VM_READ` |
+| 结果校正 | `src/correction.py` | OCR 与内存扫描结果之间的 Levenshtein 交叉匹配（rapidfuzz） |
+| 缓存 | `src/cache.py` | `PhashCache` — 感知哈希内存去重；`TranslationCache` — `(源文本, 源语言, 目标语言)` 为键的 SQLite 持久化缓存 |
+| 翻译后端 | `src/translators/` | `Translator` 抽象基类；已实现：免费 Google、Cloud Translation API、OpenAI 兼容（RAG + 函数调用，依托 `KnowledgeBase`） |
+| 知识库 | `src/knowledge/` | BM25 + 向量混合（RRF）检索；`record_term`、`record_event`、`search` — 进程内翻译器与 MCP 服务器共享 |
+| MCP 服务器 | `src/mcp_server.py` | stdio MCP 服务器（`FastMCP`）；向 Claude Desktop、Cursor 等暴露同样的 3 个工具 |
+| 配置 | `src/config.py` | `AppConfig` — 类型化 `QSettings` 封装，INI 位于 `%APPDATA%\JustReadIt\config.ini` |
+| 调试 UI | `src/ui/` | PySide6 调试窗口 + 窗口选择器 |
+| 悬浮窗 | `src/overlay.py` | 置顶透明悬浮窗，冻结模式 |
 
 ---
 
-## Requirements
+## 环境要求
 
-- **Windows 10 / 11** (Windows OCR and DXGI Desktop Duplication are Windows-only APIs)
+- **Windows 10 / 11**（Windows OCR 与 DXGI Desktop Duplication 均为 Windows 专属 API）
 - **Python 3.11+**
-- The target game must be a **Light.VN-based** title (the hook search is tuned for Light.VN engine internals)
+- 主要针对 **Light.VN** 引擎游戏；内存扫描器为通用实现，可用于任何支持 `ReadProcessMemory` 的游戏进程
 
 ---
 
-## Installation
+## 安装
 
 ```powershell
-# Clone the repository
+# 克隆仓库
 git clone https://github.com/Laurence-042/JustReadIt.git
 cd JustReadIt
 
-# Install core dependencies
+# 安装核心依赖
 pip install -e .
 
-# Install UI extras (PySide6) for the debug window
+# 安装 UI 扩展（PySide6，用于调试窗口）
 pip install -e ".[ui]"
 
-# Install dev tools (pytest, type stubs, etc.)
+# 安装开发工具（pytest、类型存根等）
 pip install -e ".[dev]"
 ```
 
 ---
 
-## Usage
+## 使用方法
 
 ```powershell
-# Launch the PySide6 debug / test window
+# 启动 PySide6 调试 / 测试窗口
 python main.py --debug
 
-# Headless mode (not yet implemented)
+# 无界面模式（尚未实现）
 python main.py
 ```
 
 ---
 
-## Development
+## MCP 知识库
+
+游戏知识库（`%APPDATA%\JustReadIt\knowledge.db`）通过 stdio [Model Context Protocol](https://modelcontextprotocol.io/) 服务器对外暴露，外部 MCP 客户端（Claude Desktop、Cursor、VS Code 等）可直接查询或写入知识库。
+
+**安装 MCP 依赖**
 
 ```powershell
-# Run the test suite
+pip install -e ".[knowledge]"
+```
+
+**手动启动服务器**（用于测试）
+
+```powershell
+python -m src.mcp_server
+# 指定自定义数据库路径
+python -m src.mcp_server --db C:\path\to\my_game.db
+```
+
+**配置 Claude Desktop**（`%APPDATA%\Claude\claude_desktop_config.json`）
+
+```json
+{
+  "mcpServers": {
+    "justreadit": {
+      "command": "python",
+      "args": ["-m", "src.mcp_server"],
+      "cwd": "C:/Users/<你的用户名>/Documents/workspace/python/JustReadIt"
+    }
+  }
+}
+```
+
+**可用工具**
+
+| 工具 | 说明 |
+|---|---|
+| `record_term` | 保存角色名、地点、道具或词汇术语及其译文 |
+| `record_event` | 追加 2–4 句剧情事件摘要 |
+| `search_terms` | 对所有已存储术语和事件执行 BM25 + 向量混合检索 |
+
+此处写入的知识对进程内 OpenAI 兼容翻译器立即生效（反之亦然），因为两者共享同一个 SQLite 文件。
+
+---
+
+## 开发
+
+```powershell
+# 运行测试套件
 pytest
 ```
 
-The codebase follows a **chain-of-responsibility** pattern for extensible rules:
+代码库遵循**责任链**模式实现可扩展规则：
 
-- **Range detectors** (`src/ocr/range_detectors.py`): implement `RangeDetector` and append to `DEFAULT_DETECTORS`.
-- **Hook cleaners** (`src/hook/cleaner.py`): implement `Cleaner` and append to the default chain.
-- **Translation backends** (`src/translators/`): implement the `Translator` ABC.
+- **范围检测器**（`src/ocr/range_detectors.py`）：实现 `RangeDetector` 并追加到 `DEFAULT_DETECTORS`。
+- **翻译后端**（`src/translators/`）：实现 `Translator` 抽象基类。
 
-All files begin with `from __future__ import annotations`. Types are pervasive (PEP 604 `X | None`, PEP 585 generics). See `.github/copilot-instructions.md` for full code-style guidelines.
-
----
-
-## Acknowledgements
-
-### Conceptual inspiration: Textractor
-
-The text-hook subsystem (`src/hook/`) was **conceptually inspired by [Textractor](https://github.com/Artikash/Textractor)**, a widely used open-source game-text extractor.
-
-Specifically, the general idea of bulk-hooking EXE function prologues to discover which ones emit CJK text strings at runtime originates from Textractor's hook-search approach.
-
-**Important clarifications:**
-
-- **No source code from Textractor was copied or incorporated.** The hook engine (`hook_engine.dll`), the Python hook-search orchestration (`src/hook/hook_search.py`), the candidate scoring logic, and the Named Pipe transport are all original implementations written independently.
-- **The execution flow differs substantially:** Textractor is a standalone C++ application that injects a DLL and routes text through a GUI extension pipeline. JustReadIt runs the hook search as a subordinate phase within a Python OCR-and-translation pipeline: hook output is cross-validated against Windows OCR results via Levenshtein matching before being accepted, and the translation is rendered as a DXGI-captured overlay rather than forwarded to clipboard or a separate UI.
-- Textractor is licensed under the GNU General Public License v3.0; this project is independently authored and licensed under the **Mozilla Public License 2.0**.
-
-Full credit and thanks to [Artikash](https://github.com/Artikash) and all Textractor contributors for pioneering and open-sourcing the hook-search technique.
+所有文件均以 `from __future__ import annotations` 开头。类型标注全面使用 PEP 604（`X | None`）和 PEP 585 泛型。完整代码风格指南见 `.github/copilot-instructions.md`。
 
 ---
 
-## License
+## 许可证
 
-This Source Code Form is subject to the terms of the **Mozilla Public License, v. 2.0**.
-If a copy of the MPL was not distributed with this file, you can obtain one at https://mozilla.org/MPL/2.0/.
+本源代码受 **Mozilla Public License, v. 2.0** 约束。
+如未随本文件收到 MPL 副本，可从 https://mozilla.org/MPL/2.0/ 获取。
 
-See [`LICENSE`](LICENSE) for the full license text.
+完整许可证文本见 [`LICENSE`](LICENSE)。
