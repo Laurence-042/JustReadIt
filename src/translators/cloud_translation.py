@@ -49,7 +49,6 @@ class CloudTranslationTranslator(Translator):
         self,
         api_key: str | None = None,
         *,
-        timeout: float = 10.0,
         progress: "Callable[[str], None] | None" = None,
     ) -> None:
         ensure_package(
@@ -66,11 +65,12 @@ class CloudTranslationTranslator(Translator):
             ) from exc
 
         if api_key:
-            self._client: _GCTClient = _gct.Client(client_options={"api_key": api_key})
+            # client_options={"api_key": ...} still triggers google.auth.default()
+            # internally.  Use google.auth.api_key.Credentials to bypass ADC entirely.
+            from google.auth.api_key import Credentials as _ApiKeyCreds  # type: ignore[import-untyped]
+            self._client: _GCTClient = _gct.Client(credentials=_ApiKeyCreds(api_key))
         else:
             self._client = _gct.Client()  # ADC / service account
-
-        self._timeout = timeout
 
     # ── Translator ────────────────────────────────────────────────────
 
@@ -103,7 +103,6 @@ class CloudTranslationTranslator(Translator):
                 text,
                 source_language=source,
                 target_language=target_lang,
-                timeout=self._timeout,
             )
         except Exception as exc:
             raise RuntimeError(

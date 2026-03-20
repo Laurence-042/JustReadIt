@@ -110,6 +110,17 @@ def ensure_package(
     # first time (frozen mode).
     _inject_user_lib()
 
+    # Invalidate the import cache so the freshly installed package is visible.
+    importlib.invalidate_caches()
+
+    # For namespace packages (e.g. google, google.cloud) Python caches a stale
+    # __path__ in sys.modules after the first failed import.  Remove all
+    # ancestor entries so they are rediscovered with the newly installed paths.
+    parts = import_name.split(".")
+    for i in range(len(parts)):
+        key = ".".join(parts[: i + 1])
+        sys.modules.pop(key, None)
+
     # Verify the package is now importable.
     try:
         importlib.import_module(import_name)
