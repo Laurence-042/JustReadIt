@@ -166,4 +166,37 @@ class AppConfig:
         s.setValue("openai/summary_trigger", value)
         s.sync()
 
+    # ── Hover overlay ──────────────────────────────────────────────────
 
+    @property
+    def freeze_vk(self) -> int:
+        """Virtual-key code for the Freeze hotkey (default 0x78 = F9)."""
+        return int(_make_qsettings().value("overlay/freeze_vk", 0x78))
+
+    @freeze_vk.setter
+    def freeze_vk(self, value: int) -> None:
+        s = _make_qsettings()
+        s.setValue("overlay/freeze_vk", value)
+        s.sync()
+
+    @property
+    def overlay_auto_hide_ms(self) -> int:
+        """Auto-hide delay for the translation popup in ms (default 5000)."""
+        return int(_make_qsettings().value("overlay/auto_hide_ms", 5000))
+
+    @overlay_auto_hide_ms.setter
+    def overlay_auto_hide_ms(self, value: int) -> None:
+        s = _make_qsettings()
+        s.setValue("overlay/auto_hide_ms", value)
+        s.sync()
+
+    @property
+    def settle_ms(self) -> int:
+        """Milliseconds cursor must remain still before OCR probe (default 500)."""
+        return int(_make_qsettings().value("hover/settle_ms", 500))
+
+    @settle_ms.setter
+    def settle_ms(self, value: int) -> None:
+        s = _make_qsettings()
+        s.setValue("hover/settle_ms", value)
+        s.sync()

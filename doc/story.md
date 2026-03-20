@@ -244,10 +244,10 @@ Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"
 - [x] 实现 stdio MCP server（`src/mcp_server.py`，`mcp` 官方 SDK）：Claude Desktop / Cursor 等外部工具可直接连接知识库
 
 ### 遮罩与交互
-- [ ] 实现翻译结果置顶遮罩窗口（透明背景，文字叠加）
-- [ ] 实现悬停触发逻辑（鼠标大幅移动后悬停检测）
-- [ ] 实现 Freeze 模式：快捷键触发、截图遮罩、右键关闭
-- [ ] 实现焦点归还逻辑（`AllowSetForegroundWindow` + `SetForegroundWindow`）
+- [x] 实现翻译结果置顶遮罩窗口（透明背景，文字叠加）
+- [x] 实现悬停触发逻辑（鼠标大幅移动后悬停检测）
+- [x] 实现 Freeze 模式：快捷键触发、截图遮罩、右键关闭
+- [x] 实现焦点归还逻辑（`AllowSetForegroundWindow` + `SetForegroundWindow`）
 
 ### 发布
 - [ ] 编写用户文档（安装、翻译插件选择）
