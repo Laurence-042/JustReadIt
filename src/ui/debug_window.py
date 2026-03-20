@@ -43,7 +43,7 @@ from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apa
 from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
 from src.memory import MemoryScanner, pick_needles
 from src.correction import best_match_with_details
-from src.translators.base import Translator
+from src.translators.base import PROVIDERS, PROVIDERS_BY_KEY, Translator
 from src.translators.factory import build_translator
 from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT
 from .window_picker import WindowPicker
@@ -1005,13 +1005,9 @@ class DebugWindow(QMainWindow):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Backend:"))
         self._cmb_backend = QComboBox()
-        for label, val in [
-            ("\u2014 None \u2014", "none"),
-            ("Google Translate (free, no key)", "google_free"),
-            ("Google Cloud Translation (API key)", "cloud"),
-            ("OpenAI", "openai"),
-        ]:
-            self._cmb_backend.addItem(label, userData=val)
+        self._cmb_backend.addItem("\u2014 None \u2014", userData="none")
+        for p in PROVIDERS:
+            self._cmb_backend.addItem(p.display_name, userData=p.key)
         row1.addWidget(self._cmb_backend)
         row1.addSpacing(12)
         row1.addWidget(QLabel("Target lang:"))
@@ -1127,7 +1123,8 @@ class DebugWindow(QMainWindow):
     def _on_backend_changed(self, index: int) -> None:
         """Show/hide backend-specific fields based on the selected backend."""
         backend = self._cmb_backend.itemData(index) or "none"
-        self._row_api_key.setVisible(backend == "cloud")
+        info = PROVIDERS_BY_KEY.get(backend)
+        self._row_api_key.setVisible(bool(info and info.needs_api_key))
         self._openai_fields.setVisible(backend == "openai")
         # Repopulate API key field with the relevant stored value
         if backend == "openai":
@@ -1196,18 +1193,57 @@ class DebugWindow(QMainWindow):
         if self._worker_thread is not None and self._worker_thread.isRunning():
             self._run()
 
+    def _build_translator_from_ui(self) -> "Translator | None":
+        """Instantiate a translator from current UI fields without persisting to config."""
+        backend = self._cmb_backend.currentData() or "none"
+        if backend in ("none", ""):
+            return None
+        progress = lambda msg: (  # noqa: E731
+            self._lbl_tl_status.setText(msg),
+            QApplication.processEvents(),
+        )
+        api_key = self._le_api_key.text().strip()
+        if backend == "cloud":
+            from src.translators.cloud_translation import CloudTranslationTranslator
+            return CloudTranslationTranslator(api_key=api_key or None, progress=progress)
+        if backend == "google_free":
+            from src.translators.google_free import GoogleFreeTranslator
+            return GoogleFreeTranslator(progress=progress)
+        if backend == "openai":
+            from src.translators.openai_translator import OpenAITranslator
+            return OpenAITranslator(
+                api_key=api_key,
+                model=self._le_model.text().strip() or "gpt-4o-mini",
+                system_prompt=self._te_system_prompt.toPlainText().strip(),
+                context_window=_cfg.openai_context_window,
+                summary_trigger=_cfg.openai_summary_trigger,
+                base_url=self._le_base_url.text().strip() or None,
+                progress=progress,
+            )
+        raise RuntimeError(f"Unknown backend: {backend!r}")
+
     @Slot()
     def _on_test_translator(self) -> None:
-        """Translate a short fixed string to verify the backend is working."""
-        if self._translator is None:
-            self._lbl_tl_status.setText("No active translator \u2014 click Apply first.")
+        """Build a temporary translator from current UI fields and run a test translation.
+
+        Does *not* persist settings or replace the active translator — use Apply for that.
+        """
+        target_lang = self._le_target_lang.text().strip() or "en"
+        self._lbl_tl_status.setText("Building\u2026")
+        QApplication.processEvents()
+        try:
+            translator = self._build_translator_from_ui()
+        except RuntimeError as exc:
+            self._lbl_tl_status.setText(f"\u26a0 {exc}")
             return
-        target_lang = _cfg.translator_target_lang or "en"
+        if translator is None:
+            self._lbl_tl_status.setText("No backend selected.")
+            return
         test_src = "\u3053\u3093\u306b\u3061\u306f\u3001\u4e16\u754c\uff01"  # "こんにちは、世界！"
         self._lbl_tl_status.setText("Testing\u2026")
         QApplication.processEvents()
         try:
-            result = self._translator.translate(test_src, target_lang=target_lang)
+            result = translator.translate(test_src, target_lang=target_lang)
             self._lbl_tl_status.setText(f"Test \u2713  {test_src!r} \u2192 {result!r}")
         except Exception as exc:
             self._lbl_tl_status.setText(f"Test failed: {exc}")

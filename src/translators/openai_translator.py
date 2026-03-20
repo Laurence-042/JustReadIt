@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from src.translators._installer import ensure_package
-from src.translators.base import Translator
+from src.translators.base import AuthError, RateLimitError, TranslationError, Translator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -164,7 +164,9 @@ class OpenAITranslator(Translator):
         if not text.strip():
             return text
 
-        messages = self._build_messages(text, source_lang, target_lang)
+        src = source_lang
+        tgt = target_lang
+        messages = self._build_messages(text, src, tgt)
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
@@ -173,7 +175,12 @@ class OpenAITranslator(Translator):
                 timeout=self._timeout,
             )
         except Exception as exc:
-            raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
+            msg = str(exc)
+            if "401" in msg or "authentication" in msg.lower() or "api_key" in msg.lower():
+                raise AuthError(f"OpenAI authentication failed: {exc}") from exc
+            if "429" in msg or "rate" in msg.lower():
+                raise RateLimitError(f"OpenAI rate limited: {exc}") from exc
+            raise TranslationError(f"OpenAI API request failed: {exc}") from exc
 
         translation: str = response.choices[0].message.content or ""
         translation = translation.strip()

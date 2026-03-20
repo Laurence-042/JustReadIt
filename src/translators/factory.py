@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
+from src.translators.base import PROVIDERS_BY_KEY
+
 if TYPE_CHECKING:
     from src.config import AppConfig
     from src.translators.base import Translator
@@ -81,7 +83,7 @@ def build_translator(
             progress=progress,
         )
 
+    valid = "'none', " + ", ".join(f"'{k}'" for k in PROVIDERS_BY_KEY)
     raise RuntimeError(
-        f"Unknown translator backend: {backend!r}.  "
-        f"Valid values are: 'none', 'cloud', 'google_free', 'openai'."
+        f"Unknown translator backend: {backend!r}.  Valid values are: {valid}."
     )

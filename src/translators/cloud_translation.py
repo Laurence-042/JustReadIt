@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from src.translators._installer import ensure_package
-from src.translators.base import Translator
+from src.translators.base import AuthError, NetworkError, TranslationError, Translator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -105,7 +105,12 @@ class CloudTranslationTranslator(Translator):
                 target_language=target_lang,
             )
         except Exception as exc:
-            raise RuntimeError(
+            msg = str(exc)
+            if "403" in msg or "credentials" in msg.lower() or "API key" in msg:
+                raise AuthError(f"Cloud Translation API auth failed: {exc}") from exc
+            if "429" in msg or "quota" in msg.lower():
+                raise NetworkError(f"Cloud Translation API rate limited: {exc}") from exc
+            raise TranslationError(
                 f"Cloud Translation API request failed: {exc}"
             ) from exc
 

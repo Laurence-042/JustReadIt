@@ -1,13 +1,15 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-"""Free (no-API-key) Google Translate backend.
+"""Free (no-API-key) Google Translate backend via ``deep-translator``.
 
-Uses the internal endpoint (``translate.googleapis.com``) that Google's own
-mobile apps use — ``client=gtx``, no billing account or API key required.
+Uses the same unofficial endpoint as the Google Translate web page \u2014 no
+billing account or API key required.  Suitable for testing and light personal
+use; not recommended for production throughput.
 
-Uses only the Python standard library (``urllib``); no third-party packages
-are installed.
+Requirements::
+
+    pip install deep-translator
 
 Usage::
 
@@ -18,42 +20,39 @@ Usage::
 """
 from __future__ import annotations
 
-import json
-import urllib.parse
-import urllib.request
 from typing import TYPE_CHECKING
 
-from src.translators.base import Translator
+from src.translators._installer import ensure_package
+from src.translators.base import TranslationError, Translator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
-# Endpoint constants
+# deep-translator BCP-47 adapter
 # ---------------------------------------------------------------------------
-
-_GTX_URL = "https://translate.googleapis.com/translate_a/single"
-
-# Request headers that mimic a browser to avoid bot-detection 429s.
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+# deep-translator's GoogleTranslator does not accept bare macro tags or
+# script-only subtags.  Map from canonical BCP-47 to its expected codes.
+_DEEP_TRANSLATOR_LANG: dict[str, str] = {
+    "zh":      "zh-CN",   # macro tag → Simplified (most common default)
+    "zh-Hans": "zh-CN",
+    "zh-Hant": "zh-TW",
 }
 
-_TIMEOUT = 10  # seconds
+
+def _to_deep_translator_lang(bcp47: str) -> str:
+    """Map a canonical BCP-47 tag to the code deep-translator accepts."""
+    return _DEEP_TRANSLATOR_LANG.get(bcp47, bcp47)
 
 
 class GoogleFreeTranslator(Translator):
-    """Translation backend using the unofficial Google Translate internal API.
+    """Translation backend backed by the free (unofficial) Google Translate API.
 
-    No API key or account needed.
+    Wraps :class:`deep_translator.GoogleTranslator`.  No API key is needed.
 
     Args:
-        progress: Optional status callback (currently unused, kept for API
-            parity with other backends).
+        progress: Optional status callback used during automatic package
+            installation.
     """
 
     def __init__(
@@ -61,7 +60,10 @@ class GoogleFreeTranslator(Translator):
         *,
         progress: "Callable[[str], None] | None" = None,
     ) -> None:
-        pass  # No package installation required.
+        ensure_package("deep-translator>=1.11", "deep_translator", progress=progress)
+        # Eagerly import to surface InstallationError early.
+        import deep_translator as _dt  # type: ignore[import-untyped]
+        self._gt_cls = _dt.GoogleTranslator
 
     # ── Translator ────────────────────────────────────────────────────
 
@@ -89,44 +91,13 @@ class GoogleFreeTranslator(Translator):
         if not text.strip():
             return text
 
-        src = source_lang if source_lang not in ("auto", "") else "auto"
+        src = source_lang if source_lang else "auto"
+        tgt = _to_deep_translator_lang(target_lang)
         try:
-            return _gtx_translate(text, src, target_lang)
+            result: str = self._gt_cls(source=src, target=tgt).translate(text)
         except Exception as exc:
-            raise RuntimeError(
+            raise TranslationError(
                 f"Google Translate (free) request failed: {exc}"
             ) from exc
 
-
-# ---------------------------------------------------------------------------
-# Backend implementations
-# ---------------------------------------------------------------------------
-
-def _gtx_translate(text: str, src: str, tgt: str) -> str:
-    """Call the unofficial Google Translate internal endpoint."""
-    params = urllib.parse.urlencode(
-        {
-            "client": "gtx",
-            "sl": src,
-            "tl": tgt,
-            "dt": "t",
-            "q": text,
-        }
-    )
-    url = f"{_GTX_URL}?{params}"
-    req = urllib.request.Request(url, headers=_HEADERS)
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    # Response structure: [ [[translated, original, ...], ...], ..., src_lang ]
-    # Concatenate all translated segments from data[0].
-    try:
-        translated = "".join(
-            segment[0] for segment in data[0] if segment[0]
-        )
-    except (IndexError, TypeError) as exc:
-        raise RuntimeError(f"Unexpected GTX response format: {data!r}") from exc
-
-    if not translated:
-        raise RuntimeError("GTX returned an empty translation.")
-    return translated
+        return result or text

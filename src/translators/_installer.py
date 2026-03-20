@@ -110,25 +110,20 @@ def ensure_package(
     # first time (frozen mode).
     _inject_user_lib()
 
-    # Invalidate the import cache so the freshly installed package is visible.
-    importlib.invalidate_caches()
+    # Verify importability in a fresh subprocess — the current process's import
+    # machinery may not discover newly installed packages reliably (stale finder
+    # caches, .pth files only processed at startup, namespace package __path__
+    # not updated).  A child process always starts with a clean state.
+    _verify_importable_subprocess(pip_name, import_name)
 
-    # For namespace packages (e.g. google, google.cloud) Python caches a stale
-    # __path__ in sys.modules after the first failed import.  Remove all
-    # ancestor entries so they are rediscovered with the newly installed paths.
+    # Now do the actual in-process import so the package is ready for use.
+    # Flush caches and stale sys.modules entries first.
+    importlib.invalidate_caches()
     parts = import_name.split(".")
     for i in range(len(parts)):
         key = ".".join(parts[: i + 1])
         sys.modules.pop(key, None)
-
-    # Verify the package is now importable.
-    try:
-        importlib.import_module(import_name)
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Package '{pip_name}' was installed but '{import_name}' could not "
-            f"be imported.  Please restart the application and try again."
-        ) from exc
+    importlib.import_module(import_name)
 
     if progress:
         progress(f"'{pip_name}' installed successfully.")
@@ -137,6 +132,33 @@ def ensure_package(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _verify_importable_subprocess(pip_name: str, import_name: str) -> None:
+    """Verify *import_name* is importable in a fresh child process.
+
+    A child process always has a clean import state, so this reliably catches
+    cases where the current process's import machinery fails to discover a
+    freshly installed package (stale finder caches, namespace package
+    ``__path__`` not updated, ``.pth`` files only processed at startup, etc.).
+
+    Raises:
+        RuntimeError: If the package cannot be imported in the child process.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {import_name}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Package '{pip_name}' was installed but '{import_name}' could not "
+            f"be imported.  Please restart the application and try again.\n"
+            f"{result.stderr.strip()}"
+        )
+
 
 def _install_subprocess(pip_name: str, *, progress: Progress | None) -> None:
     """Non-frozen install via ``subprocess`` + ``sys.executable``."""
