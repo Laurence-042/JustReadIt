@@ -29,6 +29,7 @@ def build_translator(
     config: "AppConfig",
     *,
     progress: Callable[[str], None] | None = None,
+    knowledge_base: "object | None" = None,
 ) -> "Translator | None":
     """Instantiate the configured translation backend.
 
@@ -44,6 +45,8 @@ def build_translator(
         config: Application configuration to read translator settings from.
         progress: Optional callback receiving status strings during
             dependency installation (e.g. to update a UI label).
+        knowledge_base: Optional :class:`~src.knowledge.KnowledgeBase` to
+            pass to the OpenAI-compatible backend for RAG and tool calling.
 
     Returns:
         A ready-to-use :class:`~src.translators.base.Translator`, or ``None``.
@@ -78,8 +81,8 @@ def build_translator(
             model=config.openai_model.strip() or "gpt-4o-mini",
             system_prompt=config.openai_system_prompt,
             context_window=config.openai_context_window,
-            summary_trigger=config.openai_summary_trigger,
             base_url=config.openai_base_url.strip() or None,
+            knowledge_base=knowledge_base,  # type: ignore[arg-type]
             progress=progress,
         )
 

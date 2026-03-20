@@ -1,40 +1,54 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-"""OpenAI-compatible API translation backend with rolling summary context agent.
+"""OpenAI-compatible API translation backend with KnowledgeBase RAG + tool use.
 
 Works with any endpoint that implements the OpenAI Chat Completions API,
 including OpenAI itself, OpenRouter, local Ollama proxies, Azure OpenAI, etc.
 Point ``base_url`` at the desired endpoint; the ``api_key`` format is
 provider-specific.
 
-Suitable for dialogue, plot text and long-form content where understanding
-previous exchanges improves translation quality.
+Context strategy
+----------------
+Previous versions injected rolling translation history verbatim into each
+request.  This caused context pollution when OCR misread a region and
+produced garbled text that was then fed back as if it were clean dialogue.
 
-**Context management** — two-stage rolling window:
+The current version uses a two-level context strategy that is pollution-safe:
 
-1. *Recent history*: the last ``context_window`` (source, translation) pairs
-   are appended verbatim to each request so the model understands recent
-   exchanges.
-2. *Summary agent*: once ``summary_trigger`` total pairs have accumulated,
-   the oldest chunk is condensed into a single summary paragraph via a
-   dedicated summarisation call.  The summary is injected into the system
-   prompt of all subsequent requests instead of the verbose raw history,
-   keeping token usage bounded.
+1. **RAG injection (long-term, persistent)**: Before each call, the
+   :class:`~src.knowledge.KnowledgeBase` is searched for terms and events
+   relevant to the source text.  Only explicitly confirmed knowledge (saved
+   via function calls from the model itself) reaches future requests.
+
+2. **Recent pairs (short-term, volatile)**: A small sliding buffer of the
+   last ``context_window`` (source, translation) pairs is injected as
+   alternating user/assistant turns for immediate conversational continuity.
+   Callers control whether a result is added to this buffer via the
+   ``add_to_history`` flag on :meth:`translate` — set it to ``False`` when
+   OCR confidence is low or memory-scan correction did not succeed.
+
+3. **LLM-driven knowledge capture**: The model receives three function tools
+   (``record_term``, ``record_event``, ``search_terms``) and may call them
+   during translation.  The translator runs a tool-call loop until the model
+   produces a final plain-text response.
 
 Requirements::
 
     pip install openai
+    pip install justreadit[knowledge]   # for KnowledgeBase
 
 Usage::
 
     from src.translators.openai_translator import OpenAICompatTranslator
+    from src.knowledge import KnowledgeBase
 
+    kb = KnowledgeBase.open("alcia.db")
     translator = OpenAICompatTranslator(
         api_key="sk-...",
         # base_url="https://openrouter.ai/api/v1",  # any compatible endpoint
+        knowledge_base=kb,
         system_prompt="You are translating a Japanese fantasy RPG into English.",
-        context_window=8,
     )
     result = translator.translate("この剣は伝説の武器だ。", target_lang="en")
 """
@@ -49,6 +63,7 @@ from src.translators.base import AuthError, RateLimitError, TranslationError, Tr
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from src.knowledge.knowledge_base import KnowledgeBase
 
 # ---------------------------------------------------------------------------
 # Default system prompt (supports {source_lang} / {target_lang} placeholders)
@@ -62,6 +77,10 @@ DEFAULT_SYSTEM_PROMPT: str = (
     "- Preserve all punctuation, line breaks, and formatting from the source text.\n"
     "- Translate character names phonetically unless a localised name is known.\n"
     "- Keep honorifics (san, kun, chan\u2026) as-is if no natural equivalent exists.\n"
+    "- Before translating a name or term, call search_terms to check if it was "
+    "already recorded.\n"
+    "- When you translate a new character name or game-specific term, call "
+    "record_term to save it.\n"
     "- Source language: {source_lang}.  Target language: {target_lang}."
 )
 
@@ -92,16 +111,30 @@ class OpenAICompatTranslator(Translator):
         model: Model name as accepted by the provider (default ``"gpt-4o-mini"``).
         system_prompt: User-supplied system prompt prepended to every request.
             Describe the game world, character names, writing style, etc.
-        context_window: Number of most-recent (source, translation) pairs
-            included verbatim in each request (default 10).
-        summary_trigger: When the total history length reaches this value,
-            the oldest half is condensed into a summary paragraph (default 20).
+        context_window: Maximum number of recent (source, translation) pairs
+            kept as short-term conversational context (default 3).  Unlike the
+            old rolling-window approach, pairs are only added when
+            ``add_to_history=True`` is passed to :meth:`translate`, preventing
+            OCR garbage from polluting future requests.
         base_url: OpenAI-compatible endpoint URL.  Examples::
 
                 https://openrouter.ai/api/v1          # OpenRouter
                 http://localhost:11434/v1              # Ollama
                 https://<resource>.openai.azure.com/  # Azure OpenAI
 
+        knowledge_base: Optional :class:`~src.knowledge.KnowledgeBase`.
+            When provided:
+
+            * Relevant terms and events are retrieved via hybrid RAG search
+              and injected into the system prompt before each call.
+            * The model receives ``record_term``, ``record_event`` and
+              ``search_terms`` function tools and a tool-call loop handles
+              multi-step responses.
+
+        tools_enabled: If ``True`` (default) and *knowledge_base* is set,
+            include KB tools in every API call.  Set to ``False`` to use RAG
+            injection only (no function calling), useful for models with
+            poor function-calling support.
         timeout: Per-request timeout in seconds (default 30).
     """
 
@@ -111,9 +144,10 @@ class OpenAICompatTranslator(Translator):
         *,
         model: str = "gpt-4o-mini",
         system_prompt: str = "",
-        context_window: int = 10,
-        summary_trigger: int = 20,
+        context_window: int = 3,
         base_url: str | None = None,
+        knowledge_base: "KnowledgeBase | None" = None,
+        tools_enabled: bool = True,
         timeout: float = 30.0,
         progress: "Callable[[str], None] | None" = None,
     ) -> None:
@@ -132,13 +166,12 @@ class OpenAICompatTranslator(Translator):
         self._model = model
         self._system_prompt = system_prompt
         self._context_window = context_window
-        self._summary_trigger = summary_trigger
         self._timeout = timeout
+        self._kb = knowledge_base
+        self._tools_enabled = tools_enabled
 
-        # Rolling history
-        self._history: list[_HistoryEntry] = []
-        # Condensed summary of older history (replaces raw old entries)
-        self._summary: str = ""
+        # Short-term volatile context — only grows when add_to_history=True.
+        self._recent: list[_HistoryEntry] = []
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -151,9 +184,8 @@ class OpenAICompatTranslator(Translator):
         self._system_prompt = value
 
     def clear_context(self) -> None:
-        """Discard all accumulated history and summary."""
-        self._history.clear()
-        self._summary = ""
+        """Discard all accumulated short-term conversational context."""
+        self._recent.clear()
 
     # ── Translator ────────────────────────────────────────────────────
 
@@ -162,146 +194,206 @@ class OpenAICompatTranslator(Translator):
         text: str,
         source_lang: str = "ja",
         target_lang: str = "en",
+        *,
+        add_to_history: bool = True,
     ) -> str:
-        """Translate *text* with rolling context via OpenAI Chat Completions.
+        """Translate *text* using RAG context and optional KB tool calling.
 
         Args:
             text: Source text to translate.
             source_lang: BCP-47 source language code (e.g. ``"ja"``).
-            target_lang: BCP-47 target language code (e.g. ``"en"``, ``"zh-CN"``).
+            target_lang: BCP-47 target language code (e.g. ``"en"``,
+                ``"zh-CN"``).
+            add_to_history: When ``True`` (default), the (source, translation)
+                pair is appended to the short-term recent-pairs buffer.  Pass
+                ``False`` when OCR confidence is low or the memory-scan
+                correction did not succeed, so garbled text does not pollute
+                subsequent requests.
 
         Returns:
             Translated string.
 
         Raises:
-            RuntimeError: If the OpenAI API call fails.
+            :class:`~src.translators.base.AuthError`: Authentication failure.
+            :class:`~src.translators.base.RateLimitError`: Rate limit hit.
+            :class:`~src.translators.base.TranslationError`: Other API error.
         """
         if not text.strip():
             return text
 
-        src = source_lang
-        tgt = target_lang
-        messages = self._build_messages(text, src, tgt)
-        try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                temperature=0.3,
-                timeout=self._timeout,
-            )
-        except Exception as exc:
-            msg = str(exc)
-            if "401" in msg or "authentication" in msg.lower() or "api_key" in msg.lower():
-                raise AuthError(f"OpenAI authentication failed: {exc}") from exc
-            if "429" in msg or "rate" in msg.lower():
-                raise RateLimitError(f"OpenAI rate limited: {exc}") from exc
-            raise TranslationError(f"OpenAI API request failed: {exc}") from exc
+        # 1. RAG search
+        rag_entries = self._rag_search(text)
 
-        translation: str = response.choices[0].message.content or ""
-        translation = translation.strip()
+        # 2. Build messages
+        messages = self._build_messages(text, source_lang, target_lang, rag_entries)
 
-        # Record in history, then trigger summarisation if needed
-        self._history.append(_HistoryEntry(source=text, translation=translation))
-        if len(self._history) >= self._summary_trigger:
-            self._maybe_summarise()
+        # 3. Tool schemas (only when KB is present and tools enabled)
+        tools = self._get_tools() if (self._kb and self._tools_enabled) else None
+
+        # 4. Tool-call loop → final translation
+        translation = self._run_tool_loop(messages, tools)
+
+        # 5. Update short-term context only on confirmed high-quality input
+        if add_to_history:
+            self._recent.append(_HistoryEntry(source=text, translation=translation))
+            if len(self._recent) > self._context_window:
+                self._recent = self._recent[-self._context_window:]
 
         return translation
 
     # ── Internal ──────────────────────────────────────────────────────
+
+    def _run_tool_loop(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+    ) -> str:
+        """Drive the tool-call loop until the model returns plain text."""
+        create_kwargs: dict = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": 0.3,
+            "timeout": self._timeout,
+        }
+        if tools:
+            create_kwargs["tools"] = tools
+            create_kwargs["tool_choice"] = "auto"
+
+        _MAX_TOOL_ROUNDS = 8
+        for _round in range(_MAX_TOOL_ROUNDS):
+            try:
+                response = self._client.chat.completions.create(**create_kwargs)
+            except Exception as exc:
+                msg = str(exc)
+                if "401" in msg or "authentication" in msg.lower():
+                    raise AuthError(
+                        f"OpenAI-compatible API authentication failed: {exc}"
+                    ) from exc
+                if "429" in msg or "rate" in msg.lower():
+                    raise RateLimitError(
+                        f"OpenAI-compatible API rate limited: {exc}"
+                    ) from exc
+                raise TranslationError(
+                    f"OpenAI-compatible API request failed: {exc}"
+                ) from exc
+
+            choice = response.choices[0]
+            msg_obj = choice.message
+
+            # No tool calls → final translation
+            if not msg_obj.tool_calls:
+                return (msg_obj.content or "").strip()
+
+            # Append assistant message (with tool_calls) to conversation
+            messages.append(msg_obj.model_dump(exclude_unset=True))
+
+            # Execute each tool call and append tool-role results
+            for tc in msg_obj.tool_calls:
+                result = self._dispatch_tool(tc.function.name, tc.function.arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+            create_kwargs["messages"] = messages
+
+        # Loop cap exceeded — request final answer without tools
+        warnings.warn(
+            "OpenAICompatTranslator: tool-call loop cap reached, "
+            "requesting final answer without tools.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        create_kwargs.pop("tools", None)
+        create_kwargs.pop("tool_choice", None)
+        try:
+            response = self._client.chat.completions.create(**create_kwargs)
+            return (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            raise TranslationError(
+                f"OpenAI-compatible API request failed: {exc}"
+            ) from exc
+
+    def _dispatch_tool(self, name: str, arguments: str) -> str:
+        if self._kb is None:
+            import json
+            return json.dumps({"error": "No knowledge base configured."})
+        from src.knowledge.tools import execute_tool
+        try:
+            return execute_tool(self._kb, name, arguments)
+        except Exception as exc:
+            import json
+            warnings.warn(
+                f"KB tool {name!r} raised: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return json.dumps({"error": str(exc)})
+
+    def _rag_search(self, text: str) -> list:
+        if self._kb is None:
+            return []
+        try:
+            return self._kb.search(text, k=6)
+        except Exception as exc:
+            warnings.warn(
+                f"KnowledgeBase RAG search failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return []
 
     def _build_messages(
         self,
         text: str,
         source_lang: str,
         target_lang: str,
+        rag_entries: list,
     ) -> list[dict]:
-        """Construct the messages list for the chat completions request."""
-        system_content = self._build_system_content(source_lang, target_lang)
+        system_content = self._build_system_content(
+            source_lang, target_lang, rag_entries
+        )
         messages: list[dict] = [{"role": "system", "content": system_content}]
-
-        # Inject recent history as alternating user/assistant turns
-        recent = self._history[-self._context_window:]
-        for entry in recent:
+        for entry in self._recent:
             messages.append({"role": "user", "content": entry.source})
             messages.append({"role": "assistant", "content": entry.translation})
-
         messages.append({"role": "user", "content": text})
         return messages
 
-    def _build_system_content(self, source_lang: str, target_lang: str) -> str:
-        """Compose the full system prompt including base prompt and summary."""
-        parts: list[str] = []
-
-        # Use stored prompt if set, otherwise fall back to the default template.
+    def _build_system_content(
+        self,
+        source_lang: str,
+        target_lang: str,
+        rag_entries: list,
+    ) -> str:
         raw_base = self._system_prompt.strip() or DEFAULT_SYSTEM_PROMPT
-        # Format {source_lang} / {target_lang} placeholders in the base prompt.
         base = raw_base.format(source_lang=source_lang, target_lang=target_lang)
-        parts.append(base)
+        parts: list[str] = [base]
 
-        if self._summary:
-            parts.append(
-                "\n\n=== Story context so far (summary) ===\n" + self._summary
-            )
-
-        if self._system_prompt.strip():
-            # When the user supplied a custom prompt, append the explicit
-            # translation instruction so the model always knows its task.
-            parts.append(
-                f"\n\nTranslate the following text from {source_lang} to {target_lang}. "
-                f"Output ONLY the translated text."
-            )
+        if rag_entries:
+            lines: list[str] = []
+            for entry in rag_entries:
+                if entry.kind == "term":
+                    line = (
+                        f"- [{entry.category}] {entry.original}"
+                        f" → {entry.translation}"
+                    )
+                    if entry.description:
+                        line += f" ({entry.description})"
+                    lines.append(line)
+                else:
+                    lines.append(f"- [story] {entry.description}")
+            if lines:
+                parts.append(
+                    "\n\n=== Relevant knowledge from previous sessions ===\n"
+                    + "\n".join(lines)
+                )
 
         return "\n".join(parts)
 
-    def _maybe_summarise(self) -> None:
-        """Summarise the oldest chunk of history to keep context bounded.
-
-        The oldest ``summary_trigger // 2`` entries are condensed into a
-        few sentences via a lightweight summarisation call, then removed
-        from the raw history list.
-        """
-        chunk_size = max(1, self._summary_trigger // 2)
-        chunk = self._history[:chunk_size]
-        self._history = self._history[chunk_size:]
-
-        dialogue = "\n".join(
-            f"[{i + 1}] {e.source} → {e.translation}"
-            for i, e in enumerate(chunk)
-        )
-        prompt = (
-            "The following are sequential lines from a visual novel, "
-            "with their translations.  Write a concise 2-4 sentence summary "
-            "of the story events and key information introduced, "
-            "to be used as context for future translations.\n\n"
-            + dialogue
-        )
-        try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful summarisation assistant.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                timeout=self._timeout,
-            )
-            new_summary = (response.choices[0].message.content or "").strip()
-        except Exception as exc:
-            warnings.warn(
-                f"Context summarisation failed, history chunk discarded: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return
-
-        # Prepend previous summary so we don't lose older context
-        if self._summary:
-            self._summary = self._summary + "\n" + new_summary
-        else:
-            self._summary = new_summary
+    def _get_tools(self) -> list[dict]:
+        from src.knowledge.tools import OPENAI_TOOLS
+        return OPENAI_TOOLS
 
 
 # Backward-compatible alias

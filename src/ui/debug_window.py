@@ -46,6 +46,8 @@ from src.correction import best_match_with_details
 from src.translators.base import PROVIDERS, PROVIDERS_BY_KEY, Translator
 from src.translators.factory import build_translator
 from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT
+from src.knowledge import KnowledgeBase
+from src.paths import knowledge_db_path
 from .window_picker import WindowPicker
 
 
@@ -502,6 +504,8 @@ class DebugWindow(QMainWindow):
         self._worker: _PipelineWorker | None = None
         self._worker_thread: QThread | None = None
         self._translator: Translator | None = None
+        # Shared knowledge base — persists across translator rebuilds.
+        self._knowledge_base: KnowledgeBase = KnowledgeBase.open(knowledge_db_path())
 
         self._run_timer = QTimer(self)
         self._run_timer.timeout.connect(self._request_tick)
@@ -1173,6 +1177,7 @@ class DebugWindow(QMainWindow):
         try:
             self._translator = build_translator(
                 _cfg,
+                knowledge_base=self._knowledge_base,
                 progress=lambda msg: (
                     self._lbl_tl_status.setText(msg),
                     QApplication.processEvents(),
@@ -1216,8 +1221,8 @@ class DebugWindow(QMainWindow):
                 model=self._le_model.text().strip() or "gpt-4o-mini",
                 system_prompt=self._te_system_prompt.toPlainText().strip(),
                 context_window=_cfg.openai_context_window,
-                summary_trigger=_cfg.openai_summary_trigger,
                 base_url=self._le_base_url.text().strip() or None,
+                knowledge_base=self._knowledge_base,
                 progress=progress,
             )
         raise RuntimeError(f"Unknown backend: {backend!r}")

@@ -229,12 +229,19 @@ Add-WindowsCapability -Online -Name "Language.OCR~~~ja-JP~0.0.1.0"
 - [x] 实现 `best_match`：OCR ↔ 内存扫描结果 Levenshtein 匹配（`src/correction.py`）
 
 ### 缓存
-- [x] 实现翻译区域截图 phash 计算与缓存层
+- [x] 实现翻译区域截图 phash 计算与缓存层（内存，PhashCache）
+- [x] 实现翻译结果文本持久化缓存（SQLite，TranslationCache，源文→译文映射，跨会话）
 
 ### 翻译插件
 - [x] 定义翻译插件接口（`Translator` ABC，`src/translators/base.py`）
 - [x] 实现 Cloud Translation API 插件
-- [x] 实现 OpenAI 接入点插件（含前文摘要 Agent、全局 prompt 配置）
+- [x] 实现 OpenAI 接入点插件（RAG 注入 + function-calling 工具循环 + 可配置 base_url 支持任意兼容端点）
+
+### 知识库与 MCP
+- [x] 实现游戏知识库（`src/knowledge/`）：SQLite FTS5 BM25 + 可选向量相似度 + RRF 混合检索
+- [x] 实现三个知识库工具：`record_term`（词条/人名存储）、`record_event`（剧情事件摘要）、`search_terms`（混合检索）
+- [x] 实现 OpenAI function-calling 工具循环：LLM 可在翻译过程中主动调用工具记录/查询知识
+- [x] 实现 stdio MCP server（`src/mcp_server.py`，`mcp` 官方 SDK）：Claude Desktop / Cursor 等外部工具可直接连接知识库
 
 ### 遮罩与交互
 - [ ] 实现翻译结果置顶遮罩窗口（透明背景，文字叠加）
