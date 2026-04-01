@@ -98,11 +98,6 @@ class TestCapturer:
         # dxcam region is (left, top, right, bottom) → width = right-left
         assert img.size == (320, 240), f"Expected (320, 240), got {img.size}"
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="May fail in RDP / virtual-display / screensaver environments where "
-               "the desktop is genuinely black.",
-    )
     def test_grab_not_all_black(self) -> None:
         """Core check: DXGI capture should never return a pure-black frame.
 
@@ -136,10 +131,6 @@ class TestOneShotHelpers:
         w, h = img.size
         assert w > 0 and h > 0
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="May fail in RDP / virtual-display / screensaver environments.",
-    )
     def test_capture_fullscreen_not_all_black(self) -> None:
         from src.capture import capture_fullscreen
 
@@ -152,10 +143,6 @@ class TestOneShotHelpers:
         img = capture_region(0, 0, 640, 480)
         assert img.size == (640, 480)
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="May fail in RDP / virtual-display / screensaver environments.",
-    )
     def test_capture_region_not_all_black(self) -> None:
         from src.capture import capture_region
 
@@ -174,12 +161,6 @@ class TestBlackFrameRegression:
     active even when a D3D-rendered window occupies the screen.
     """
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="May fail in RDP / virtual-display / screensaver environments where "
-               "all frames are black (e.g., locked desktop, RDP without display, "
-               "DXGI unavailable).",
-    )
     def test_repeated_grabs_include_non_black_frame(self) -> None:
         from src.capture import Capturer
 

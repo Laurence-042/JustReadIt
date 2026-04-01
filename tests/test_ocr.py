@@ -335,16 +335,18 @@ class TestRunDetectors:
 # ==========================================================================
 
 class TestWindowsOcrUnit:
-    def test_instantiation_raises_without_japanese(self):
-        """Creating WindowsOcr('ja') raises MissingOcrLanguageError when the Japanese
-        OCR capability is not installed."""
+    def test_instantiation_for_japanese_depends_on_pack(self):
+        """WindowsOcr('ja') should succeed when Japanese OCR is installed and
+        raise MissingOcrLanguageError otherwise."""
         from src.ocr.windows_ocr import WindowsOcr, MissingOcrLanguageError
         import winrt.windows.media.ocr as wocr
         import winrt.windows.globalization as glob
 
         ja = glob.Language("ja")
         if wocr.OcrEngine.is_language_supported(ja):
-            pytest.skip("Japanese OCR language pack is installed -- no error expected")
+            ocr = WindowsOcr("ja")
+            assert ocr.language_tag.lower().startswith("ja")
+            return
 
         with pytest.raises(MissingOcrLanguageError, match="install_ja_ocr"):
             WindowsOcr("ja")
@@ -375,10 +377,6 @@ class TestWindowsOcrUnit:
         assert len(ocr.language_tag) > 0
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="Requires Japanese OCR language pack installed in Windows",
-)
 class TestWindowsOcrRecognise:
     def test_recognise_returns_boxes(self):
         from src.ocr.windows_ocr import WindowsOcr
