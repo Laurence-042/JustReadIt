@@ -52,6 +52,40 @@ class TestNormalize:
         # Windows OCR sometimes inserts a space between punctuation marks.
         assert _normalize("馬小屋! ?") == "馬小屋!?"
 
+    def test_katakana_middle_dot_pair_to_ellipsis(self) -> None:
+        # ・・ (U+30FB × 2) — OCR renders VN ellipsis glyphs as middle dots.
+        assert _normalize("大丈夫\u30fb\u30fb") == "大丈夫\u2026"
+
+    def test_katakana_middle_dot_triple(self) -> None:
+        assert _normalize("\u30fb\u30fb\u30fbん") == "\u2026ん"
+
+    def test_single_katakana_middle_dot_unchanged(self) -> None:
+        # A solitary \u30fb is a legitimate separator, not an ellipsis.
+        assert _normalize("A\u30fbB") == "A\u30fbB"
+
+    def test_strip_template_variable(self) -> None:
+        assert _normalize("おはよう、{{主人公}}。") == "おはよう、。"
+
+    def test_strip_multiple_templates(self) -> None:
+        assert _normalize("{{A}}と{{B}}") == "と"
+
+    def test_unwrap_character_name_tag(self) -> None:
+        assert _normalize("~【落ち着いた人妻】") == "落ち着いた人妻"
+
+    def test_unwrap_name_tag_multiline(self) -> None:
+        text = "~【馬飼いの青年】\nダイアログ"
+        result = _normalize(text)
+        assert result == "馬飼いの青年\nダイアログ"
+
+    def test_strip_vn_command_line(self) -> None:
+        assert _normalize("~ジャンプ somewhere.txt").strip() == ""
+
+    def test_strip_vn_command_keeps_name_tag(self) -> None:
+        text = "~【名前】\n~ジャンプ x.txt"
+        result = _normalize(text)
+        assert "名前" in result
+        assert "ジャンプ" not in result
+
 
 # ---------------------------------------------------------------------------
 # _best_line_window
@@ -250,3 +284,99 @@ class TestBestMatchWithDetails:
         assert result is not None
         assert "う、馬小屋" in result.text, "First dialog line must be present"
         assert "た、確かに誰も居ないけど" in result.text, "Second dialog line must be present"
+
+    def test_realworld_partial_must_not_over_narrow(self) -> None:
+        """Regression: 4-line OCR with 8 memory hits.
+
+        Phase 3 (partial) used to report partial_ratio (inflated) as the
+        comparable score, beating Phase 2's fuzz.ratio for the full dialog.
+        Then `_best_line_window` narrowed the Phase 3 output to 2 lines,
+        losing the character name and first dialogue line.
+
+        After the fix, the comparable scores are all fuzz.ratio, so
+        Phase 2's 4-line window (or Phase 1's full candidate) wins.
+        """
+        ocr = (
+            "馬飼いの青年\n"
+            "・・・ん、ああ、おはよう。\n"
+            "こめん。僕の責任だ。ヒスカに騙されてね・・\n"
+            "帰ってきたら折檻してやる!"
+        )
+        # Simulated memory scan results (first 5 of 8 hits).
+        candidates = [
+            # Candidate 1: garbage prefix + 3 dialogue lines (no name)
+            "嘞鮱ᬀ退……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+            # Candidate 2: garbage prefix + single last line
+            "혩鄳錀适帰ってきたら折檻してやる！\\w",
+            # Candidate 3: the BEST — full VN script block with name tag
+            "~【馬飼いの青年】\n"
+            "\u201c……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！\\w",
+            # Candidate 4: different dialogue (same character)
+            "~【馬飼いの青年】\n"
+            "\u201c……街に行くまでの道で、牧場がある村がある。",
+            # Candidate 5: another garbage prefix copy
+            "大魇─蠀……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+        ]
+        result = best_match_with_details(ocr, candidates)
+        assert result is not None
+        # Must include the character name AND the first dialogue line.
+        assert "馬飼いの青年" in result.text, (
+            f"Character name missing — got phase={result.phase} "
+            f"score={result.score:.1f}: {result.text!r}"
+        )
+        assert "おはよう" in result.text, (
+            f"First dialogue line missing — got phase={result.phase} "
+            f"score={result.score:.1f}: {result.text!r}"
+        )
+        assert "帰ってきたら折檻してやる" in result.text
+
+    def test_realworld_template_variable_prefers_vn_script(self) -> None:
+        """Regression: {{template}} in VN script source must not lose to
+        a rendered-text copy that contains the substituted value.
+
+        OCR sees ``233`` (the player-chosen name), memory has both the
+        template ``{{主人公}}`` form and a rendered form with ``233``.
+        The VN script source (with ~【name】 tag) is the authoritative
+        candidate and must win.
+        """
+        ocr = (
+            "落ち着いた人妻\n"
+            "おはよう、233。\n"
+            "あのニ人、あなたが居なくて大丈夫なのかしら\u30fb\u30fb"
+        )
+        candidates = [
+            # Candidate 0: the authoritative VN script block
+            "~【落ち着いた人妻】\n"
+            '\u201cおはよう、{{主人公}}。\n'
+            "あの二人、あなたが居なくて大丈夫なのかしら……。\\w",
+            # Candidate 1: VN jump command (noise)
+            "~ジャンプ event/mobtalk_asnalo_00.txt 自由行動",
+            # Candidate 2: garbage prefix + last line only
+            "\u0832\u6172\u7350\u66b6\u9b9c\u1dc3退あの二人、"
+            "あなたが居なくて大丈夫なのかしら……。\\w",
+            # Candidate 3: garbage prefix + last line only
+            "\ufC74\u9a96\u643e\u8000あの二人、"
+            "あなたが居なくて大丈夫なのかしら……。\\w",
+            # Candidate 4: rendered copy (has literal 233)
+            "言おはよう、233。\n"
+            "あの二人、あなたが居なくて大丈夫なのかしら……。",
+            # Candidate 5: single last line
+            "あの二人、あなたが居なくて大丈夫なのかしら……。",
+        ]
+        result = best_match_with_details(ocr, candidates)
+        assert result is not None
+        # Must contain the character name tag (from the VN script source).
+        assert "落ち着いた人妻" in result.text, (
+            f"Character name missing — got phase={result.phase} "
+            f"score={result.score:.1f}: {result.text!r}"
+        )
+        # Must contain the greeting line.
+        assert "おはよう" in result.text
+        # Must contain the last dialogue line.
+        assert "大丈夫なのかしら" in result.text

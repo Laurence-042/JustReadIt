@@ -61,10 +61,22 @@ def _normalize(text: str) -> str:
     text = re.sub(r"\.{2,}", "\u2026", text)
     # Collapse consecutive … into one.
     text = re.sub("\u2026{2,}", "\u2026", text)
+    # Collapse ・ (U+30FB, katakana middle-dot) sequences — OCR often
+    # renders the VN ellipsis glyph as ・・ instead of …… or ‥‥.
+    text = re.sub("\u30FB{2,}", "\u2026", text)
     # Strip leading " \u201c \u201d (Light.VN dialog quote markers, not rendered).
     text = re.sub(r'^["\u201c\u201d]', "", text, flags=re.MULTILINE)
     # Strip literal \w \n etc. (Light.VN wait/control commands).
     text = re.sub(r"\\[a-z]", "", text)
+    # Strip Light.VN {{template}} variables (e.g. {{主人公}}) — replaced
+    # by runtime values in the rendered text that OCR captures.
+    text = re.sub(r"\{\{[^}\n]*\}\}", "", text)
+    # Unwrap ~【name】 character name tags — keep the inner name so it
+    # can still match the rendered character name visible to OCR.
+    text = re.sub(r"^~【([^】\n]+)】$", r"\1", text, flags=re.MULTILINE)
+    # Strip VN engine command lines (e.g. ~ジャンプ, ~暗転解除).  Lines
+    # starting with ~ that are NOT character name tags are commands.
+    text = re.sub(r"^~(?!【).+$", "", text, flags=re.MULTILINE)
     # Strip spaces that Windows OCR inserts between punctuation marks,
     # e.g. "! ?" → "!?" or "( )" → "()".  Japanese text has no word spaces
     # so removing isolated spaces between non-alphanumeric chars is safe.
@@ -98,7 +110,7 @@ def _best_line_window(
     best_score = 0.0
     best_text: str | None = None
 
-    min_win = max(1, ocr_line_count - 2)
+    min_win = max(1, ocr_line_count - 1)
     max_win = min(len(cand_lines), ocr_line_count + 3)
 
     for win_size in range(min_win, max_win + 1):
@@ -224,12 +236,24 @@ def best_match_with_details(
         # that a short single-line candidate cannot beat a richer multi-line
         # candidate just because partial_ratio ignores length differences.
         partial_output = best_partial_text
+        # Use fuzz.ratio (not partial_ratio) as the comparable score so
+        # that the final cross-phase max() is an apples-to-apples
+        # comparison.  partial_ratio ignores length differences and
+        # inflates scores relative to fuzz.ratio used in Phases 1 & 2.
+        partial_comparable_score = best_partial_score
         win_result = _best_line_window(ocr_norm, best_partial_text)
         if win_result is not None:
             partial_output = win_result[0]
+            partial_comparable_score = win_result[1]
+        else:
+            # Single-line or very short candidate — fall back to full-text
+            # fuzz.ratio for a fair comparison.
+            partial_comparable_score = fuzz.ratio(
+                ocr_norm, _normalize(best_partial_text)
+            )
         accepted.append(MatchResult(
             text=partial_output,
-            score=best_partial_score,
+            score=partial_comparable_score,
             phase="partial",
             threshold=_PARTIAL_THRESHOLD,
         ))
