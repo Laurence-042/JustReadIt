@@ -33,7 +33,7 @@ from PySide6.QtCore import (
     QPoint, QRect, Qt, Signal, QTimer,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QFontMetrics, QImage, QPainter, QPixmap,
+    QColor, QFont, QFontMetrics, QImage, QPainter, QPixmap, QScreen,
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -43,6 +43,25 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+
+def _screen_dpr(phys_x: int, phys_y: int) -> tuple["QScreen | None", float]:
+    """Return the QScreen and its devicePixelRatio for a Win32 physical-pixel coord.
+
+    Win32 APIs (GetWindowRect, DwmGetWindowAttribute, DXGI) return coordinates
+    in *physical* pixels, while Qt 6 ``QWidget`` geometry uses *logical*
+    (device-independent) pixels.  This helper bridges the gap.
+
+    ``QApplication.screenAt`` expects logical Qt coordinates; passing physical
+    values is an approximation that works correctly when all monitors share the
+    same DPI and gives a close result on mixed-DPI setups.
+    """
+    screen = QApplication.screenAt(QPoint(phys_x, phys_y))
+    if screen is None:
+        screen = QApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen else 1.0
+    return screen, dpr
+
 
 # ---------------------------------------------------------------------------
 # Win32 helpers
@@ -164,20 +183,23 @@ class TranslationOverlay(QWidget):
         self.resize(text_w, text_h)
 
         # ---- compute position ---------------------------------------
-        ox, oy = screen_origin
-        screen = QApplication.screenAt(QPoint(ox, oy)) or QApplication.primaryScreen()
+        ox_phys, oy_phys = screen_origin
+        screen, dpr = _screen_dpr(ox_phys, oy_phys)
+        # Convert physical Win32 coords to Qt logical pixels.
         if near_rect is not None:
             rx, ry, rw, rh = near_rect
-            cx = ox + rx + rw // 2
-            cy = oy + ry + rh + 8
+            cx = round((ox_phys + rx + rw // 2) / dpr)
+            cy = round((oy_phys + ry + rh + 8) / dpr)
         else:
             app = QApplication.instance()
             cursor_pos = app.cursorPos() if app is not None else QPoint(0, 0)  # type: ignore[union-attr]
+            # cursorPos() is already in Qt logical pixels.
             cx = cursor_pos.x()
             cy = cursor_pos.y() + 24
+            screen = QApplication.screenAt(cursor_pos) or screen
 
-        if screen:
-            sg = screen.geometry()
+        sg = screen.geometry() if screen else None
+        if sg is not None:
             x = min(max(cx - text_w // 2, sg.x()), sg.right() - text_w)
             y = min(max(cy, sg.y()), sg.bottom() - text_h)
         else:
@@ -237,10 +259,22 @@ class TranslationOverlay(QWidget):
             img_rgb.width * 3,
             QImage.Format.Format_RGB888,
         )
-        self._freeze_pixmap = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(qimg)
 
-        self.resize(img_rgb.width, img_rgb.height)
-        self.move(window_left, window_top)
+        # ── HiDPI: convert physical pixel sizes/coords to Qt logical pixels ──
+        # Win32 returns physical pixels; Qt 6 widget geometry is in logical pixels.
+        # Setting the pixmap's devicePixelRatio makes Qt render it without scaling.
+        screen, dpr = _screen_dpr(window_left, window_top)
+        pix.setDevicePixelRatio(dpr)
+        self._freeze_pixmap = pix
+
+        log_w = round(img_rgb.width  / dpr)
+        log_h = round(img_rgb.height / dpr)
+        log_left = round(window_left / dpr)
+        log_top  = round(window_top  / dpr)
+
+        self.resize(log_w, log_h)
+        self.move(log_left, log_top)
 
         # In freeze mode we need to capture focus so the game cannot steal it.
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)

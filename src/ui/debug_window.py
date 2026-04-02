@@ -200,9 +200,10 @@ class _PipelineWorker(QObject):
 
         _pt = _POINT()
         _user32_ui.GetCursorPos(ctypes.byref(_pt))
-        cr = self._target.capture_rect
-        cursor_x = _pt.x - cr.left
-        cursor_y = _pt.y - cr.top
+        # Cursor is in virtual-screen (physical) coords; image origin == window_rect origin.
+        wr = self._target.window_rect
+        cursor_x = _pt.x - wr.left
+        cursor_y = _pt.y - wr.top
         if not (0 <= cursor_x < img.width and 0 <= cursor_y < img.height):
             cursor_x = img.width // 2
             cursor_y = int(img.height * 0.75)
@@ -1048,11 +1049,11 @@ class DebugWindow(QMainWindow):
             if self._overlay._is_freeze_mode:
                 self._overlay.show_freeze_translation(translated_text)
             elif crop_rect is not None:
-                cr = self._target.capture_rect
+                wr = self._target.window_rect
                 cx, cy, cx2, cy2 = crop_rect  # type: ignore[misc]
                 near_rect = (cx, cy, cx2 - cx, cy2 - cy)
                 self._overlay.show_translation(
-                    translated_text, near_rect, (cr.left, cr.top)
+                    translated_text, near_rect, (wr.left, wr.top)
                 )
 
     @Slot(str)
@@ -1100,9 +1101,9 @@ class DebugWindow(QMainWindow):
             self._target = self._target.refresh()
         except Exception:
             pass
-        cr = self._target.capture_rect
+        wr = self._target.window_rect
         self._overlay.enter_freeze_mode(
-            img, cr.left, cr.top, self._target.pid, self._target.hwnd
+            img, wr.left, wr.top, self._target.pid, self._target.hwnd
         )
         self._run_timer.stop()
         self._send_freeze_frame.emit(self._last_frame_bytes)
