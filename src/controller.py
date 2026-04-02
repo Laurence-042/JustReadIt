@@ -546,9 +546,9 @@ class HoverController(QObject):
             crop_rect[3] - crop_rect[1],
         ) if crop_rect else (0, 0, 0, 0)
 
-        # ── Phash cache (fast path) ──────────────────────────────────
+        # ── OCR text cache (fast path) ────────────────────────────
         crop_img = img.crop(crop_rect) if crop_rect else None
-        cached = self._phash_cache.get(crop_img) if crop_img is not None else None
+        cached = self._phash_cache.get(region_text)
         if cached is not None:
             self._emit_debug(
                 img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
@@ -635,13 +635,9 @@ class HoverController(QObject):
                 _log.warning("Translation failed: %s", exc)
                 translation = f"[translation error: {exc}]"
 
-        # ── Phash store ──────────────────────────────────────────────
-        if (
-            crop_img is not None
-            and translation
-            and not translation.startswith("[")
-        ):
-            self._phash_cache.put(crop_img, translation)
+        # ── OCR text cache store ──────────────────────────────────────────
+        if translation and not translation.startswith("["):
+            self._phash_cache.put(region_text, translation)
 
         # ── Emit results ─────────────────────────────────────────────
         self._emit_debug(

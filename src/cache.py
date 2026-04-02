@@ -1,8 +1,8 @@
 """Translation caches — two complementary layers.
 
-**PhashCache** (in-memory, perceptual-hash-keyed)
-    Fast first-pass cache using the perceptual hash of a screenshot region.
-    A cache hit avoids any OCR or translation work.  Entries survive only
+**PhashCache** (in-memory, OCR-text-keyed)
+    Fast first-pass cache keyed by the OCR region text.  A cache hit
+    avoids any memory-scan or translation work.  Entries survive only
     for the current session.
 
 **TranslationCache** (persistent, text-keyed)
@@ -17,8 +17,8 @@ Typical pipeline::
     phash_cache = PhashCache()
     text_cache  = TranslationCache(translations_db_path())
 
-    # Fast path: phash hit (screenshot-level dedup)
-    result = phash_cache.get(region_img)
+    # Fast path: same OCR text seen this session
+    result = phash_cache.get(region_text)
     if result:
         show(result)
         return
@@ -32,21 +32,10 @@ Typical pipeline::
         result = translator.translate(source_text, target_lang=target_lang)
         text_cache.put(source_text, source_lang, target_lang, result)
 
-    phash_cache.put(region_img, result)
+    phash_cache.put(region_text, result)
     show(result)
 """
 from __future__ import annotations
-
-from PIL.Image import Image
-
-import imagehash
-
-# Maximum Hamming distance between two pHashes to be considered a cache hit.
-# 64-bit pHash: 0 = identical, 64 = completely different.
-# Threshold of 8 (~12.5 %) tolerates minor background animation without
-# letting visually distinct frames collide.
-_DEFAULT_THRESHOLD: int = 8
-_HASH_SIZE: int = 8  # produces 64-bit hash (hash_size²)
 
 
 # ── Persistent text-level translation cache ───────────────────────────────────
@@ -170,56 +159,30 @@ class TranslationCache:
 
 
 class PhashCache:
-    """In-memory translation cache keyed by perceptual hash of the source image.
+    """In-memory translation cache keyed by OCR region text.
 
-    Args:
-        threshold: Maximum Hamming distance for a cache hit (default 8).
-        hash_size: Controls hash resolution; default 8 → 64-bit hash.
+    Stores ``{source_text: translation}`` pairs.  A cache hit requires an
+    **exact** ``source_text`` match — no image hashing involved.  This
+    avoids the entire memory-scan + translation pipeline when the same
+    OCR output is seen again within the current session.
+
+    The class name is kept for backward compatibility with existing call
+    sites, but the cache no longer uses perceptual hashing.
     """
 
-    def __init__(
-        self,
-        threshold: int = _DEFAULT_THRESHOLD,
-        hash_size: int = _HASH_SIZE,
-    ) -> None:
-        self._threshold = threshold
-        self._hash_size = hash_size
-        # List of (hash, translation) pairs — list kept small in practice
-        # because each unique on-screen text block has its own entry.
-        self._entries: list[tuple[imagehash.ImageHash, str]] = []
+    def __init__(self) -> None:
+        self._entries: dict[str, str] = {}
 
     # ── Public API ────────────────────────────────────────────────────
 
-    def get(self, img: Image) -> str | None:
-        """Return the cached translation for *img*, or ``None`` on a miss.
+    def get(self, source_text: str) -> str | None:
+        """Return the cached translation for *source_text*, or ``None``."""
+        return self._entries.get(source_text) if source_text else None
 
-        The nearest stored hash within ``threshold`` Hamming distance is
-        returned; if multiple entries are within range, the closest wins.
-        """
-        if not self._entries:
-            return None
-        h = self._phash(img)
-        best_dist = self._threshold + 1
-        best_text: str | None = None
-        for stored_hash, text in self._entries:
-            dist = h - stored_hash
-            if dist < best_dist:
-                best_dist = dist
-                best_text = text
-        return best_text if best_dist <= self._threshold else None
-
-    def put(self, img: Image, translation: str) -> None:
-        """Store *translation* keyed by the pHash of *img*.
-
-        If an existing entry is already within ``threshold`` distance,
-        its translation is updated in-place rather than adding a duplicate.
-        """
-        h = self._phash(img)
-        for i, (stored_hash, _) in enumerate(self._entries):
-            if h - stored_hash <= self._threshold:
-                self._entries[i] = (stored_hash, translation)
-                return
-        self._entries.append((h, translation))
+    def put(self, source_text: str, translation: str) -> None:
+        """Store *translation* keyed by *source_text*."""
+        if source_text:
+            self._entries[source_text] = translation
 
     def clear(self) -> None:
         """Evict all cached entries."""
@@ -227,8 +190,3 @@ class PhashCache:
 
     def __len__(self) -> int:
         return len(self._entries)
-
-    # ── Internal ──────────────────────────────────────────────────────
-
-    def _phash(self, img: Image) -> imagehash.ImageHash:
-        return imagehash.phash(img, hash_size=self._hash_size)

@@ -17,7 +17,6 @@ dependencies = [
     "winrt-Windows.Foundation",
     "winrt-Windows.Foundation.Collections",
     "winrt-Windows.Globalization",
-    "imagehash",
     "rapidfuzz",
     "pywin32",
     "psutil",
