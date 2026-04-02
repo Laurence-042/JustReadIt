@@ -158,31 +158,50 @@ class TranslationCache:
         self.close()
 
 
+class _CacheEntry:
+    """Payload stored in :class:`PhashCache`."""
+    __slots__ = ("translation", "mem_text", "corrected_text")
+
+    def __init__(
+        self, translation: str, mem_text: str, corrected_text: str,
+    ) -> None:
+        self.translation = translation
+        self.mem_text = mem_text
+        self.corrected_text = corrected_text
+
+
 class PhashCache:
     """In-memory translation cache keyed by OCR region text.
 
-    Stores ``{source_text: translation}`` pairs.  A cache hit requires an
-    **exact** ``source_text`` match — no image hashing involved.  This
-    avoids the entire memory-scan + translation pipeline when the same
-    OCR output is seen again within the current session.
+    Each entry stores ``(translation, mem_text, corrected_text)`` so that
+    a cache hit can replay the full debug output without re-running the
+    memory-scan / Levenshtein correction pipeline.
 
     The class name is kept for backward compatibility with existing call
     sites, but the cache no longer uses perceptual hashing.
     """
 
     def __init__(self) -> None:
-        self._entries: dict[str, str] = {}
+        self._entries: dict[str, _CacheEntry] = {}
 
     # ── Public API ────────────────────────────────────────────────────
 
-    def get(self, source_text: str) -> str | None:
-        """Return the cached translation for *source_text*, or ``None``."""
+    def get(self, source_text: str) -> _CacheEntry | None:
+        """Return the cached entry for *source_text*, or ``None``."""
         return self._entries.get(source_text) if source_text else None
 
-    def put(self, source_text: str, translation: str) -> None:
-        """Store *translation* keyed by *source_text*."""
+    def put(
+        self,
+        source_text: str,
+        translation: str,
+        mem_text: str = "",
+        corrected_text: str = "",
+    ) -> None:
+        """Store a cache entry keyed by *source_text*."""
         if source_text:
-            self._entries[source_text] = translation
+            self._entries[source_text] = _CacheEntry(
+                translation, mem_text, corrected_text,
+            )
 
     def clear(self) -> None:
         """Evict all cached entries."""

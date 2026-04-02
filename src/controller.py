@@ -550,13 +550,18 @@ class HoverController(QObject):
         crop_img = img.crop(crop_rect) if crop_rect else None
         cached = self._phash_cache.get(region_text)
         if cached is not None:
+            hit_mem = f"[cache hit]\n{cached.mem_text}"
+            hit_corrected = f"[cache hit]\n{cached.corrected_text}" if cached.corrected_text else region_text
             self._emit_debug(
                 img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
-                region_text, detector_name, "[phash cache hit]",
-                region_text, cached,
+                region_text, detector_name, hit_mem,
+                hit_corrected,
+                cached.translation,
             )
             wr = self._target.window_rect
-            self.translation_ready.emit(cached, near_rect, (wr.left, wr.top))
+            self.translation_ready.emit(
+                cached.translation, near_rect, (wr.left, wr.top),
+            )
             return
 
         # ── Memory scan + Levenshtein correction ─────────────────────
@@ -637,7 +642,10 @@ class HoverController(QObject):
 
         # ── OCR text cache store ──────────────────────────────────────────
         if translation and not translation.startswith("["):
-            self._phash_cache.put(region_text, translation)
+            self._phash_cache.put(
+                region_text, translation,
+                mem_text=mem_text, corrected_text=corrected_text,
+            )
 
         # ── Emit results ─────────────────────────────────────────────
         self._emit_debug(
