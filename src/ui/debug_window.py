@@ -48,6 +48,7 @@ from src.translators.factory import build_translator
 from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT
 from src.knowledge import KnowledgeBase
 from src.paths import knowledge_db_path
+from src.overlay import TranslationOverlay
 from .window_picker import WindowPicker
 
 
@@ -124,6 +125,7 @@ class _PipelineWorker(QObject):
         self._capturer: Capturer | None = None
         self._ocr: WindowsOcr | None = None
         self._scanner: MemoryScanner | None = None
+        self._freeze_frame: Image.Image | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle (called on worker thread via QThread.started / explicit slots)
@@ -180,7 +182,6 @@ class _PipelineWorker(QObject):
         except Exception as exc:
             _log.warning("target.refresh() failed, using last known position: %s", exc)
 
-        t0 = time.monotonic()
         try:
             img: Image.Image = self._capturer.grab_target(self._target)
         except ValueError:
@@ -196,6 +197,44 @@ class _PipelineWorker(QObject):
         except Exception as exc:
             self.error.emit(f"Capture failed: {exc}")
             return
+
+        _pt = _POINT()
+        _user32_ui.GetCursorPos(ctypes.byref(_pt))
+        cr = self._target.capture_rect
+        cursor_x = _pt.x - cr.left
+        cursor_y = _pt.y - cr.top
+        if not (0 <= cursor_x < img.width and 0 <= cursor_y < img.height):
+            cursor_x = img.width // 2
+            cursor_y = int(img.height * 0.75)
+
+        self._process_frame(img, cursor_x, cursor_y)
+
+    @Slot(bytes)
+    def set_freeze_frame(self, img_bytes: bytes) -> None:
+        """Store a frozen frame for :meth:`run_freeze_tick`."""
+        self._freeze_frame = Image.open(io.BytesIO(img_bytes))
+
+    @Slot()
+    def clear_freeze_frame(self) -> None:
+        """Discard the stored frozen frame."""
+        self._freeze_frame = None
+
+    @Slot(int, int)
+    def run_freeze_tick(self, cursor_x: int, cursor_y: int) -> None:
+        """Run the pipeline on the stored frozen frame at *(cursor_x, cursor_y)*."""
+        if self._freeze_frame is None or self._ocr is None:
+            return
+        self._process_frame(self._freeze_frame, cursor_x, cursor_y)
+
+    # ------------------------------------------------------------------
+    # Internal — shared processing
+    # ------------------------------------------------------------------
+
+    def _process_frame(
+        self, img: Image.Image, cursor_x: int, cursor_y: int
+    ) -> None:
+        """Run OCR + region detection + memory scan + translation on *img*."""
+        t0 = time.monotonic()
 
         try:
             boxes, line_boxes = self._ocr.recognise(img)
@@ -215,17 +254,6 @@ class _PipelineWorker(QObject):
         detector_name = ""
         crop_rect: tuple[int, int, int, int] | None = None
         if line_boxes:
-            _pt = _POINT()
-            _user32_ui.GetCursorPos(ctypes.byref(_pt))
-            cr = self._target.capture_rect
-            cursor_x = _pt.x - cr.left
-            cursor_y = _pt.y - cr.top
-            # When the cursor is outside the captured frame, fall back to
-            # bottom-centre — where VN dialog boxes typically sit.
-            if not (0 <= cursor_x < img.width and 0 <= cursor_y < img.height):
-                cursor_x = img.width // 2
-                cursor_y = int(img.height * 0.75)
-
             dialog_boxes, detector_name = run_detectors(line_boxes, cursor_x, cursor_y)
             if dialog_boxes:
                 region_text = merge_boxes_text(dialog_boxes)
@@ -490,10 +518,13 @@ class DebugWindow(QMainWindow):
     """
 
     _trigger_tick = Signal()
+    _send_freeze_frame = Signal(bytes)
+    _request_freeze_tick = Signal(int, int)
+    _send_clear_freeze = Signal()
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("JustReadIt — Debug")
+        self.setWindowTitle("JustReadIt")
         self.resize(1400, 820)
 
         primary = QApplication.primaryScreen()
@@ -516,6 +547,19 @@ class DebugWindow(QMainWindow):
         self._install_timer = QTimer(self)
         self._install_timer.setInterval(500)
         self._install_timer.timeout.connect(self._poll_install)
+
+        # Translation overlay — floats over the game window.
+        self._overlay = TranslationOverlay(auto_hide_ms=_cfg.overlay_auto_hide_ms)
+        self._overlay.hover_requested.connect(self._on_freeze_hover)
+        self._overlay.freeze_dismissed.connect(self._on_freeze_dismissed)
+
+        # Freeze hotkey (F9) polling
+        self._freeze_vk: int = _cfg.freeze_vk
+        self._freeze_key_was_down: bool = False
+        self._last_frame_bytes: bytes | None = None
+        self._hotkey_timer = QTimer(self)
+        self._hotkey_timer.setInterval(80)
+        self._hotkey_timer.timeout.connect(self._poll_freeze_hotkey)
 
         self._build_ui()
 
@@ -913,6 +957,9 @@ class DebugWindow(QMainWindow):
         self._worker.error.connect(self._on_error)
         self._worker.ready.connect(self._on_worker_ready)
         self._trigger_tick.connect(self._worker.run_tick)
+        self._send_freeze_frame.connect(self._worker.set_freeze_frame)
+        self._request_freeze_tick.connect(self._worker.run_freeze_tick)
+        self._send_clear_freeze.connect(self._worker.clear_freeze_frame)
         self._worker_thread.started.connect(self._worker.setup)
         self._worker_thread.finished.connect(self._worker.teardown)
 
@@ -923,9 +970,22 @@ class DebugWindow(QMainWindow):
 
     def _stop(self) -> None:
         self._run_timer.stop()
+        self._hotkey_timer.stop()
         if self._worker_thread is not None:
             try:
                 self._trigger_tick.disconnect()
+            except RuntimeError:
+                pass
+            try:
+                self._send_freeze_frame.disconnect()
+            except RuntimeError:
+                pass
+            try:
+                self._request_freeze_tick.disconnect()
+            except RuntimeError:
+                pass
+            try:
+                self._send_clear_freeze.disconnect()
             except RuntimeError:
                 pass
             self._worker_thread.quit()
@@ -938,6 +998,7 @@ class DebugWindow(QMainWindow):
         interval = self._spn_interval.value()
         self._run_timer.setInterval(interval)
         self._run_timer.start()
+        self._hotkey_timer.start()
         lang = self._selected_language
         self.statusBar().showMessage(
             f"Running — lang={lang}  interval={interval} ms"
@@ -980,6 +1041,20 @@ class DebugWindow(QMainWindow):
             f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
         )
 
+        # ── Translation overlay ─────────────────────────────────────────
+        if not self._overlay._is_freeze_mode:
+            self._last_frame_bytes = img_bytes
+        if translated_text and self._target is not None:
+            if self._overlay._is_freeze_mode:
+                self._overlay.show_freeze_translation(translated_text)
+            elif crop_rect is not None:
+                cr = self._target.capture_rect
+                cx, cy, cx2, cy2 = crop_rect  # type: ignore[misc]
+                near_rect = (cx, cy, cx2 - cx, cy2 - cy)
+                self._overlay.show_translation(
+                    translated_text, near_rect, (cr.left, cr.top)
+                )
+
     @Slot(str)
     def _on_error(self, message: str) -> None:
         self.statusBar().showMessage(f"⚠  {message}", 10000)
@@ -991,8 +1066,62 @@ class DebugWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._stop()
+        self._overlay.close()
         _cfg.interval_ms = self._spn_interval.value()
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Freeze mode
+    # ------------------------------------------------------------------
+
+    def _poll_freeze_hotkey(self) -> None:
+        """Edge-detect the freeze hotkey (default F9)."""
+        if self._target is None:
+            return
+        key_down = bool(
+            _user32_ui.GetAsyncKeyState(self._freeze_vk) & 0x8000
+        )
+        if key_down and not self._freeze_key_was_down:
+            if not self._overlay._is_freeze_mode:
+                self._freeze_key_was_down = True
+                self._trigger_freeze()
+                return
+        self._freeze_key_was_down = key_down
+
+    def _trigger_freeze(self) -> None:
+        """Enter freeze mode using the last captured frame."""
+        if self._last_frame_bytes is None or self._target is None:
+            self.statusBar().showMessage(
+                "⚠ Cannot freeze — no captured frame yet.", 3000
+            )
+            return
+        img = Image.open(io.BytesIO(self._last_frame_bytes))
+        try:
+            self._target = self._target.refresh()
+        except Exception:
+            pass
+        cr = self._target.capture_rect
+        self._overlay.enter_freeze_mode(
+            img, cr.left, cr.top, self._target.pid, self._target.hwnd
+        )
+        self._run_timer.stop()
+        self._send_freeze_frame.emit(self._last_frame_bytes)
+        self.statusBar().showMessage(
+            "Freeze mode — hover over the overlay; right-click or Esc to dismiss."
+        )
+
+    @Slot(float, float)
+    def _on_freeze_hover(self, x: float, y: float) -> None:
+        """Forward freeze-mode hover to the worker thread."""
+        self._request_freeze_tick.emit(int(x), int(y))
+
+    @Slot()
+    def _on_freeze_dismissed(self) -> None:
+        """Resume normal polling after freeze overlay is dismissed."""
+        self._send_clear_freeze.emit()
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            self._run_timer.start()
+        self.statusBar().showMessage("Freeze mode dismissed.", 3000)
 
     # ------------------------------------------------------------------
     # Translator settings panel
