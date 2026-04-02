@@ -12,19 +12,18 @@ Launch via ``python main.py --debug``.
 from __future__ import annotations
 
 import ctypes
-import io
 import logging
-import time
 
 from PySide6.QtCore import (
-    QObject, QSize, QThread, QTimer,
-    Signal, Slot, Qt,
+    QSize, QThread, QTimer,
+    Slot, Qt,
 )
 
 from src.config import AppConfig
 
 _cfg = AppConfig()
 _log = logging.getLogger(__name__)
+
 from PySide6.QtGui import (
     QColor, QFont, QImage, QPainter, QPen, QPixmap,
 )
@@ -35,20 +34,17 @@ from PySide6.QtWidgets import (
     QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar,
     QVBoxLayout, QWidget,
 )
-from PIL import Image
 
-from src.capture import Capturer
+from src.controller import HoverController
 from src.target import GameTarget
-from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
-from src.ocr.range_detectors import BoundingBox, merge_boxes_text, run_detectors
-from src.memory import MemoryScanner, pick_needles
-from src.correction import best_match_with_details
+from src.ocr.windows_ocr import _ensure_apartment
+from src.ocr.range_detectors import BoundingBox
 from src.translators.base import PROVIDERS, PROVIDERS_BY_KEY, Translator
 from src.translators.factory import build_translator
 from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT
 from src.knowledge import KnowledgeBase
 from src.paths import knowledge_db_path
-from src.overlay import TranslationOverlay
+from src.overlay import FreezeOverlay, TranslationOverlay
 from .window_picker import WindowPicker
 
 
@@ -84,265 +80,8 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040
 _WAIT_TIMEOUT            = 0x00000102
 _kernel32_ui = ctypes.WinDLL("kernel32", use_last_error=True)
-_user32_ui   = ctypes.WinDLL("user32",   use_last_error=True)
 
 
-class _POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-
-# ---------------------------------------------------------------------------
-# Background pipeline worker
-# ---------------------------------------------------------------------------
-
-class _PipelineWorker(QObject):
-    """Runs capture + OCR + memory scan + translation on a background QThread.
-
-    Signals
-    -------
-    result_ready(img_bytes, word_boxes, line_boxes, crop_rect, win_ocr_text,
-                 region_text, detector_name, mem_text, corrected_text,
-                 translated_text, elapsed_ms)
-    error(message)
-    """
-
-    result_ready = Signal(bytes, list, list, object, str, str, str, str, str, str, float)
-    error = Signal(str)
-    ready = Signal()
-
-    def __init__(
-        self,
-        target: GameTarget,
-        language_tag: str,
-        translator: Translator | None = None,
-        target_lang: str = "en",
-    ) -> None:
-        super().__init__()
-        self._target = target
-        self._language_tag = language_tag
-        self._translator = translator
-        self._target_lang = target_lang
-        self._capturer: Capturer | None = None
-        self._ocr: WindowsOcr | None = None
-        self._scanner: MemoryScanner | None = None
-        self._freeze_frame: Image.Image | None = None
-
-    # ------------------------------------------------------------------
-    # Lifecycle (called on worker thread via QThread.started / explicit slots)
-    # ------------------------------------------------------------------
-
-    @Slot()
-    def setup(self) -> None:
-        """Initialise resources on the worker thread."""
-        try:
-            self._capturer = Capturer(hmonitor=self._target.hmonitor)
-            self._capturer.open()
-        except Exception as exc:
-            self.error.emit(f"Capturer init failed: {exc}")
-            return
-
-        try:
-            self._ocr = WindowsOcr(self._language_tag)
-        except MissingOcrLanguageError as exc:
-            self.error.emit(str(exc))
-        except Exception as exc:
-            self.error.emit(f"Windows OCR init failed: {exc}")
-
-        try:
-            self._scanner = MemoryScanner(self._target.pid)
-        except OSError as exc:
-            self.error.emit(f"MemoryScanner init failed: {exc}")
-
-        self.ready.emit()
-
-    @Slot()
-    def teardown(self) -> None:
-        """Release resources when the thread is stopping."""
-        if self._capturer is not None:
-            self._capturer.close()
-            self._capturer = None
-        if self._scanner is not None:
-            self._scanner.close()
-            self._scanner = None
-
-    # ------------------------------------------------------------------
-    # Pipeline tick
-    # ------------------------------------------------------------------
-
-    @Slot()
-    def run_tick(self) -> None:
-        """Capture one frame, run OCR, run memory scan, emit results."""
-        if self._capturer is None or self._ocr is None:
-            return
-
-        # Refresh window rect every tick so we always capture the current
-        # window position / size (handles window moves, resizes, DPI changes).
-        try:
-            self._target = self._target.refresh()
-        except Exception as exc:
-            _log.warning("target.refresh() failed, using last known position: %s", exc)
-
-        try:
-            img: Image.Image = self._capturer.grab_target(self._target)
-        except ValueError:
-            # Target moved to a different monitor — recreate Capturer.
-            try:
-                self._capturer.close()
-                self._capturer = Capturer(hmonitor=self._target.hmonitor)
-                self._capturer.open()
-                img = self._capturer.grab_target(self._target)
-            except Exception as exc:
-                self.error.emit(f"Capture failed (monitor switch): {exc}")
-                return
-        except Exception as exc:
-            self.error.emit(f"Capture failed: {exc}")
-            return
-
-        _pt = _POINT()
-        _user32_ui.GetCursorPos(ctypes.byref(_pt))
-        # Cursor is in virtual-screen (physical) coords; image origin == window_rect origin.
-        wr = self._target.window_rect
-        cursor_x = _pt.x - wr.left
-        cursor_y = _pt.y - wr.top
-        if not (0 <= cursor_x < img.width and 0 <= cursor_y < img.height):
-            cursor_x = img.width // 2
-            cursor_y = int(img.height * 0.75)
-
-        self._process_frame(img, cursor_x, cursor_y)
-
-    @Slot(bytes)
-    def set_freeze_frame(self, img_bytes: bytes) -> None:
-        """Store a frozen frame for :meth:`run_freeze_tick`."""
-        self._freeze_frame = Image.open(io.BytesIO(img_bytes))
-
-    @Slot()
-    def clear_freeze_frame(self) -> None:
-        """Discard the stored frozen frame."""
-        self._freeze_frame = None
-
-    @Slot(int, int)
-    def run_freeze_tick(self, cursor_x: int, cursor_y: int) -> None:
-        """Run the pipeline on the stored frozen frame at *(cursor_x, cursor_y)*."""
-        if self._freeze_frame is None or self._ocr is None:
-            return
-        self._process_frame(self._freeze_frame, cursor_x, cursor_y)
-
-    # ------------------------------------------------------------------
-    # Internal — shared processing
-    # ------------------------------------------------------------------
-
-    def _process_frame(
-        self, img: Image.Image, cursor_x: int, cursor_y: int
-    ) -> None:
-        """Run OCR + region detection + memory scan + translation on *img*."""
-        t0 = time.monotonic()
-
-        try:
-            boxes, line_boxes = self._ocr.recognise(img)
-        except Exception as exc:
-            self.error.emit(f"Windows OCR failed: {exc}")
-            boxes, line_boxes = [], []
-
-        win_ocr_lines = [
-            f"[{b.x:4},{b.y:4}  {b.w:3}×{b.h:3}]  {b.text}"
-            for b in boxes
-        ]
-        lang_info = f"lang={self._ocr.language_tag}" if self._ocr else "lang=?"
-        win_ocr_text = f"[ {lang_info} ]\n" + "\n".join(win_ocr_lines)
-
-        # ── Region detection ──────────────────────────────────────────
-        region_text = ""
-        detector_name = ""
-        crop_rect: tuple[int, int, int, int] | None = None
-        if line_boxes:
-            dialog_boxes, detector_name = run_detectors(line_boxes, cursor_x, cursor_y)
-            if dialog_boxes:
-                region_text = merge_boxes_text(dialog_boxes)
-                xs  = [b.x       for b in dialog_boxes]
-                ys  = [b.y       for b in dialog_boxes]
-                x2s = [b.x + b.w for b in dialog_boxes]
-                y2s = [b.y + b.h for b in dialog_boxes]
-                margin = 8
-                crop_rect = (
-                    max(0, min(xs)  - margin),
-                    max(0, min(ys)  - margin),
-                    min(img.width,  max(x2s) + margin),
-                    min(img.height, max(y2s) + margin),
-                )
-
-        # ── Memory scan ──────────────────────────────────────────────
-        mem_text = ""
-        corrected_text = region_text
-        if region_text and self._scanner is not None:
-            try:
-                needles = pick_needles(region_text)
-                results: list = []
-                used_needle = ""
-                for needle in needles:
-                    results = self._scanner.scan(needle)
-                    if results:
-                        used_needle = needle
-                        break
-                    used_needle = needle  # remember last tried
-
-                candidates = [r.text for r in results]
-                matched = best_match_with_details(region_text, candidates)
-                if matched is not None:
-                    enc = results[0].encoding if results else "?"
-                    corrected_text = matched.text
-                    previews = "\n\n".join(
-                        r.text[:400] for r in results[:5]
-                    )
-                    mem_text = (
-                        f"[match ✓  enc={enc}  "
-                        f"hits={len(results)}  "
-                        f"needle={used_needle!r}  "
-                        f"tried={len(needles)}  "
-                        f"phase={matched.phase}  "
-                        f"score={matched.score:.1f}/{matched.threshold:.1f}]"
-                        f"\n\n{previews}"
-                    )
-                elif results:
-                    previews = "\n".join(
-                        f"  [{r.encoding}] {r.text[:200]!r}"
-                        for r in results[:5]
-                    )
-                    mem_text = (
-                        f"[no match  hits={len(results)}  "
-                        f"needle={used_needle!r}  "
-                        f"tried={len(needles)}]\n{previews}"
-                    )
-                elif needles:
-                    mem_text = (
-                        f"[no hits  needles={needles!r}]"
-                    )
-                else:
-                    mem_text = "[no needles from OCR text]"
-            except Exception as exc:
-                mem_text = f"[scan error: {exc}]"
-                corrected_text = region_text
-
-        # ── Translation ──────────────────────────────────────────────
-        translated_text = ""
-        if self._translator is not None and corrected_text:
-            try:
-                translated_text = self._translator.translate(
-                    corrected_text, target_lang=self._target_lang
-                )
-            except Exception as exc:
-                translated_text = f"[translation error: {exc}]"
-
-        elapsed_ms = (time.monotonic() - t0) * 1000
-
-        # Encode frame as JPEG bytes so the PIL object doesn't cross
-        # thread boundary.
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=75)
-        self.result_ready.emit(
-            buf.getvalue(), boxes, line_boxes, crop_rect,
-            win_ocr_text, region_text, detector_name, mem_text, corrected_text,
-            translated_text, elapsed_ms,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -518,11 +257,6 @@ class DebugWindow(QMainWindow):
     Right: Windows OCR · Detected Region · Memory Scan · Translation.
     """
 
-    _trigger_tick = Signal()
-    _send_freeze_frame = Signal(bytes)
-    _request_freeze_tick = Signal(int, int)
-    _send_clear_freeze = Signal()
-
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("JustReadIt")
@@ -533,14 +267,11 @@ class DebugWindow(QMainWindow):
             self.move(primary.availableGeometry().center() - self.rect().center())
 
         self._target: GameTarget | None = None
-        self._worker: _PipelineWorker | None = None
+        self._controller: HoverController | None = None
         self._worker_thread: QThread | None = None
         self._translator: Translator | None = None
         # Shared knowledge base — persists across translator rebuilds.
         self._knowledge_base: KnowledgeBase = KnowledgeBase.open(knowledge_db_path())
-
-        self._run_timer = QTimer(self)
-        self._run_timer.timeout.connect(self._request_tick)
 
         self._picker: WindowPicker | None = None
 
@@ -549,18 +280,12 @@ class DebugWindow(QMainWindow):
         self._install_timer.setInterval(500)
         self._install_timer.timeout.connect(self._poll_install)
 
-        # Translation overlay — floats over the game window.
-        self._overlay = TranslationOverlay(auto_hide_ms=_cfg.overlay_auto_hide_ms)
-        self._overlay.hover_requested.connect(self._on_freeze_hover)
-        self._overlay.freeze_dismissed.connect(self._on_freeze_dismissed)
-
-        # Freeze hotkey (F9) polling
-        self._freeze_vk: int = _cfg.freeze_vk
-        self._freeze_key_was_down: bool = False
-        self._last_frame_bytes: bytes | None = None
-        self._hotkey_timer = QTimer(self)
-        self._hotkey_timer.setInterval(80)
-        self._hotkey_timer.timeout.connect(self._poll_freeze_hotkey)
+        # Overlays — translation popup + freeze screenshot.
+        self._translation_overlay = TranslationOverlay(
+            auto_hide_ms=_cfg.overlay_auto_hide_ms,
+        )
+        self._freeze_overlay = FreezeOverlay()
+        self._freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
 
         self._build_ui()
 
@@ -603,14 +328,50 @@ class DebugWindow(QMainWindow):
         tb.addWidget(self._spn_interval)
         tb.addSeparator()
 
+        tb.addWidget(QLabel(" Auto-hide: "))
+        self._spn_auto_hide = QSpinBox()
+        self._spn_auto_hide.setRange(0, 30000)
+        self._spn_auto_hide.setSingleStep(500)
+        self._spn_auto_hide.setSuffix(" ms")
+        self._spn_auto_hide.setToolTip(
+            "Translation popup auto-hide delay (0 = never hide)"
+        )
+        tb.addWidget(self._spn_auto_hide)
+        tb.addSeparator()
+
+        tb.addWidget(QLabel(" Freeze key: "))
+        self._cmb_freeze_key = QComboBox()
+        _VK_FKEYS = [
+            ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73),
+            ("F5", 0x74), ("F6", 0x75), ("F7", 0x76), ("F8", 0x77),
+            ("F9", 0x78), ("F10", 0x79), ("F11", 0x7A), ("F12", 0x7B),
+        ]
+        for label, vk in _VK_FKEYS:
+            self._cmb_freeze_key.addItem(label, userData=vk)
+        self._cmb_freeze_key.setToolTip("Hotkey to toggle freeze mode")
+        tb.addWidget(self._cmb_freeze_key)
+        tb.addSeparator()
+
         # ── Restore persisted settings ───────────────────────────────
         saved_lang = _cfg.ocr_language
         saved_interval = _cfg.interval_ms
         self._spn_interval.setValue(saved_interval)
+        self._spn_auto_hide.setValue(_cfg.overlay_auto_hide_ms)
+        saved_vk = _cfg.freeze_vk
+        for i in range(self._cmb_freeze_key.count()):
+            if self._cmb_freeze_key.itemData(i) == saved_vk:
+                self._cmb_freeze_key.setCurrentIndex(i)
+                break
         for i in range(self._cmb_lang.count()):
             if self._cmb_lang.itemData(i) == saved_lang:
                 self._cmb_lang.setCurrentIndex(i)
                 break
+
+        # Live-update freeze hotkey when combo changes.
+        self._cmb_freeze_key.currentIndexChanged.connect(self._on_freeze_key_changed)
+
+        # Live-update poll interval when spinbox changes.
+        self._spn_interval.valueChanged.connect(self._on_interval_changed)
 
         # ── Install progress bar (hidden until capability install) ───
         self._install_bar = QWidget()
@@ -948,66 +709,62 @@ class DebugWindow(QMainWindow):
 
         lang = self._selected_language
         target_lang = _cfg.translator_target_lang
-        self._worker = _PipelineWorker(
-            self._target, lang, self._translator, target_lang
+        interval = self._spn_interval.value()
+        freeze_vk = self._cmb_freeze_key.currentData() or 0x78
+
+        self._controller = HoverController(
+            self._target,
+            language_tag=lang,
+            translator=self._translator,
+            source_lang=lang,
+            target_lang=target_lang,
+            freeze_vk=freeze_vk,
+            poll_ms=interval,
+            continuous=True,
         )
         self._worker_thread = QThread(self)
-        self._worker.moveToThread(self._worker_thread)
+        self._controller.moveToThread(self._worker_thread)
 
-        self._worker.result_ready.connect(self._on_result)
-        self._worker.error.connect(self._on_error)
-        self._worker.ready.connect(self._on_worker_ready)
-        self._trigger_tick.connect(self._worker.run_tick)
-        self._send_freeze_frame.connect(self._worker.set_freeze_frame)
-        self._request_freeze_tick.connect(self._worker.run_freeze_tick)
-        self._send_clear_freeze.connect(self._worker.clear_freeze_frame)
-        self._worker_thread.started.connect(self._worker.setup)
-        self._worker_thread.finished.connect(self._worker.teardown)
+        # Controller → debug panels + overlays
+        self._controller.pipeline_debug.connect(self._on_result)
+        self._controller.translation_ready.connect(self._on_translation)
+        self._controller.freeze_triggered.connect(self._on_freeze_triggered)
+        self._controller.error.connect(self._on_error)
+        self._controller.ready.connect(self._on_worker_ready)
+
+        # Overlay → controller (freeze mode interaction)
+        self._freeze_overlay.hover_requested.connect(
+            self._controller.on_freeze_hover,
+        )
+        self._freeze_overlay.dismissed.connect(
+            self._controller.on_freeze_dismissed,
+        )
+
+        self._worker_thread.started.connect(self._controller.setup)
+        self._worker_thread.finished.connect(self._controller.teardown)
 
         self._worker_thread.start()
         self.statusBar().showMessage(
-            f"Starting — lang={lang}  interval={self._spn_interval.value()} ms"
+            f"Starting — lang={lang}  interval={interval} ms"
         )
 
     def _stop(self) -> None:
-        self._run_timer.stop()
-        self._hotkey_timer.stop()
         if self._worker_thread is not None:
-            try:
-                self._trigger_tick.disconnect()
-            except RuntimeError:
-                pass
-            try:
-                self._send_freeze_frame.disconnect()
-            except RuntimeError:
-                pass
-            try:
-                self._request_freeze_tick.disconnect()
-            except RuntimeError:
-                pass
-            try:
-                self._send_clear_freeze.disconnect()
-            except RuntimeError:
-                pass
             self._worker_thread.quit()
-            self._worker_thread.wait(3000)
+            if not self._worker_thread.wait(3000):
+                _log.warning("Worker thread did not stop in 3 s — terminating.")
+                self._worker_thread.terminate()
+                self._worker_thread.wait(1000)
             self._worker_thread = None
-            self._worker = None
+            self._controller = None
 
     @Slot()
     def _on_worker_ready(self) -> None:
-        interval = self._spn_interval.value()
-        self._run_timer.setInterval(interval)
-        self._run_timer.start()
-        self._hotkey_timer.start()
         lang = self._selected_language
+        interval = self._spn_interval.value()
         self.statusBar().showMessage(
             f"Running — lang={lang}  interval={interval} ms"
         )
-
-    def _request_tick(self) -> None:
-        if self._worker_thread is not None and self._worker_thread.isRunning():
-            self._trigger_tick.emit()
 
     # ------------------------------------------------------------------
     # Result / error handlers
@@ -1028,8 +785,9 @@ class DebugWindow(QMainWindow):
         translated_text: str,
         elapsed_ms: float,
     ) -> None:
+        """Update debug panels with intermediate pipeline data."""
         self._preview.update_frame(img_bytes, boxes, line_boxes, crop_rect)
-        header = f"[ {len(boxes)} boxes  —  {elapsed_ms:.0f} ms ]\n\n"
+        header = f"[ {len(boxes)} boxes  \u2014  {elapsed_ms:.0f} ms ]\n\n"
         self._te_wocr.setPlainText(header + win_ocr_text)
         if detector_name:
             self._grp_region.setTitle(f"Detected Region  [{detector_name}]")
@@ -1042,19 +800,37 @@ class DebugWindow(QMainWindow):
             f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
         )
 
-        # ── Translation overlay ─────────────────────────────────────────
-        if not self._overlay._is_freeze_mode:
-            self._last_frame_bytes = img_bytes
-        if translated_text and self._target is not None:
-            if self._overlay._is_freeze_mode:
-                self._overlay.show_freeze_translation(translated_text)
-            elif crop_rect is not None:
-                wr = self._target.window_rect
-                cx, cy, cx2, cy2 = crop_rect  # type: ignore[misc]
-                near_rect = (cx, cy, cx2 - cx, cy2 - cy)
-                self._overlay.show_translation(
-                    translated_text, near_rect, (wr.left, wr.top)
-                )
+    @Slot(str, object, object)
+    def _on_translation(
+        self,
+        text: str,
+        near_rect: object,
+        screen_origin: object,
+    ) -> None:
+        """Route translation to the appropriate overlay."""
+        if self._freeze_overlay.is_active:
+            self._freeze_overlay.show_translation(text)
+        elif near_rect is not None and screen_origin is not None:
+            self._translation_overlay.show_translation(
+                text, near_rect, screen_origin,
+            )
+
+    @Slot(object, int, int, int, int)
+    def _on_freeze_triggered(
+        self,
+        screenshot: object,
+        window_left: int,
+        window_top: int,
+        pid: int,
+        hwnd: int,
+    ) -> None:
+        """Enter freeze mode when the controller detects the hotkey."""
+        self._freeze_overlay.freeze(
+            screenshot, window_left, window_top, pid, hwnd,
+        )
+        self.statusBar().showMessage(
+            "Freeze mode \u2014 right-click or Esc to dismiss."
+        )
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
@@ -1066,63 +842,57 @@ class DebugWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        # Disconnect freeze_dismissed first so _on_freeze_dismissed cannot restart
+        # timers after we've already stopped everything.
+        try:
+            self._freeze_overlay.dismissed.disconnect(self._on_freeze_dismissed)
+        except RuntimeError:
+            pass
+        # Stop all timers and the worker thread.
         self._stop()
-        self._overlay.close()
+        # Persist toolbar settings.
         _cfg.interval_ms = self._spn_interval.value()
+        _cfg.overlay_auto_hide_ms = self._spn_auto_hide.value()
+        _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
+        # Close overlays and knowledge base.
+        self._translation_overlay.close()
+        self._freeze_overlay.close()
+        try:
+            self._knowledge_base.close()
+        except Exception:
+            pass
         super().closeEvent(event)
+        # Ensure the process exits even if dangling threads/resources remain.
+        QApplication.instance().quit()  # type: ignore[union-attr]
 
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # Freeze mode
     # ------------------------------------------------------------------
 
-    def _poll_freeze_hotkey(self) -> None:
-        """Edge-detect the freeze hotkey (default F9)."""
-        if self._target is None:
-            return
-        key_down = bool(
-            _user32_ui.GetAsyncKeyState(self._freeze_vk) & 0x8000
-        )
-        if key_down and not self._freeze_key_was_down:
-            if not self._overlay._is_freeze_mode:
-                self._freeze_key_was_down = True
-                self._trigger_freeze()
-                return
-        self._freeze_key_was_down = key_down
-
-    def _trigger_freeze(self) -> None:
-        """Enter freeze mode using the last captured frame."""
-        if self._last_frame_bytes is None or self._target is None:
-            self.statusBar().showMessage(
-                "⚠ Cannot freeze — no captured frame yet.", 3000
-            )
-            return
-        img = Image.open(io.BytesIO(self._last_frame_bytes))
-        try:
-            self._target = self._target.refresh()
-        except Exception:
-            pass
-        wr = self._target.window_rect
-        self._overlay.enter_freeze_mode(
-            img, wr.left, wr.top, self._target.pid, self._target.hwnd
-        )
-        self._run_timer.stop()
-        self._send_freeze_frame.emit(self._last_frame_bytes)
-        self.statusBar().showMessage(
-            "Freeze mode — hover over the overlay; right-click or Esc to dismiss."
-        )
-
-    @Slot(float, float)
-    def _on_freeze_hover(self, x: float, y: float) -> None:
-        """Forward freeze-mode hover to the worker thread."""
-        self._request_freeze_tick.emit(int(x), int(y))
+    @Slot(int)
+    def _on_freeze_key_changed(self, index: int) -> None:
+        """Update the live freeze hotkey VK code and persist it."""
+        vk = self._cmb_freeze_key.itemData(index)
+        if vk is not None:
+            _cfg.freeze_vk = vk
+            if self._controller is not None:
+                self._controller.set_freeze_vk(vk)
 
     @Slot()
     def _on_freeze_dismissed(self) -> None:
-        """Resume normal polling after freeze overlay is dismissed."""
-        self._send_clear_freeze.emit()
-        if self._worker_thread is not None and self._worker_thread.isRunning():
-            self._run_timer.start()
         self.statusBar().showMessage("Freeze mode dismissed.", 3000)
+
+    # ------------------------------------------------------------------
+    # Interval change
+    # ------------------------------------------------------------------
+
+    @Slot(int)
+    def _on_interval_changed(self, ms: int) -> None:
+        """Push the new poll interval to the running controller."""
+        if self._controller is not None:
+            self._controller.set_poll_interval(ms)
+
 
     # ------------------------------------------------------------------
     # Translator settings panel
@@ -1206,6 +976,27 @@ class DebugWindow(QMainWindow):
         row4.addLayout(prompt_col)
         of_lay.addLayout(row4)
 
+        row_ctx = QHBoxLayout()
+        row_ctx.addWidget(QLabel("Context window:"))
+        self._spn_context_window = QSpinBox()
+        self._spn_context_window.setRange(0, 100)
+        self._spn_context_window.setToolTip(
+            "Number of recent translation pairs included as context"
+        )
+        self._spn_context_window.setMaximumWidth(80)
+        row_ctx.addWidget(self._spn_context_window)
+        row_ctx.addSpacing(12)
+        row_ctx.addWidget(QLabel("Summary trigger:"))
+        self._spn_summary_trigger = QSpinBox()
+        self._spn_summary_trigger.setRange(0, 200)
+        self._spn_summary_trigger.setToolTip(
+            "History length that triggers summarisation of the oldest chunk"
+        )
+        self._spn_summary_trigger.setMaximumWidth(80)
+        row_ctx.addWidget(self._spn_summary_trigger)
+        row_ctx.addStretch()
+        of_lay.addLayout(row_ctx)
+
         lay.addWidget(self._openai_fields)
 
         # Row 5: Apply / Test + status
@@ -1250,6 +1041,8 @@ class DebugWindow(QMainWindow):
             self._le_model.setText(_cfg.openai_model)
             self._le_base_url.setText(_cfg.openai_base_url)
             self._te_system_prompt.setPlainText(_cfg.openai_system_prompt or DEFAULT_SYSTEM_PROMPT)
+            self._spn_context_window.setValue(_cfg.openai_context_window)
+            self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
         else:
             self._le_api_key.setText(_cfg.cloud_api_key)
 
@@ -1288,6 +1081,8 @@ class DebugWindow(QMainWindow):
             _cfg.openai_model = self._le_model.text().strip() or "gpt-4o-mini"
             _cfg.openai_base_url = self._le_base_url.text().strip()
             _cfg.openai_system_prompt = self._te_system_prompt.toPlainText().strip()
+            _cfg.openai_context_window = self._spn_context_window.value()
+            _cfg.openai_summary_trigger = self._spn_summary_trigger.value()
 
         if backend == "none":
             self._translator = None
@@ -1324,9 +1119,9 @@ class DebugWindow(QMainWindow):
             self._lbl_tl_status.setText(f"\u26a0 {exc}")
 
     def _restart_worker_with_translator(self) -> None:
-        """Restart the pipeline worker so it picks up the new translator."""
-        if self._worker_thread is not None and self._worker_thread.isRunning():
-            self._run()
+        """Push the new translator to the running controller."""
+        if self._controller is not None:
+            self._controller.set_translator(self._translator)
 
     def _build_translator_from_ui(self) -> "Translator | None":
         """Instantiate a translator from current UI fields without persisting to config."""
@@ -1350,7 +1145,7 @@ class DebugWindow(QMainWindow):
                 api_key=api_key,
                 model=self._le_model.text().strip() or "gpt-4o-mini",
                 system_prompt=self._te_system_prompt.toPlainText().strip(),
-                context_window=_cfg.openai_context_window,
+                context_window=self._spn_context_window.value(),
                 base_url=self._le_base_url.text().strip() or None,
                 knowledge_base=self._knowledge_base,
                 progress=progress,

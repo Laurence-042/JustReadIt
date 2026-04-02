@@ -189,14 +189,3 @@ class AppConfig:
         s = _make_qsettings()
         s.setValue("overlay/auto_hide_ms", value)
         s.sync()
-
-    @property
-    def settle_ms(self) -> int:
-        """Milliseconds cursor must remain still before OCR probe (default 500)."""
-        return int(_make_qsettings().value("hover/settle_ms", 500))
-
-    @settle_ms.setter
-    def settle_ms(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("hover/settle_ms", value)
-        s.sync()

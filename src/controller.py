@@ -56,6 +56,7 @@ Typical wiring::
 from __future__ import annotations
 
 import ctypes
+import io
 import logging
 import math
 import time
@@ -65,7 +66,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from src.cache import PhashCache, TranslationCache
 from src.capture import Capturer
-from src.correction import best_match
+from src.correction import best_match_with_details
 from src.memory import MemoryScanner, pick_needles
 from src.ocr.range_detectors import merge_boxes_text, run_detectors
 from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr
@@ -128,6 +129,10 @@ class HoverController(QObject):
         Virtual-key code for the Freeze hotkey.  Default 0x78 = **F9**.
     poll_ms:
         Poll interval in milliseconds.
+    continuous:
+        When ``True`` the controller runs the full pipeline on **every** poll
+        tick (no settle detection or OCR probe gate).  Intended for debug/UI
+        use where live feedback is preferred over conservative API usage.
 
     Signals
     -------
@@ -138,14 +143,25 @@ class HoverController(QObject):
         screen space.
     freeze_triggered(screenshot, window_left, window_top, pid, hwnd)
         Emitted when the freeze hotkey fires.  Arguments are passed directly
-        to :meth:`~src.overlay.TranslationOverlay.enter_freeze_mode`.
+        to :meth:`~src.overlay.FreezeOverlay.freeze`.
+    pipeline_debug(img_bytes, word_boxes, line_boxes, crop_rect,
+                   win_ocr_text, region_text, detector_name,
+                   mem_text, corrected_text, translated_text, elapsed_ms)
+        Emitted after every pipeline run with intermediate data for debug
+        panels.  Only useful when a UI consumes it — no-ops otherwise.
     error(message)
         Emitted for recoverable errors (e.g. OCR language not installed).
+    ready()
+        Emitted after :meth:`setup` completes successfully.
     """
 
     translation_ready = Signal(str, object, object)   # text, near_rect, screen_origin
     freeze_triggered = Signal(object, int, int, int, int)  # img, left, top, pid, hwnd
+    pipeline_debug = Signal(
+        bytes, list, list, object, str, str, str, str, str, str, float,
+    )
     error = Signal(str)
+    ready = Signal()
 
     def __init__(
         self,
@@ -156,6 +172,7 @@ class HoverController(QObject):
         target_lang: str = "zh-CN",
         freeze_vk: int = 0x78,  # VK_F9
         poll_ms: int = _POLL_MS,
+        continuous: bool = False,
     ) -> None:
         super().__init__()
         self._target = target
@@ -165,6 +182,7 @@ class HoverController(QObject):
         self._target_lang = target_lang
         self._freeze_vk = freeze_vk
         self._poll_ms = poll_ms
+        self._continuous = continuous
 
         # Resources — created in setup() on the worker thread
         self._capturer: Capturer | None = None
@@ -227,6 +245,7 @@ class HoverController(QObject):
         self._poll_timer.setInterval(self._poll_ms)
         self._poll_timer.timeout.connect(self._poll)
         self._poll_timer.start()
+        self.ready.emit()
 
     @Slot()
     def teardown(self) -> None:
@@ -243,6 +262,27 @@ class HoverController(QObject):
         if self._text_cache is not None:
             self._text_cache.close()
             self._text_cache = None
+
+    # ------------------------------------------------------------------
+    # Runtime parameter updates (thread-safe via queued connection)
+    # ------------------------------------------------------------------
+
+    @Slot(object)
+    def set_translator(self, translator: "Translator | None") -> None:
+        """Replace the active translator at runtime."""
+        self._translator = translator
+
+    @Slot(int)
+    def set_poll_interval(self, ms: int) -> None:
+        """Change the poll timer interval while running."""
+        self._poll_ms = ms
+        if self._poll_timer is not None:
+            self._poll_timer.setInterval(ms)
+
+    @Slot(int)
+    def set_freeze_vk(self, vk: int) -> None:
+        """Change the freeze-mode hotkey virtual-key code."""
+        self._freeze_vk = vk
 
     # ------------------------------------------------------------------
     # Freeze-mode slots (called from main thread via queued connection)
@@ -283,6 +323,29 @@ class HoverController(QObject):
 
         if self._in_freeze:
             return  # hover events drive the pipeline in freeze mode
+
+        if self._continuous:
+            # Continuous mode: always capture and run pipeline.
+            try:
+                self._target = self._target.refresh()
+            except Exception as exc:
+                _log.warning("target.refresh() failed: %s", exc)
+            img = self._capture_current()
+            if img is None:
+                return
+            pt = _POINT()
+            _user32.GetCursorPos(ctypes.byref(pt))
+            wr = self._target.window_rect
+            img_x = pt.x - wr.left
+            img_y = pt.y - wr.top
+            if not (0 <= img_x < img.width and 0 <= img_y < img.height):
+                img_x = img.width // 2
+                img_y = int(img.height * 0.75)
+            try:
+                self._run_pipeline(img, img_x, img_y)
+            except Exception as exc:
+                _log.exception("Continuous pipeline error: %s", exc)
+            return
 
         # ── Mouse settle detection ────────────────────────────────────
         pt = _POINT()
@@ -420,103 +483,198 @@ class HoverController(QObject):
     def _run_pipeline(
         self, img: "PILImage", img_x: int, img_y: int
     ) -> None:
-        """Run the full OCR → correct → translate pipeline.
+        """Run the full OCR -> correct -> translate pipeline.
 
-        Results are emitted via :attr:`translation_ready`.  The method is
-        synchronous and runs on the worker thread.
+        Emits :attr:`translation_ready` with the final result and
+        :attr:`pipeline_debug` with all intermediate data for debug panels.
         """
         if self._ocr is None:
             return
 
-        # ── Full OCR ──────────────────────────────────────────────────
+        t0 = time.monotonic()
+
+        # ── Full OCR ─────────────────────────────────────────────────
         try:
-            _boxes, line_boxes = self._ocr.recognise(img)
+            boxes, line_boxes = self._ocr.recognise(img)
         except Exception as exc:
-            _log.warning("OCR failed: %s", exc)
-            return
+            self.error.emit(f"Windows OCR failed: {exc}")
+            boxes, line_boxes = [], []
+
+        win_ocr_lines = [
+            f"[{b.x:4},{b.y:4}  {b.w:3}\u00d7{b.h:3}]  {b.text}"
+            for b in boxes
+        ]
+        lang_info = f"lang={self._ocr.language_tag}" if self._ocr else "lang=?"
+        win_ocr_text = f"[ {lang_info} ]\n" + "\n".join(win_ocr_lines)
 
         if not line_boxes:
+            self._emit_debug(
+                img, t0, boxes, line_boxes, None, win_ocr_text,
+                "", "", "", "", "",
+            )
             return
 
-        # ── Range detection ───────────────────────────────────────────
-        region_boxes, _detector_name = run_detectors(line_boxes, img_x, img_y)
-        if not region_boxes:
-            return
+        # ── Range detection ──────────────────────────────────────────
+        region_boxes, detector_name = run_detectors(line_boxes, img_x, img_y)
+        region_text = merge_boxes_text(region_boxes) if region_boxes else ""
+        crop_rect: tuple[int, int, int, int] | None = None
 
-        region_text = merge_boxes_text(region_boxes)
+        if region_boxes and region_text.strip():
+            xs  = [b.x       for b in region_boxes]
+            ys  = [b.y       for b in region_boxes]
+            x2s = [b.x + b.w for b in region_boxes]
+            y2s = [b.y + b.h for b in region_boxes]
+            margin = 8
+            crop_rect = (
+                max(0, min(xs)  - margin),
+                max(0, min(ys)  - margin),
+                min(img.width,  max(x2s) + margin),
+                min(img.height, max(y2s) + margin),
+            )
+
         if not region_text.strip():
+            self._emit_debug(
+                img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
+                region_text, detector_name, "", region_text, "",
+            )
             return
 
-        # Bounding rect of the detected region (in image coords)
-        xs  = [b.x       for b in region_boxes]
-        ys  = [b.y       for b in region_boxes]
-        x2s = [b.x + b.w for b in region_boxes]
-        y2s = [b.y + b.h for b in region_boxes]
-        margin = 8
-        crop_x  = max(0, min(xs)  - margin)
-        crop_y  = max(0, min(ys)  - margin)
-        crop_x2 = min(img.width,  max(x2s) + margin)
-        crop_y2 = min(img.height, max(y2s) + margin)
-        near_rect = (crop_x, crop_y, crop_x2 - crop_x, crop_y2 - crop_y)
+        near_rect = (
+            crop_rect[0],
+            crop_rect[1],
+            crop_rect[2] - crop_rect[0],
+            crop_rect[3] - crop_rect[1],
+        ) if crop_rect else (0, 0, 0, 0)
 
-        # ── Phash cache (fast path) ────────────────────────────────────
-        crop_img = img.crop((crop_x, crop_y, crop_x2, crop_y2))
-        cached = self._phash_cache.get(crop_img)
+        # ── Phash cache (fast path) ──────────────────────────────────
+        crop_img = img.crop(crop_rect) if crop_rect else None
+        cached = self._phash_cache.get(crop_img) if crop_img is not None else None
         if cached is not None:
+            self._emit_debug(
+                img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
+                region_text, detector_name, "[phash cache hit]",
+                region_text, cached,
+            )
             wr = self._target.window_rect
             self.translation_ready.emit(cached, near_rect, (wr.left, wr.top))
             return
 
-        # ── Memory scan + Levenshtein correction ──────────────────────
-        source_text = region_text
-        if self._scanner is not None:
+        # ── Memory scan + Levenshtein correction ─────────────────────
+        mem_text = ""
+        corrected_text = region_text
+        if self._scanner is not None and region_text:
             try:
                 needles = pick_needles(region_text)
                 results: list = []
+                used_needle = ""
                 for needle in needles:
                     results = self._scanner.scan(needle)
                     if results:
+                        used_needle = needle
                         break
-                if results:
-                    matched = best_match(region_text, [r.text for r in results])
-                    if matched is not None:
-                        source_text = matched
-            except Exception as exc:
-                _log.warning("Memory scan/correction failed: %s", exc)
+                    used_needle = needle
 
-        # ── Text cache (persistent) ────────────────────────────────────
+                candidates = [r.text for r in results]
+                matched = best_match_with_details(region_text, candidates)
+                if matched is not None:
+                    enc = results[0].encoding if results else "?"
+                    corrected_text = matched.text
+                    previews = "\n\n".join(
+                        r.text[:400] for r in results[:5]
+                    )
+                    mem_text = (
+                        f"[match \u2713  enc={enc}  "
+                        f"hits={len(results)}  "
+                        f"needle={used_needle!r}  "
+                        f"tried={len(needles)}  "
+                        f"phase={matched.phase}  "
+                        f"score={matched.score:.1f}/{matched.threshold:.1f}]"
+                        f"\n\n{previews}"
+                    )
+                elif results:
+                    previews = "\n".join(
+                        f"  [{r.encoding}] {r.text[:200]!r}"
+                        for r in results[:5]
+                    )
+                    mem_text = (
+                        f"[no match  hits={len(results)}  "
+                        f"needle={used_needle!r}  "
+                        f"tried={len(needles)}]\n{previews}"
+                    )
+                elif needles:
+                    mem_text = f"[no hits  needles={needles!r}]"
+                else:
+                    mem_text = "[no needles from OCR text]"
+            except Exception as exc:
+                mem_text = f"[scan error: {exc}]"
+                corrected_text = region_text
+
+        # ── Text cache (persistent) ──────────────────────────────────
         translation = ""
         if self._text_cache is not None:
             translation = self._text_cache.get(
-                source_text, self._source_lang, self._target_lang
+                corrected_text, self._source_lang, self._target_lang,
             ) or ""
 
-        # ── Translation backend ────────────────────────────────────────
-        if not translation and self._translator is not None:
+        # ── Translation backend ──────────────────────────────────────
+        if not translation and self._translator is not None and corrected_text:
             try:
                 translation = self._translator.translate(
-                    source_text,
+                    corrected_text,
                     source_lang=self._source_lang,
                     target_lang=self._target_lang,
                 )
                 if self._text_cache is not None and translation:
                     self._text_cache.put(
-                        source_text,
+                        corrected_text,
                         self._source_lang,
                         self._target_lang,
                         translation,
                     )
             except Exception as exc:
                 _log.warning("Translation failed: %s", exc)
-                translation = f"[Translation error: {exc}]"
+                translation = f"[translation error: {exc}]"
 
-        if not translation:
-            _log.debug("No translation for: %r", source_text[:60])
-            return
+        # ── Phash store ──────────────────────────────────────────────
+        if (
+            crop_img is not None
+            and translation
+            and not translation.startswith("[")
+        ):
+            self._phash_cache.put(crop_img, translation)
 
-        # ── Phash store ────────────────────────────────────────────────
-        self._phash_cache.put(crop_img, translation)
+        # ── Emit results ─────────────────────────────────────────────
+        self._emit_debug(
+            img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
+            region_text, detector_name, mem_text, corrected_text, translation,
+        )
+        if translation:
+            wr = self._target.window_rect
+            self.translation_ready.emit(translation, near_rect, (wr.left, wr.top))
 
-        # ── Emit result ────────────────────────────────────────────────
-        wr = self._target.window_rect
-        self.translation_ready.emit(translation, near_rect, (wr.left, wr.top))
+    # ------------------------------------------------------------------
+    # Private — emit debug signal
+    # ------------------------------------------------------------------
+
+    def _emit_debug(
+        self,
+        img: "PILImage",
+        t0: float,
+        boxes: list,
+        line_boxes: list,
+        crop_rect: tuple[int, int, int, int] | None,
+        win_ocr_text: str,
+        region_text: str,
+        detector_name: str,
+        mem_text: str,
+        corrected_text: str,
+        translated_text: str,
+    ) -> None:
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=75)
+        self.pipeline_debug.emit(
+            buf.getvalue(), boxes, line_boxes, crop_rect,
+            win_ocr_text, region_text, detector_name, mem_text,
+            corrected_text, translated_text, elapsed_ms,
+        )
