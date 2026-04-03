@@ -251,12 +251,18 @@ def best_match_with_details(
             partial_comparable_score = fuzz.ratio(
                 ocr_norm, _normalize(best_partial_text)
             )
-        accepted.append(MatchResult(
-            text=partial_output,
-            score=partial_comparable_score,
-            phase="partial",
-            threshold=_PARTIAL_THRESHOLD,
-        ))
+        # Guard: the comparable score must also clear the base threshold.
+        # partial_ratio ignores length differences, so it can be very high
+        # when the OCR text is a substring of a noisy single-line candidate
+        # (e.g. a VN engine log line containing the dialog text).  Without
+        # this check the inflated gate lets garbage through.
+        if partial_comparable_score >= threshold:
+            accepted.append(MatchResult(
+                text=partial_output,
+                score=partial_comparable_score,
+                phase="partial",
+                threshold=_PARTIAL_THRESHOLD,
+            ))
 
     if not accepted:
         return None

@@ -336,6 +336,23 @@ class TestBestMatchWithDetails:
         )
         assert "帰ってきたら折檻してやる" in result.text
 
+    def test_noisy_single_line_candidate_rejected(self) -> None:
+        """Regression: OCR text is a clean substring of a noisy single-line
+        memory string (e.g. a VN engine log line).  partial_ratio is very
+        high (substring match) but the candidate is garbage.  The correction
+        should return None so the controller falls back to OCR text."""
+        ocr = "強化の丸薬を1個手に入れた"
+        candidates = [
+            # Simulated engine log lines — OCR text is embedded in noise.
+            'ូ髗䴀耀LogClockPassed: 0.90ms (ParseLine_Actual: '
+            '~文字 アイテム入手文字 300 255 251 Corporate_Yawamin.ttf '
+            '20 カメラ付着 "強化の丸薬を1個手に入れた',
+            '囉鹋̀退保存変数 道具_強化の丸薬所持数 += 1',
+        ]
+        result = best_match_with_details(ocr, candidates)
+        # Should reject all candidates — the OCR text is already clean.
+        assert result is None
+
     def test_realworld_template_variable_prefers_vn_script(self) -> None:
         """Regression: {{template}} in VN script source must not lose to
         a rendered-text copy that contains the substituted value.
