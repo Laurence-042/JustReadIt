@@ -580,7 +580,7 @@ class HoverController(QObject):
                     used_needle = needle
 
                 candidates = [r.text for r in results]
-                matched = best_match_with_details(region_text, candidates)
+                matched = best_match_with_details(region_text, candidates, used_needle)
                 if matched is not None:
                     enc = results[0].encoding if results else "?"
                     corrected_text = matched.text

@@ -1,25 +1,44 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Cross-match between Windows OCR text and process memory scan results.
 
-Uses Levenshtein distance (via ``rapidfuzz``) to find the best-matching
-memory-resident string for each OCR result, providing cleaner text for
-downstream translation.
+Uses needle-anchored alignment to find and extract the best-matching
+memory-resident string segment for each OCR result, providing cleaner
+text for downstream translation.
 
-When no memory match exceeds the similarity threshold, the caller should
-fall back to the original OCR text.
+Algorithm overview:
+
+1. Use the needle (a short CJK substring known to appear in both OCR and
+   memory) as an anchor. Locate the needle in each candidate to compute a
+   rough start/end boundary that aligns the memory string with the OCR text.
+2. Score the aligned segment against the OCR text, treating ``{{template}}``
+   variables as wildcards.
+3. Pick the highest-scoring candidate/occurrence.
+4. Refine the left boundary: walk left from the rough start, including
+   symbols/punctuation until a ``clean text`` zone begins (no nearby symbols)
+   or a terminator/opening-bracket is reached. This captures ``\u2026\u2026``
+   or ``\u3010A\u2026\u2026`` that OCR drops while stopping at garbled bytes.
+5. Refine the right boundary: walk right from the rough end, including
+   everything (text and symbols) until a terminator or closing bracket is
+   reached.
+
+When no candidate reaches the similarity threshold, the caller should fall
+back to the original OCR text.
 
 Usage::
 
     from src.memory import MemoryScanner, pick_needles
     from src.correction import best_match
 
-    ocr_text = "テスト文字列"
+    ocr_text = "\u30c6\u30b9\u30c8\u6587\u5b57\u5217"
     with MemoryScanner(pid=target.pid) as ms:
         for needle in pick_needles(ocr_text):
             results = ms.scan(needle)
             if results:
                 break
 
-    clean = best_match(ocr_text, [r.text for r in results])
+    clean = best_match(ocr_text, [r.text for r in results], needle)
     final = clean if clean is not None else ocr_text
 """
 from __future__ import annotations
@@ -31,8 +50,8 @@ from typing import Sequence
 
 from rapidfuzz import fuzz
 
+
 _DEFAULT_THRESHOLD: float = 60.0
-_PARTIAL_THRESHOLD: float = 75.0
 
 # ---------------------------------------------------------------------------
 # Unicode normalisation — scoring only
@@ -85,56 +104,228 @@ def _normalize(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Line-window matching
+# Character classification helpers
 # ---------------------------------------------------------------------------
 
 
-def _best_line_window(
-    ocr_norm: str,
-    candidate: str,
-) -> tuple[str, float] | None:
-    """Find the contiguous line window in *candidate* best matching OCR text.
+def _is_symbol_char(ch: str) -> bool:
+    """Return ``True`` for punctuation and symbol Unicode characters.
 
-    Splits *candidate* by newlines and tries all contiguous windows of
-    ``max(1, ocr_lines − 2)`` to ``min(total, ocr_lines + 3)`` lines.
-    Each window is normalised before scoring against *ocr_norm*.
-
-    Returns ``(original_window_text, score)`` or ``None``.
+    Returns ``False`` for CJK/Latin letters, digits, spaces, and controls.
+    Categories covered: ``P*`` (punctuation) and ``S*`` (symbol).
     """
-    cand_lines = candidate.replace("\r\n", "\n").split("\n")
-    if len(cand_lines) <= 1:
-        return None  # single-line candidates handled by full-text ratio
+    cat = unicodedata.category(ch)
+    return cat[0] in ("P", "S")
 
-    ocr_line_count = len(ocr_norm.split("\n"))
+
+# Characters that terminate boundary walks unconditionally.
+_TERMINATORS: frozenset[str] = frozenset('\n\r\t|')
+
+# Opening delimiters: include and stop when walking left.
+_LEFT_OPEN_SET: frozenset[str] = frozenset(
+    '【（「『《〈〔〖[(\'\"\u201c\u201e\u3010\uff08\u300c\u300a\u300e\u3018'
+)
+
+# Closing delimiters: include and stop when walking right; stop (don't include) when walking left.
+_CLOSE_SET: frozenset[str] = frozenset(
+    '】）」』》〉〕〗])\'\"\u201d\u2019\u3011\uff09\u300d\u300b\u300f\u3019'
+)
+
+
+# ---------------------------------------------------------------------------
+# Needle search
+# ---------------------------------------------------------------------------
+
+_FUZZY_NEEDLE_GATE = 70  # minimum fuzz.ratio for a fuzzy needle match
+
+
+def _find_all_needle_positions(text: str, needle: str) -> list[int]:
+    """Return all start positions of *needle* in *text* (exact match)."""
+    positions: list[int] = []
+    start = 0
+    while True:
+        idx = text.find(needle, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
+    return positions
+
+
+def _find_needle_pos(text: str, needle: str) -> int | None:
+    """Find *needle* in *text*: exact first, then fuzzy sliding-window.
+
+    Returns the start index of the best match, or ``None`` if no match
+    exceeds ``_FUZZY_NEEDLE_GATE``.
+    """
+    idx = text.find(needle)
+    if idx >= 0:
+        return idx
+
+    n = len(needle)
+    if n == 0 or len(text) < n:
+        return None
 
     best_score = 0.0
-    best_text: str | None = None
+    best_pos: int | None = None
+    for i in range(len(text) - n + 1):
+        window = text[i : i + n]
+        score = fuzz.ratio(needle, window)
+        if score > best_score:
+            best_score = score
+            best_pos = i
 
-    min_win = max(1, ocr_line_count - 1)
-    max_win = min(len(cand_lines), ocr_line_count + 3)
-
-    for win_size in range(min_win, max_win + 1):
-        for start in range(len(cand_lines) - win_size + 1):
-            window_lines = cand_lines[start : start + win_size]
-            window_text = "\n".join(window_lines)
-            window_norm = _normalize(window_text)
-
-            if not window_norm.strip():
-                continue
-
-            score = fuzz.ratio(ocr_norm, window_norm)
-            if score > best_score:
-                best_score = score
-                best_text = window_text
-
-    if best_text is not None:
-        return best_text, best_score
+    if best_score >= _FUZZY_NEEDLE_GATE:
+        return best_pos
     return None
+
+
+# ---------------------------------------------------------------------------
+# Boundary refinement
+# ---------------------------------------------------------------------------
+
+
+def _refine_left_boundary(
+    text: str,
+    rough_left: int,
+    token_range: int = 2,
+) -> int:
+    """Walk *left* from *rough_left* to capture symbols OCR may have missed.
+
+    Rules (evaluated for each character stepping leftward):
+
+    * **Terminator** (``\\n``, ``\\r``, ``\\t``, ``|``, ``~``): stop, do not
+      include.
+    * **Closing bracket** (``\u3011``, ``)``\u3001 ``\uff09`` ...): stop, do not include —
+      a closing bracket to the left means we have already passed that block.
+    * **Opening bracket** (``\u3010``, ``(``, ``\uff08`` ...): include and stop —
+      capture the start of the bracketed run.
+    * **Symbol / punctuation** (``\u2026``, ``\uff1f``, ``\uff01``, ``\u3001``, ``\u3002`` ...): include
+      and continue walking.
+    * **Text character** (CJK, Latin letter, digit ...): include only if at
+      least one symbol or opening-bracket exists within the next
+      *token_range* positions further to the left; otherwise stop.
+    """
+    pos = rough_left
+    while pos > 0:
+        ch = text[pos - 1]
+
+        # Hard terminators — stop without including.
+        if ch in _TERMINATORS or ch == "~":
+            break
+
+        # Closing bracket on the left — we have overshot the block boundary.
+        if ch in _CLOSE_SET:
+            break
+
+        # Opening bracket — include it and stop.
+        if ch in _LEFT_OPEN_SET:
+            pos -= 1
+            break
+
+        # Symbol / punctuation — include and keep walking.
+        if _is_symbol_char(ch):
+            pos -= 1
+            continue
+
+        # Text character: look further left within token_range positions.
+        look_start = max(0, pos - 1 - token_range)
+        has_nearby_symbol = any(
+            _is_symbol_char(text[j]) or text[j] in _LEFT_OPEN_SET
+            for j in range(look_start, pos - 1)
+        )
+        if has_nearby_symbol:
+            pos -= 1  # text char is attached to a symbol run; keep going
+        else:
+            break  # clean text starts here; this is the real left edge
+
+    return pos
+
+
+def _refine_right_boundary(text: str, rough_right: int) -> int:
+    """Walk *right* from *rough_right* to include trailing symbols OCR missed.
+
+    Rules:
+
+    * **Terminator** (``\\n``, ``\\r``, ``\\t``, ``|``, ``~``): stop, do not include.
+    * **Closing bracket** (``\u3011``, ``)``\u3001 ``\uff09`` ...): include and stop.
+    * **Anything else** (text or symbols): include and continue.
+    """
+    pos = rough_right
+    while pos < len(text):
+        ch = text[pos]
+
+        if ch in _TERMINATORS or ch == "~":
+            break
+
+        pos += 1  # include the character
+
+        if ch in _CLOSE_SET:
+            break  # included the closing bracket; stop
+
+    return pos
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+
+def _template_aware_score(ocr_norm: str, cand_raw_segment: str) -> float:
+    """Score *cand_raw_segment* against *ocr_norm* with ``{{...}}`` as wildcards.
+
+    When no template variables are present delegates to ``fuzz.ratio``.
+    When templates exist, splits the segment at template boundaries and
+    finds each fixed part in *ocr_norm* left-to-right; the score is the
+    fraction of fixed characters successfully matched, scaled to 0–100.
+    """
+    templates = re.findall(r'\{\{[^}\n]*\}\}', cand_raw_segment)
+    cand_norm = _normalize(cand_raw_segment)
+
+    if not templates:
+        return float(fuzz.ratio(ocr_norm, cand_norm))
+
+    # Split raw segment by template vars, normalise each fixed part.
+    parts = re.split(r'\{\{[^}\n]*\}\}', cand_raw_segment)
+    fixed_segments = [_normalize(p) for p in parts]
+    fixed_segments = [s for s in fixed_segments if s.strip()]
+
+    if not fixed_segments:
+        return 0.0
+
+    total_chars = sum(len(s) for s in fixed_segments)
+    if total_chars == 0:
+        return 0.0
+
+    matched_chars = 0.0
+    search_pos = 0
+    for seg in fixed_segments:
+        idx = ocr_norm.find(seg, search_pos)
+        if idx >= 0:
+            matched_chars += len(seg)
+            search_pos = idx + len(seg)
+        else:
+            # Fuzzy fallback: partial_ratio finds the best alignment of seg
+            # anywhere inside the remaining OCR text (equivalent to the
+            # sliding-window approach but using optimised C internals).
+            # search_pos advances by len(seg) as a conservative estimate so
+            # subsequent segments are not double-counted.
+            ratio = fuzz.partial_ratio(seg, ocr_norm[search_pos:])
+            if ratio >= _DEFAULT_THRESHOLD:
+                matched_chars += len(seg) * (ratio / 100.0)
+                search_pos += len(seg)
+
+    return (matched_chars / total_chars) * 100.0
+
+
+# ---------------------------------------------------------------------------
+# Result type
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class MatchResult:
-    """Levenshtein matching result with provenance details."""
+    """Needle-aligned matching result with score/provenance details."""
 
     text: str
     score: float
@@ -150,133 +341,100 @@ class MatchResult:
 def best_match_with_details(
     ocr_text: str,
     candidates: Sequence[str],
+    needle: str,
     threshold: float = _DEFAULT_THRESHOLD,
 ) -> MatchResult | None:
-    """Return the best-matching text segment with score/phase metadata.
+    """Return the best needle-aligned memory segment with score metadata.
 
-    Three-phase matching:
+    For each candidate the needle is located (exact then fuzzy) to derive
+    a rough start/end boundary that aligns the memory string with the OCR
+    text.  The aligned segment is scored against normalised OCR using
+    template-aware scoring.  After picking the winner, left and right
+    boundaries are refined to capture symbols OCR may have dropped and to
+    trim leading garbled bytes.
 
-    1. **Full-text ratio** — fastest; works when OCR and memory text
-       are roughly the same length and content.
-    2. **Line-window matching** — splits each candidate into lines and
-       finds the contiguous window most similar to the OCR text.
-       Naturally excludes engine command lines and character-name tags.
-    3. **Partial ratio fallback** — catches remaining substring
-       relationships (e.g. single dialog line vs. multi-line OCR).
-
-    Both sides are unicode-normalised before scoring (ellipsis variants,
-    VN script markers) so that cosmetic differences don't drag scores
-    down.
-
-    Returns ``None`` when no strategy reaches its threshold.
+    Returns ``None`` when no candidate's aligned segment reaches *threshold*.
     """
-    if not candidates or not ocr_text:
+    if not candidates or not ocr_text or not needle:
         return None
 
     ocr_norm = _normalize(ocr_text)
 
-    accepted: list[MatchResult] = []
+    # Locate needle in OCR text (original then NFKC-simplified fallback).
+    ocr_needle_pos = _find_needle_pos(ocr_text, needle)
+    if ocr_needle_pos is None:
+        needle_nfkc = unicodedata.normalize("NFKC", needle)
+        ocr_nfkc = unicodedata.normalize("NFKC", ocr_text)
+        ocr_needle_pos = _find_needle_pos(ocr_nfkc, needle_nfkc)
+    if ocr_needle_pos is None:
+        ocr_needle_pos = 0  # defensive fallback
 
-    # Phase 1: full-text ratio with normalisation.
-    best_full_score = 0.0
-    best_full_text: str | None = None
+    # Collect accepted (candidate, rough_left, rough_right, score) tuples.
+    accepted: list[tuple[str, int, int, float]] = []
+
     for candidate in candidates:
         if not candidate:
             continue
-        cand_norm = _normalize(candidate)
-        score = fuzz.ratio(ocr_norm, cand_norm)
-        if score > best_full_score:
-            best_full_score = score
-            best_full_text = candidate
 
-    if best_full_text is not None and best_full_score >= threshold:
-        accepted.append(MatchResult(
-            text=best_full_text,
-            score=best_full_score,
-            phase="full",
-            threshold=threshold,
-        ))
+        # Find all occurrences of needle in candidate.
+        positions = _find_all_needle_positions(candidate, needle)
+        if not positions:
+            pos = _find_needle_pos(candidate, needle)
+            if pos is None:
+                continue
+            positions = [pos]
 
-    # Phase 2: line-window matching — best contiguous segment.
-    best_line_score = 0.0
-    best_line_text: str | None = None
-    for candidate in candidates:
-        if not candidate:
-            continue
-        result = _best_line_window(ocr_norm, candidate)
-        if result is None:
-            continue
-        window_text, window_score = result
-        if window_score > best_line_score:
-            best_line_score = window_score
-            best_line_text = window_text
+        # Evaluate each occurrence; keep the one giving the highest score.
+        best_score = -1.0
+        best_left = 0
+        best_right = 0
 
-    if best_line_text is not None and best_line_score >= threshold:
-        accepted.append(MatchResult(
-            text=best_line_text,
-            score=best_line_score,
-            phase="line-window",
-            threshold=threshold,
-        ))
+        for cand_needle_pos in positions:
+            offset = cand_needle_pos - ocr_needle_pos
+            rough_left = max(0, offset)
+            rough_right = min(len(candidate), offset + len(ocr_text))
 
-    # Phase 3: partial ratio fallback for substring relationships.
-    best_partial_score = 0.0
-    best_partial_text: str | None = None
-    for candidate in candidates:
-        if not candidate:
-            continue
-        cand_norm = _normalize(candidate)
-        score = fuzz.partial_ratio(ocr_norm, cand_norm)
-        if score > best_partial_score:
-            best_partial_score = score
-            best_partial_text = candidate
+            if rough_right <= rough_left:
+                continue
 
-    if best_partial_text is not None and best_partial_score >= _PARTIAL_THRESHOLD:
-        # Refine multi-line partial winners to the best matching window so
-        # that a short single-line candidate cannot beat a richer multi-line
-        # candidate just because partial_ratio ignores length differences.
-        partial_output = best_partial_text
-        # Use fuzz.ratio (not partial_ratio) as the comparable score so
-        # that the final cross-phase max() is an apples-to-apples
-        # comparison.  partial_ratio ignores length differences and
-        # inflates scores relative to fuzz.ratio used in Phases 1 & 2.
-        partial_comparable_score = best_partial_score
-        win_result = _best_line_window(ocr_norm, best_partial_text)
-        if win_result is not None:
-            partial_output = win_result[0]
-            partial_comparable_score = win_result[1]
-        else:
-            # Single-line or very short candidate — fall back to full-text
-            # fuzz.ratio for a fair comparison.
-            partial_comparable_score = fuzz.ratio(
-                ocr_norm, _normalize(best_partial_text)
-            )
-        # Guard: the comparable score must also clear the base threshold.
-        # partial_ratio ignores length differences, so it can be very high
-        # when the OCR text is a substring of a noisy single-line candidate
-        # (e.g. a VN engine log line containing the dialog text).  Without
-        # this check the inflated gate lets garbage through.
-        if partial_comparable_score >= threshold:
-            accepted.append(MatchResult(
-                text=partial_output,
-                score=partial_comparable_score,
-                phase="partial",
-                threshold=_PARTIAL_THRESHOLD,
-            ))
+            segment = candidate[rough_left:rough_right]
+            score = _template_aware_score(ocr_norm, segment)
+
+            if score > best_score:
+                best_score = score
+                best_left = rough_left
+                best_right = rough_right
+
+        if best_score >= threshold:
+            accepted.append((candidate, best_left, best_right, best_score))
 
     if not accepted:
         return None
 
-    # Prefer the highest score; on tie, prefer line-window over full over partial.
-    phase_priority = {"line-window": 3, "full": 2, "partial": 1}
-    return max(accepted, key=lambda r: (r.score, phase_priority.get(r.phase, 0)))
+    # Winner = highest score; on tie prefer longer aligned segment (more context).
+    winner_cand, winner_left, winner_right, winner_score = max(
+        accepted,
+        key=lambda x: (x[3], x[2] - x[1]),
+    )
+
+    # Refine boundaries.
+    refined_left = _refine_left_boundary(winner_cand, winner_left)
+    refined_right = _refine_right_boundary(winner_cand, winner_right)
+
+    return MatchResult(
+        text=winner_cand[refined_left:refined_right],
+        score=winner_score,
+        phase="aligned",
+        threshold=threshold,
+    )
 
 
 def best_match(
     ocr_text: str,
     candidates: Sequence[str],
+    needle: str,
     threshold: float = _DEFAULT_THRESHOLD,
 ) -> str | None:
     """Compatibility wrapper returning only matched text."""
-    result = best_match_with_details(ocr_text, candidates, threshold)
+    result = best_match_with_details(ocr_text, candidates, needle, threshold)
     return result.text if result is not None else None
