@@ -201,6 +201,7 @@ class HoverController(QObject):
     translation_ready = Signal(str, object, object)   # text, near_rect, screen_origin
     freeze_triggered = Signal(object, int, int, int, int)  # img, left, top, pid, hwnd
     pipeline_debug = Signal(object)  # PipelineResult
+    pipeline_progress = Signal(str, object, object)  # step_label, near_rect, screen_origin
     error = Signal(str)
     ready = Signal()
 
@@ -450,6 +451,7 @@ class HoverController(QObject):
             return
 
         # ── Full pipeline ─────────────────────────────────────────────
+        self._emit_progress("正在识别文字\u2026")
         try:
             self._run_pipeline(img, img_x, img_y)
         except Exception as exc:
@@ -542,6 +544,7 @@ class HoverController(QObject):
             return
 
         t0 = time.monotonic()
+        self._emit_progress("正在识别文字\u2026")
 
         # ── Full OCR ─────────────────────────────────────────────────
         t = time.monotonic()
@@ -630,6 +633,7 @@ class HoverController(QObject):
             return
 
         # ── Memory scan + Levenshtein correction ─────────────────────
+        self._emit_progress("正在扫描内存\u2026", near_rect)
         mem_text = ""
         corrected_text = region_text
         scan_ms = corr_ms = 0.0
@@ -696,6 +700,7 @@ class HoverController(QObject):
         # ── Translation backend ──────────────────────────────────────
         t = time.monotonic()
         if not translation and self._translator is not None and corrected_text:
+            self._emit_progress("正在翻译\u2026", near_rect)
             try:
                 translation = self._translator.translate(
                     corrected_text,
@@ -733,6 +738,14 @@ class HoverController(QObject):
     # ------------------------------------------------------------------
     # Private — emit debug signal
     # ------------------------------------------------------------------
+
+    def _emit_progress(self, step: str, near_rect: object = None) -> None:
+        """Emit a progress step to the overlay loading indicator."""
+        try:
+            wr = self._target.window_rect
+            self.pipeline_progress.emit(step, near_rect, (wr.left, wr.top))
+        except Exception:
+            pass
 
     def _emit_debug(
         self,

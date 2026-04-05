@@ -844,6 +844,7 @@ class DebugWindow(QMainWindow):
         # Controller → debug panels + overlays
         self._controller.pipeline_debug.connect(self._on_result)
         self._controller.translation_ready.connect(self._on_translation)
+        self._controller.pipeline_progress.connect(self._on_pipeline_progress)
         self._controller.freeze_triggered.connect(self._on_freeze_triggered)
         self._controller.error.connect(self._on_error)
         self._controller.ready.connect(self._on_worker_ready)
@@ -919,6 +920,21 @@ class DebugWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Last tick: {result.elapsed_ms:.0f} ms  |  {len(ocr.boxes)} boxes"
         )
+
+    @Slot(str, object, object)
+    def _on_pipeline_progress(
+        self,
+        step: str,
+        near_rect: object,
+        screen_origin: object,
+    ) -> None:
+        """Show a loading indicator in the appropriate overlay."""
+        if self._freeze_overlay.is_active:
+            self._freeze_overlay.show_translation(f"\u23f3 {step}")
+        elif near_rect is not None and screen_origin is not None:
+            self._translation_overlay.show_progress(step, near_rect, screen_origin)
+        else:
+            self._translation_overlay.show_progress(step, None, screen_origin or (0, 0))
 
     @Slot(str, object, object)
     def _on_translation(

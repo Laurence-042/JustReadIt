@@ -151,6 +151,7 @@ class TranslationOverlay(Overlay):
         super().__init__(parent)
         self._auto_hide_ms = auto_hide_ms
         self._text: str = ""
+        self._is_loading: bool = False
 
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
@@ -180,6 +181,7 @@ class TranslationOverlay(Overlay):
             ``(left, top)`` of the game window in virtual-screen coordinates.
         """
         self._hide_timer.stop()
+        self._is_loading = False
         self._text = text
 
         # ---- size the widget to fit the text ------------------------
@@ -221,6 +223,69 @@ class TranslationOverlay(Overlay):
         if self._auto_hide_ms > 0:
             self._hide_timer.start(self._auto_hide_ms)
 
+    def show_progress(
+        self,
+        step: str,
+        near_rect: tuple[int, int, int, int] | None = None,
+        screen_origin: tuple[int, int] = (0, 0),
+    ) -> None:
+        """Show a loading-state indicator during pipeline processing.
+
+        Unlike :meth:`show_translation` this does **not** start the auto-hide
+        timer — the popup stays until replaced by the real translation.
+
+        Parameters
+        ----------
+        step:
+            Short description of the current processing stage, e.g.
+            ``"正在翻译\u2026"``.
+        near_rect:
+            Same as :meth:`show_translation`.  ``None`` falls back to cursor
+            position.
+        screen_origin:
+            Same as :meth:`show_translation`.
+        """
+        self._hide_timer.stop()
+        self._is_loading = True
+        self._text = step
+
+        # ---- size the widget (same logic as show_translation) ------
+        font = QFont("Segoe UI", 10)
+        fm = QFontMetrics(font)
+        text_w = min(320, fm.horizontalAdvance(step) + 48)
+        text_h = fm.height() + 24
+        self.resize(text_w, text_h)
+
+        # ---- compute position --------------------------------------
+        ox_phys, oy_phys = screen_origin
+        screen, dpr = _screen_dpr(ox_phys, oy_phys)
+        if near_rect is not None:
+            rx, ry, rw, rh = near_rect
+            cx = round((ox_phys + rx + rw // 2) / dpr)
+            cy = round((oy_phys + ry + rh + 8) / dpr)
+        else:
+            app = QApplication.instance()
+            cursor_pos = app.cursorPos() if app is not None else QPoint(0, 0)  # type: ignore[union-attr]
+            cx = cursor_pos.x()
+            cy = cursor_pos.y() + 24
+            screen = QApplication.screenAt(cursor_pos) or screen
+
+        sg = screen.geometry() if screen else None
+        if sg is not None:
+            x = min(max(cx - text_w // 2, sg.x()), sg.right() - text_w)
+            y = min(max(cy, sg.y()), sg.bottom() - text_h)
+        else:
+            x = cx - text_w // 2
+            y = cy
+
+        self.move(x, y)
+        self.update()
+        self.show()
+        # Fallback auto-hide: if the pipeline finishes without emitting a
+        # translation (e.g. OCR found no text), hide the loading bubble after
+        # 2 seconds so it does not linger on screen.
+        self._hide_timer.start(2000)
+
     # ------------------------------------------------------------------
     # Qt overrides
     # ------------------------------------------------------------------
@@ -230,7 +295,28 @@ class TranslationOverlay(Overlay):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._draw_bubble(painter, self.rect(), self._text)
+        if self._is_loading:
+            self._draw_loading_bubble(painter, self.rect(), self._text)
+        else:
+            self._draw_bubble(painter, self.rect(), self._text)
+
+    @staticmethod
+    def _draw_loading_bubble(painter: QPainter, rect: QRect, text: str) -> None:
+        """Draw a muted progress-indicator bubble."""
+        bg = QColor(20, 28, 48, 185)
+        painter.setBrush(bg)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 10, 10)
+
+        painter.setPen(QColor(140, 155, 200))
+        font = QFont("Segoe UI", 10)
+        font.setItalic(True)
+        painter.setFont(font)
+        painter.drawText(
+            rect.adjusted(14, 8, -14, -8),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            text,
+        )
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
