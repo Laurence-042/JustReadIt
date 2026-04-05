@@ -3,25 +3,27 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Cross-match between Windows OCR text and process memory scan results.
 
-Uses needle-anchored alignment to find and extract the best-matching
+Uses **edlib semi-global alignment** to find and extract the best-matching
 memory-resident string segment for each OCR result, providing cleaner
 text for downstream translation.
 
 Algorithm overview:
 
-1. Use the needle (a short CJK substring known to appear in both OCR and
-   memory) as an anchor. Locate the needle in each candidate to compute a
-   rough start/end boundary that aligns the memory string with the OCR text.
-2. Score the aligned segment against the OCR text, treating ``{{template}}``
-   variables as wildcards.
-3. Pick the highest-scoring candidate/occurrence.
-4. Refine the left boundary: walk left from the rough start, including
-   symbols/punctuation until a ``clean text`` zone begins (no nearby symbols)
-   or a terminator/opening-bracket is reached. This captures ``\u2026\u2026``
-   or ``\u3010A\u2026\u2026`` that OCR drops while stopping at garbled bytes.
-5. Refine the right boundary: walk right from the rough end, including
-   everything (text and symbols) until a terminator or closing bracket is
-   reached.
+1. Light-normalise both OCR and candidate texts for alignment: strip VN
+   engine noise (commands, templates, dialog-quote markers) and replace
+   ``\\n`` with spaces so that structural differences do not prevent
+   alignment.  A position map tracks where each normalised character
+   came from in the original text.
+2. Run ``edlib.align(ocr, candidate, mode="HW")`` — semi-global
+   alignment finds the substring of the (normalised) candidate with
+   minimal edit distance to the (normalised) OCR text.
+3. Map the alignment's ``[i0, i1]`` back to original candidate positions
+   via the position map.
+4. Score the mapped segment against normalised OCR using template-aware
+   scoring (``{{...}}`` treated as wildcards).
+5. Pick the highest-scoring candidate.
+6. Refine boundaries: walk outward from the mapped edges to capture
+   symbols/brackets that OCR may have dropped (``……``, ``【``, ``」`` …).
 
 When no candidate reaches the similarity threshold, the caller should fall
 back to the original OCR text.
@@ -48,6 +50,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Sequence
 
+import edlib
 from rapidfuzz import fuzz
 
 
@@ -130,6 +133,95 @@ _LEFT_OPEN_SET: frozenset[str] = frozenset(
 _CLOSE_SET: frozenset[str] = frozenset(
     '】）」』》〉〕〗])\'\"\u201d\u2019\u3011\uff09\u300d\u300b\u300f\u3019'
 )
+
+# ---------------------------------------------------------------------------
+# Alignment normalisation (lightweight, with position map)
+# ---------------------------------------------------------------------------
+
+_NAME_TAG_RE = re.compile(r'^~【([^】\n]+)】$')
+
+
+def _normalize_for_alignment(text: str) -> tuple[str, list[int]]:
+    """Light normalisation for ``edlib`` alignment with position map.
+
+    Unlike :func:`_normalize` this does **not** apply NFKC (which
+    changes string lengths in hard-to-track ways).  ``edlib`` tolerates
+    small character-level differences (fullwidth vs ASCII punctuation,
+    different ellipsis code-points) as edit distance.
+
+    Transformations (all maintain a ``pos_map`` from normalised index
+    to original index):
+
+    * ``\\n`` → space (lets alignment span across lines).
+    * ``~【name】`` → just the name (VN character name tags).
+    * ``~command…`` lines → skipped entirely.
+    * ``{{template}}`` → skipped.
+    * ``\\w``, ``\\n`` etc. (VN wait/control commands) → skipped.
+    * ``\u201c``/``\u201d``/``"`` dialog-quote markers → skipped.
+    * ``\\r``, ``\\t``, ``|`` → space.
+    """
+    lines = text.split('\n')
+    chars: list[str] = []
+    pos_map: list[int] = []
+    offset = 0  # position in *text* where current line starts
+
+    for line_idx, line in enumerate(lines):
+        # Inter-line separator: the \n at (offset - 1).
+        if line_idx > 0:
+            chars.append(' ')
+            pos_map.append(offset - 1)  # position of the \n
+
+        # VN command line (~ジャンプ …) — skip entirely.
+        if line.startswith('~') and not _NAME_TAG_RE.match(line):
+            offset += len(line) + (1 if line_idx < len(lines) - 1 else 0)
+            continue
+
+        # Character name tag (~【name】) — keep only the name.
+        m = _NAME_TAG_RE.match(line)
+        if m:
+            name_start = 2  # after ~【
+            for j, ch in enumerate(m.group(1)):
+                chars.append(ch)
+                pos_map.append(offset + name_start + j)
+            offset += len(line) + (1 if line_idx < len(lines) - 1 else 0)
+            continue
+
+        # Regular line: character-by-character.
+        i = 0
+        while i < len(line):
+            ch = line[i]
+
+            # Skip {{...}} templates.
+            if line[i : i + 2] == '{{':
+                end = line.find('}}', i + 2)
+                if end >= 0:
+                    i = end + 2
+                    continue
+
+            # Skip \\w \\n etc. (literal backslash + letter).
+            if ch == '\\' and i + 1 < len(line) and line[i + 1].isalpha():
+                i += 2
+                continue
+
+            # Replace control chars with space.
+            if ch in '\r\t|':
+                chars.append(' ')
+                pos_map.append(offset + i)
+                i += 1
+                continue
+
+            # Skip dialog-quote markers.
+            if ch in '"\u201c\u201d':
+                i += 1
+                continue
+
+            chars.append(ch)
+            pos_map.append(offset + i)
+            i += 1
+
+        offset += len(line) + (1 if line_idx < len(lines) - 1 else 0)
+
+    return ''.join(chars), pos_map
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +313,9 @@ def _refine_left_boundary(
         # Opening bracket — include it and stop.
         if ch in _LEFT_OPEN_SET:
             pos -= 1
+            # Special case: ~【name】 — include the ~ command prefix.
+            if pos > 0 and text[pos - 1] == '~':
+                pos -= 1
             break
 
         # Symbol / punctuation — include and keep walking.
@@ -344,66 +439,80 @@ def best_match_with_details(
     needle: str,
     threshold: float = _DEFAULT_THRESHOLD,
 ) -> MatchResult | None:
-    """Return the best needle-aligned memory segment with score metadata.
+    """Return the best edlib-aligned memory segment with score metadata.
 
-    For each candidate the needle is located (exact then fuzzy) to derive
-    a rough start/end boundary that aligns the memory string with the OCR
-    text.  The aligned segment is scored against normalised OCR using
-    template-aware scoring.  After picking the winner, left and right
-    boundaries are refined to capture symbols OCR may have dropped and to
-    trim leading garbled bytes.
+    Uses ``edlib`` semi-global alignment (``mode="HW"``) to find the
+    substring of each candidate that best matches the OCR text.  Both
+    sides are *light-normalised* first (VN noise stripped, ``\\n`` →
+    space) so that structural differences do not block alignment.
 
-    Returns ``None`` when no candidate's aligned segment reaches *threshold*.
+    The aligned region is mapped back to the original candidate text,
+    scored with :func:`_template_aware_score`, and the winner’s
+    boundaries are refined to capture symbols OCR may have dropped.
+
+    *needle* is used as a fast pre-filter: candidates that do not
+    contain the needle (exact match) are skipped.
+
+    Returns ``None`` when no candidate reaches *threshold*.
     """
     if not candidates or not ocr_text or not needle:
         return None
 
     ocr_norm = _normalize(ocr_text)
+    ocr_align, _ = _normalize_for_alignment(ocr_text)
 
-    # Locate needle in OCR text (original then NFKC-simplified fallback).
-    ocr_needle_pos = _find_needle_pos(ocr_text, needle)
-    if ocr_needle_pos is None:
-        needle_nfkc = unicodedata.normalize("NFKC", needle)
-        ocr_nfkc = unicodedata.normalize("NFKC", ocr_text)
-        ocr_needle_pos = _find_needle_pos(ocr_nfkc, needle_nfkc)
-    if ocr_needle_pos is None:
-        ocr_needle_pos = 0  # defensive fallback
+    if not ocr_align.strip():
+        return None
 
-    # Collect accepted (candidate, rough_left, rough_right, score) tuples.
+    # Maximum edit distance: 50% of normalised OCR length.
+    max_k = max(1, len(ocr_align) // 2)
+
+    # Collect accepted (candidate, orig_left, orig_right, score).
     accepted: list[tuple[str, int, int, float]] = []
 
     for candidate in candidates:
         if not candidate:
             continue
 
-        # Find all occurrences of needle in candidate.
-        positions = _find_all_needle_positions(candidate, needle)
-        if not positions:
-            pos = _find_needle_pos(candidate, needle)
-            if pos is None:
-                continue
-            positions = [pos]
+        # Fast pre-filter: needle must appear in candidate.
+        if needle not in candidate:
+            continue
 
-        # Evaluate each occurrence; keep the one giving the highest score.
+        cand_align, cand_pos_map = _normalize_for_alignment(candidate)
+        if not cand_align.strip() or not cand_pos_map:
+            continue
+
+        result = edlib.align(
+            ocr_align, cand_align, mode="HW", task="locations", k=max_k,
+        )
+        if result["editDistance"] < 0:  # -1 means no alignment within k
+            continue
+
+        locations = result["locations"]
+        if not locations:
+            continue
+
+        # Evaluate each reported location; keep the best score.
         best_score = -1.0
         best_left = 0
         best_right = 0
 
-        for cand_needle_pos in positions:
-            offset = cand_needle_pos - ocr_needle_pos
-            rough_left = max(0, offset)
-            rough_right = min(len(candidate), offset + len(ocr_text))
-
-            if rough_right <= rough_left:
+        for loc_start, loc_end_inclusive in locations:
+            if loc_start >= len(cand_pos_map):
                 continue
+            if loc_end_inclusive >= len(cand_pos_map):
+                loc_end_inclusive = len(cand_pos_map) - 1
 
-            segment = candidate[rough_left:rough_right]
+            orig_left = cand_pos_map[loc_start]
+            orig_right = cand_pos_map[loc_end_inclusive] + 1
+
+            segment = candidate[orig_left:orig_right]
             score = _template_aware_score(ocr_norm, segment)
 
             if score > best_score:
                 best_score = score
-                best_left = rough_left
-                best_right = rough_right
+                best_left = orig_left
+                best_right = orig_right
 
         if best_score >= threshold:
             accepted.append((candidate, best_left, best_right, best_score))
@@ -411,13 +520,13 @@ def best_match_with_details(
     if not accepted:
         return None
 
-    # Winner = highest score; on tie prefer longer aligned segment (more context).
+    # Winner = highest score; on tie prefer longer segment (more context).
     winner_cand, winner_left, winner_right, winner_score = max(
         accepted,
         key=lambda x: (x[3], x[2] - x[1]),
     )
 
-    # Refine boundaries.
+    # Refine boundaries for symbols/brackets OCR may have dropped.
     refined_left = _refine_left_boundary(winner_cand, winner_left)
     refined_right = _refine_right_boundary(winner_cand, winner_right)
 

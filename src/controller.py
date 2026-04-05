@@ -56,11 +56,12 @@ Typical wiring::
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import io
 import logging
 import math
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
@@ -84,6 +85,49 @@ _user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline result types
+# ---------------------------------------------------------------------------
+
+_T = TypeVar("_T")
+
+
+@dataclasses.dataclass(frozen=True)
+class StepResult(Generic[_T]):
+    """One pipeline step's output value paired with its wall-clock duration."""
+    value: _T
+    ms: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class OcrOutput:
+    """Outputs produced by the Windows OCR step."""
+    boxes:      list   # word-level BoundingBox list
+    line_boxes: list   # line-level BoundingBox list
+    text:       str    # formatted debug text
+
+
+@dataclasses.dataclass(frozen=True)
+class RangeOutput:
+    """Outputs produced by the range-detection step."""
+    region_text:   str
+    detector_name: str
+    crop_rect:     tuple[int, int, int, int] | None
+
+
+@dataclasses.dataclass(frozen=True)
+class PipelineResult:
+    """All intermediate data from one pipeline run, emitted via
+    :attr:`HoverController.pipeline_debug` for debug panels."""
+    img_bytes: bytes
+    ocr:       StepResult[OcrOutput]
+    range_det: StepResult[RangeOutput]  # 'range_det' avoids shadowing builtin
+    scan:      StepResult[str]   # mem_text
+    corr:      StepResult[str]   # corrected_text
+    translate: StepResult[str]   # translated_text
+    elapsed_ms: float            # total wall time for the run
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +188,10 @@ class HoverController(QObject):
     freeze_triggered(screenshot, window_left, window_top, pid, hwnd)
         Emitted when the freeze hotkey fires.  Arguments are passed directly
         to :meth:`~src.overlay.FreezeOverlay.freeze`.
-    pipeline_debug(img_bytes, word_boxes, line_boxes, crop_rect,
-                   win_ocr_text, region_text, detector_name,
-                   mem_text, corrected_text, translated_text, elapsed_ms)
-        Emitted after every pipeline run with intermediate data for debug
-        panels.  Only useful when a UI consumes it — no-ops otherwise.
+    pipeline_debug(result)
+        Emitted after every pipeline run with a :class:`PipelineResult`
+        containing all intermediate data for debug panels.
+        Only useful when a UI consumes it — no-ops otherwise.
     error(message)
         Emitted for recoverable errors (e.g. OCR language not installed).
     ready()
@@ -157,9 +200,7 @@ class HoverController(QObject):
 
     translation_ready = Signal(str, object, object)   # text, near_rect, screen_origin
     freeze_triggered = Signal(object, int, int, int, int)  # img, left, top, pid, hwnd
-    pipeline_debug = Signal(
-        bytes, list, list, object, str, str, str, str, str, str, float,
-    )
+    pipeline_debug = Signal(object)  # PipelineResult
     error = Signal(str)
     ready = Signal()
 
@@ -494,31 +535,37 @@ class HoverController(QObject):
         t0 = time.monotonic()
 
         # ── Full OCR ─────────────────────────────────────────────────
+        t = time.monotonic()
         try:
             boxes, line_boxes = self._ocr.recognise(img)
         except Exception as exc:
             self.error.emit(f"Windows OCR failed: {exc}")
             boxes, line_boxes = [], []
-
         win_ocr_lines = [
             f"[{b.x:4},{b.y:4}  {b.w:3}\u00d7{b.h:3}]  {b.text}"
             for b in boxes
         ]
         lang_info = f"lang={self._ocr.language_tag}" if self._ocr else "lang=?"
         win_ocr_text = f"[ {lang_info} ]\n" + "\n".join(win_ocr_lines)
+        ocr_step = StepResult(
+            OcrOutput(boxes, line_boxes, win_ocr_text),
+            (time.monotonic() - t) * 1000,
+        )
 
         if not line_boxes:
             self._emit_debug(
-                img, t0, boxes, line_boxes, None, win_ocr_text,
-                "", "", "", "", "",
+                img, t0,
+                ocr_step,
+                StepResult(RangeOutput("", "", None)),
+                StepResult(""), StepResult(""), StepResult(""),
             )
             return
 
         # ── Range detection ──────────────────────────────────────────
+        t = time.monotonic()
         region_boxes, detector_name = run_detectors(line_boxes, img_x, img_y)
         region_text = merge_boxes_text(region_boxes) if region_boxes else ""
         crop_rect: tuple[int, int, int, int] | None = None
-
         if region_boxes and region_text.strip():
             xs  = [b.x       for b in region_boxes]
             ys  = [b.y       for b in region_boxes]
@@ -531,11 +578,16 @@ class HoverController(QObject):
                 min(img.width,  max(x2s) + margin),
                 min(img.height, max(y2s) + margin),
             )
+        range_step = StepResult(
+            RangeOutput(region_text, detector_name, crop_rect),
+            (time.monotonic() - t) * 1000,
+        )
 
         if not region_text.strip():
             self._emit_debug(
-                img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
-                region_text, detector_name, "", region_text, "",
+                img, t0,
+                ocr_step, range_step,
+                StepResult(""), StepResult(""), StepResult(""),
             )
             return
 
@@ -551,12 +603,16 @@ class HoverController(QObject):
         cached = self._phash_cache.get(region_text)
         if cached is not None:
             hit_mem = f"[cache hit]\n{cached.mem_text}"
-            hit_corrected = f"[cache hit]\n{cached.corrected_text}" if cached.corrected_text else region_text
+            hit_corrected = (
+                f"[cache hit]\n{cached.corrected_text}"
+                if cached.corrected_text else region_text
+            )
             self._emit_debug(
-                img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
-                region_text, detector_name, hit_mem,
-                hit_corrected,
-                cached.translation,
+                img, t0,
+                ocr_step, range_step,
+                StepResult(hit_mem),
+                StepResult(hit_corrected),
+                StepResult(cached.translation),
             )
             wr = self._target.window_rect
             self.translation_ready.emit(
@@ -567,20 +623,25 @@ class HoverController(QObject):
         # ── Memory scan + Levenshtein correction ─────────────────────
         mem_text = ""
         corrected_text = region_text
+        scan_ms = corr_ms = 0.0
         if self._scanner is not None and region_text:
             try:
                 needles = pick_needles(region_text)
                 results: list = []
                 used_needle = ""
+                t = time.monotonic()
                 for needle in needles:
                     results = self._scanner.scan(needle)
                     if results:
                         used_needle = needle
                         break
                     used_needle = needle
+                scan_ms = (time.monotonic() - t) * 1000
 
+                t = time.monotonic()
                 candidates = [r.text for r in results]
                 matched = best_match_with_details(region_text, candidates, used_needle)
+                corr_ms = (time.monotonic() - t) * 1000
                 if matched is not None:
                     enc = results[0].encoding if results else "?"
                     corrected_text = matched.text
@@ -613,8 +674,10 @@ class HoverController(QObject):
             except Exception as exc:
                 mem_text = f"[scan error: {exc}]"
                 corrected_text = region_text
+        scan_step = StepResult(mem_text, scan_ms)
+        corr_step = StepResult(corrected_text, corr_ms)
 
-        # ── Text cache (persistent) ──────────────────────────────────
+        # ── Text cache (persistent) ──────────────────────────────────────────────────────────
         translation = ""
         if self._text_cache is not None:
             translation = self._text_cache.get(
@@ -622,6 +685,7 @@ class HoverController(QObject):
             ) or ""
 
         # ── Translation backend ──────────────────────────────────────
+        t = time.monotonic()
         if not translation and self._translator is not None and corrected_text:
             try:
                 translation = self._translator.translate(
@@ -639,6 +703,7 @@ class HoverController(QObject):
             except Exception as exc:
                 _log.warning("Translation failed: %s", exc)
                 translation = f"[translation error: {exc}]"
+        translate_step = StepResult(translation, (time.monotonic() - t) * 1000)
 
         # ── OCR text cache store ──────────────────────────────────────────
         if translation and not translation.startswith("["):
@@ -649,8 +714,8 @@ class HoverController(QObject):
 
         # ── Emit results ─────────────────────────────────────────────
         self._emit_debug(
-            img, t0, boxes, line_boxes, crop_rect, win_ocr_text,
-            region_text, detector_name, mem_text, corrected_text, translation,
+            img, t0,
+            ocr_step, range_step, scan_step, corr_step, translate_step,
         )
         if translation:
             wr = self._target.window_rect
@@ -664,21 +729,21 @@ class HoverController(QObject):
         self,
         img: "PILImage",
         t0: float,
-        boxes: list,
-        line_boxes: list,
-        crop_rect: tuple[int, int, int, int] | None,
-        win_ocr_text: str,
-        region_text: str,
-        detector_name: str,
-        mem_text: str,
-        corrected_text: str,
-        translated_text: str,
+        ocr: "StepResult[OcrOutput]",
+        range_det: "StepResult[RangeOutput]",
+        scan: "StepResult[str]",
+        corr: "StepResult[str]",
+        translate: "StepResult[str]",
     ) -> None:
         elapsed_ms = (time.monotonic() - t0) * 1000
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=75)
-        self.pipeline_debug.emit(
-            buf.getvalue(), boxes, line_boxes, crop_rect,
-            win_ocr_text, region_text, detector_name, mem_text,
-            corrected_text, translated_text, elapsed_ms,
-        )
+        self.pipeline_debug.emit(PipelineResult(
+            img_bytes=buf.getvalue(),
+            ocr=ocr,
+            range_det=range_det,
+            scan=scan,
+            corr=corr,
+            translate=translate,
+            elapsed_ms=elapsed_ms,
+        ))

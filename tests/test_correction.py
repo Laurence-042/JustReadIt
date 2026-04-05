@@ -436,8 +436,11 @@ class TestRealWorld:
         ]
         result = best_match_with_details(ocr, candidates, needle)
         assert result is not None, "Expected a match"
-        assert "馬飼いの青年" in result.text, (
-            f"Name missing — score={result.score:.1f}: {result.text!r}"
+        # The VN script candidate must win (has \w wait command
+        # that garbage-prefix copies lack).
+        assert "\\w" in result.text, (
+            f"VN script candidate did not win — "
+            f"score={result.score:.1f}: {result.text!r}"
         )
         assert "おはよう" in result.text, (
             f"First dialog line missing — score={result.score:.1f}: {result.text!r}"
@@ -478,4 +481,38 @@ class TestRealWorld:
         )
         assert "おはよう" in result.text
         assert "大丈夫なのかしら" in result.text
+
+    def test_name_tag_included_across_newline(self) -> None:
+        """Bug: ~【name】 on a separate line must be included in the result.
+
+        The old needle-anchored expansion stopped at ``\\n`` / ``"``
+        boundaries and lost the name tag.  With edlib semi-global
+        alignment in normalised space (``\\n`` → space), the alignment
+        spans the full multi-line block.  ``_refine_left_boundary``
+        then extends through ``【`` and ``~`` to capture the tag.
+        """
+        ocr = (
+            "綺麗な老女\n"
+            "私が調合した丸薬だよ。\n"
+            "効果はあるはずたから、233が使いなさいな。"
+        )
+        needle = "調合した丸薬"
+        candidates = [
+            # authoritative VN script block with name tag on separate line
+            "~【綺麗な老女】\n"
+            "\u201c私が調合した丸薬だよ。\n"
+            "効果はあるはずだから、{{主人公}}が使いなさいな。\\w",
+            # garbage prefix + dialog only (no name tag)
+            "\u1b00\u9c80退私が調合した丸薬だよ。\n"
+            "効果はあるはずだから、233が使いなさいな。",
+        ]
+        result = best_match_with_details(ocr, candidates, needle)
+        assert result is not None
+        # Name tag must be present.
+        assert "~【綺麗な老女】" in result.text, (
+            f"Name tag missing — result: {result.text!r}"
+        )
+        # Dialog content must be present.
+        assert "私が調合した丸薬だよ" in result.text
+        assert "使いなさいな" in result.text
 

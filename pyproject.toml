@@ -18,6 +18,7 @@ dependencies = [
     "winrt-Windows.Foundation.Collections",
     "winrt-Windows.Globalization",
     "rapidfuzz",
+    "edlib",
     "pywin32",
     "psutil",
     "Pillow",

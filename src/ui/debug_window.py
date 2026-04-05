@@ -28,14 +28,14 @@ from PySide6.QtGui import (
     QColor, QFont, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QFrame, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar,
     QVBoxLayout, QWidget,
 )
 
-from src.controller import HoverController
+from src.controller import HoverController, OcrOutput, PipelineResult, RangeOutput, StepResult
 from src.target import GameTarget
 from src.ocr.windows_ocr import _ensure_apartment
 from src.ocr.range_detectors import BoundingBox
@@ -233,6 +233,106 @@ def _make_panel(title: str) -> tuple[QGroupBox, QTextEdit]:
     lay.setContentsMargins(3, 3, 3, 3)
     lay.addWidget(te)
     return grp, te
+
+
+# ---------------------------------------------------------------------------
+# Step panel with per-step latency label + proportion bar
+# ---------------------------------------------------------------------------
+
+class _StepPanel(QWidget):
+    """Pipeline step panel showing title, rolling-average latency, and a
+    proportion bar that grows with the step's share of total pipeline time.
+
+    Layout (top to bottom inside a styled frame):
+      header row  ·  <title>  ────────  avg: X ms  ·  now: Y ms
+      proportion  ·  ████████░░░░░░░░░░░░░░░  (fraction of total elapsed)
+      text area   ·  read-only QTextEdit
+    """
+
+    _EMA_ALPHA: float = 0.2   # exponential moving-average smoothing factor
+
+    def __init__(
+        self,
+        title: str,
+        color: tuple[int, int, int],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._base_title = title
+        self._color = color
+        self._avg_ms: float = 0.0
+        self._n: int = 0
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(0)
+
+        # Styled frame for the visual border
+        frame = QFrame()
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame_lay = QVBoxLayout(frame)
+        frame_lay.setContentsMargins(4, 5, 4, 4)
+        frame_lay.setSpacing(3)
+
+        # Header row: bold title on the left, latency info on the right
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        self._lbl_title = QLabel(f"<b>{title}</b>")
+        self._lbl_latency = QLabel("avg: —    now: —")
+        self._lbl_latency.setStyleSheet("color: #999; font-size: 8pt;")
+        self._lbl_latency.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        header.addWidget(self._lbl_title)
+        header.addStretch()
+        header.addWidget(self._lbl_latency)
+        frame_lay.addLayout(header)
+
+        # Proportion bar
+        r, g, b = color
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 1000)
+        self._bar.setValue(0)
+        self._bar.setFixedHeight(5)
+        self._bar.setTextVisible(False)
+        self._bar.setStyleSheet(
+            f"QProgressBar {{ background: #2e2e2e; border: none; border-radius: 2px; }}"
+            f"QProgressBar::chunk {{ background: rgb({r},{g},{b}); border-radius: 2px; }}"
+        )
+        frame_lay.addWidget(self._bar)
+
+        # Read-only text area
+        self.te = QTextEdit()
+        self.te.setReadOnly(True)
+        self.te.setFont(QFont("Consolas", 9))
+        frame_lay.addWidget(self.te, 1)
+
+        outer.addWidget(frame, 1)
+
+    # ------------------------------------------------------------------
+
+    def set_subtitle(self, subtitle: str) -> None:
+        """Update the optional subtitle appended to the title label."""
+        if subtitle:
+            self._lbl_title.setText(f"<b>{self._base_title}</b>  [{subtitle}]")
+        else:
+            self._lbl_title.setText(f"<b>{self._base_title}</b>")
+
+    def update_timing(self, now_ms: float, total_ms: float) -> None:
+        """Update EMA average, latency label text, and proportion bar."""
+        self._n += 1
+        if self._n == 1:
+            self._avg_ms = now_ms
+        else:
+            self._avg_ms = (
+                self._avg_ms * (1.0 - self._EMA_ALPHA)
+                + now_ms * self._EMA_ALPHA
+            )
+        self._lbl_latency.setText(
+            f"avg {self._avg_ms:.0f} ms  ·  now {now_ms:.0f} ms"
+        )
+        ratio = now_ms / total_ms if total_ms > 0 else 0.0
+        self._bar.setValue(int(min(ratio, 1.0) * 1000))
 
 
 # ---------------------------------------------------------------------------
@@ -436,12 +536,18 @@ class DebugWindow(QMainWindow):
         right = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(right)
 
-        grp_wocr,   self._te_wocr   = _make_panel("Windows OCR")
-        self._grp_region, self._te_region = _make_panel("Detected Region")
-        grp_region = self._grp_region
-        grp_mem,    self._te_mem    = _make_panel("Memory Scan")
-        grp_corr,   self._te_corr   = _make_panel("Levenshtein Corrected")
-        grp_tl,     self._te_tl     = _make_panel("Translation")
+        self._panel_wocr   = _StepPanel("Windows OCR",          (80,  160, 255))
+        self._panel_region = _StepPanel("Detected Region",       (80,  210, 120))
+        self._panel_mem    = _StepPanel("Memory Scan",           (255, 160,  50))
+        self._panel_corr   = _StepPanel("Levenshtein Corrected", (180, 100, 255))
+        self._panel_tl     = _StepPanel("Translation",           ( 80, 220, 200))
+
+        # Convenience aliases so the rest of the code keeps working unchanged.
+        self._te_wocr   = self._panel_wocr.te
+        self._te_region = self._panel_region.te
+        self._te_mem    = self._panel_mem.te
+        self._te_corr   = self._panel_corr.te
+        self._te_tl     = self._panel_tl.te
 
         self._te_region.setPlaceholderText(
             "Region text will appear after range detection."
@@ -458,12 +564,12 @@ class DebugWindow(QMainWindow):
             "Configure a translator backend below and click \"Apply\" to enable."
         )
 
-        right.addWidget(grp_wocr)
-        right.addWidget(grp_region)
-        right.addWidget(grp_mem)
-        right.addWidget(grp_corr)
+        right.addWidget(self._panel_wocr)
+        right.addWidget(self._panel_region)
+        right.addWidget(self._panel_mem)
+        right.addWidget(self._panel_corr)
         right.addWidget(self._build_translator_settings_panel())
-        right.addWidget(grp_tl)
+        right.addWidget(self._panel_tl)
         right.setSizes([220, 120, 100, 140, 180, 100])
 
         splitter.setStretchFactor(0, 6)
@@ -770,34 +876,30 @@ class DebugWindow(QMainWindow):
     # Result / error handlers
     # ------------------------------------------------------------------
 
-    @Slot(bytes, list, list, object, str, str, str, str, str, str, float)
-    def _on_result(
-        self,
-        img_bytes: bytes,
-        boxes: list,
-        line_boxes: list,
-        crop_rect: object,
-        win_ocr_text: str,
-        region_text: str,
-        detector_name: str,
-        mem_text: str,
-        corrected_text: str,
-        translated_text: str,
-        elapsed_ms: float,
-    ) -> None:
+    @Slot(object)
+    def _on_result(self, result: PipelineResult) -> None:
         """Update debug panels with intermediate pipeline data."""
-        self._preview.update_frame(img_bytes, boxes, line_boxes, crop_rect)
-        header = f"[ {len(boxes)} boxes  \u2014  {elapsed_ms:.0f} ms ]\n\n"
-        self._te_wocr.setPlainText(header + win_ocr_text)
-        if detector_name:
-            self._grp_region.setTitle(f"Detected Region  [{detector_name}]")
-        self._te_region.setPlainText(region_text)
-        self._te_mem.setPlainText(mem_text)
-        self._te_corr.setPlainText(corrected_text)
-        if translated_text:
-            self._te_tl.setPlainText(translated_text)
+        ocr = result.ocr.value
+        rng = result.range_det.value
+        self._preview.update_frame(
+            result.img_bytes, ocr.boxes, ocr.line_boxes, rng.crop_rect
+        )
+        header = f"[ {len(ocr.boxes)} boxes  \u2014  {result.elapsed_ms:.0f} ms ]\n\n"
+        self._te_wocr.setPlainText(header + ocr.text)
+        self._panel_region.set_subtitle(rng.detector_name)
+        self._te_region.setPlainText(rng.region_text)
+        self._te_mem.setPlainText(result.scan.value)
+        self._te_corr.setPlainText(result.corr.value)
+        if result.translate.value:
+            self._te_tl.setPlainText(result.translate.value)
+        total = max(result.elapsed_ms, 1.0)
+        self._panel_wocr.update_timing(result.ocr.ms, total)
+        self._panel_region.update_timing(result.range_det.ms, total)
+        self._panel_mem.update_timing(result.scan.ms, total)
+        self._panel_corr.update_timing(result.corr.ms, total)
+        self._panel_tl.update_timing(result.translate.ms, total)
         self.statusBar().showMessage(
-            f"Last tick: {elapsed_ms:.0f} ms  |  {len(boxes)} boxes"
+            f"Last tick: {result.elapsed_ms:.0f} ms  |  {len(ocr.boxes)} boxes"
         )
 
     @Slot(str, object, object)
