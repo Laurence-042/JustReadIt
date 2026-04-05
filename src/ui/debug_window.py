@@ -452,6 +452,16 @@ class DebugWindow(QMainWindow):
         tb.addWidget(self._cmb_freeze_key)
         tb.addSeparator()
 
+        self._btn_clear_cache = QPushButton("🗑  Clear Cache")
+        self._btn_clear_cache.setToolTip(
+            "Flush the in-memory and persistent translation caches.\n"
+            "Use this after updating the app to force re-translation with improved logic."
+        )
+        self._btn_clear_cache.setEnabled(False)
+        self._btn_clear_cache.clicked.connect(self._on_clear_cache)
+        tb.addWidget(self._btn_clear_cache)
+        tb.addSeparator()
+
         # ── Restore persisted settings ───────────────────────────────
         saved_lang = _cfg.ocr_language
         saved_interval = _cfg.interval_ms
@@ -855,6 +865,7 @@ class DebugWindow(QMainWindow):
         )
 
     def _stop(self) -> None:
+        self._btn_clear_cache.setEnabled(False)
         if self._worker_thread is not None:
             self._worker_thread.quit()
             if not self._worker_thread.wait(3000):
@@ -865,7 +876,14 @@ class DebugWindow(QMainWindow):
             self._controller = None
 
     @Slot()
+    def _on_clear_cache(self) -> None:
+        if self._controller is not None:
+            self._controller.clear_caches()
+            self.statusBar().showMessage("Translation caches cleared.", 3000)
+
+    @Slot()
     def _on_worker_ready(self) -> None:
+        self._btn_clear_cache.setEnabled(True)
         lang = self._selected_language
         interval = self._spn_interval.value()
         self.statusBar().showMessage(

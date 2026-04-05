@@ -414,6 +414,81 @@ def _template_aware_score(ocr_norm: str, cand_raw_segment: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Per-candidate alignment
+# ---------------------------------------------------------------------------
+
+
+def _align_candidate(
+    ocr_align: str,
+    ocr_norm: str,
+    candidate: str,
+    cand_align: str,
+    cand_pos_map: list[int],
+    max_k: int,
+    threshold: float,
+) -> tuple[int, int, float, bool] | None:
+    """Align *candidate* against *ocr_align* and return ``(left, right, score, is_reversed)``.
+
+    Two strategies are tried in order:
+
+    **Normal** — ``edlib`` HW, OCR as query, candidate as target.
+    Finds the substring of the candidate with minimal edit distance to
+    the full OCR text.  Skipped when the length excess alone already
+    exceeds *max_k* (guaranteed failure).
+
+    **Reversed** — ``edlib`` HW, candidate as query, OCR as target.
+    Used when OCR is longer than the candidate (captured UI chrome
+    inflates OCR length).  Scored with ``fuzz.partial_ratio`` because
+    no position map is available in this direction; the full candidate
+    is returned as-is (boundaries refined by the caller).
+
+    The 4th return value ``is_reversed`` lets the caller prefer normal-
+    direction results when both directions have accepted candidates;
+    the reversed path is a fallback for when OCR is heavily inflated.
+
+    Returns ``None`` when neither strategy produces a score ≥ *threshold*.
+    """
+    length_excess = len(ocr_align) - len(cand_align)
+
+    # ── Normal direction ─────────────────────────────────────────────
+    if length_excess <= max_k:
+        result = edlib.align(
+            ocr_align, cand_align, mode="HW", task="locations", k=max_k,
+        )
+        if result["editDistance"] >= 0:
+            best_score = -1.0
+            best_left = 0
+            best_right = 0
+            for loc_start, loc_end_inclusive in result["locations"]:
+                if loc_start >= len(cand_pos_map):
+                    continue
+                if loc_end_inclusive >= len(cand_pos_map):
+                    loc_end_inclusive = len(cand_pos_map) - 1
+                orig_left  = cand_pos_map[loc_start]
+                orig_right = cand_pos_map[loc_end_inclusive] + 1
+                score = _template_aware_score(ocr_norm, candidate[orig_left:orig_right])
+                if score > best_score:
+                    best_score = score
+                    best_left  = orig_left
+                    best_right = orig_right
+            if best_score >= threshold:
+                return best_left, best_right, best_score, False
+
+    # ── Reversed direction (OCR longer than candidate) ───────────────
+    if len(cand_align) < len(ocr_align):
+        rev_k = max(1, len(cand_align) // 2)
+        rev = edlib.align(
+            cand_align, ocr_align, mode="HW", task="distance", k=rev_k,
+        )
+        if rev["editDistance"] >= 0:
+            score = fuzz.partial_ratio(_normalize(candidate), ocr_norm)
+            if score >= threshold:
+                return 0, len(candidate), score, True
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 
@@ -464,11 +539,14 @@ def best_match_with_details(
     if not ocr_align.strip():
         return None
 
-    # Maximum edit distance: 50% of normalised OCR length.
-    max_k = max(1, len(ocr_align) // 2)
+    # Maximum edit distance: 2/3 of normalised OCR length.
+    # Using 2/3 (not 1/2) because captured UI chrome can inflate OCR length
+    # significantly beyond the clean dialog portion, raising the edit distance
+    # well past 50% while still being a legitimate match.
+    max_k = max(1, (len(ocr_align) * 2) // 3)
 
-    # Collect accepted (candidate, orig_left, orig_right, score).
-    accepted: list[tuple[str, int, int, float]] = []
+    # Collect accepted (candidate, orig_left, orig_right, score, is_reversed).
+    accepted: list[tuple[str, int, int, float, bool]] = []
 
     for candidate in candidates:
         if not candidate:
@@ -482,47 +560,26 @@ def best_match_with_details(
         if not cand_align.strip() or not cand_pos_map:
             continue
 
-        result = edlib.align(
-            ocr_align, cand_align, mode="HW", task="locations", k=max_k,
+        match = _align_candidate(
+            ocr_align, ocr_norm, candidate, cand_align, cand_pos_map,
+            max_k, threshold,
         )
-        if result["editDistance"] < 0:  # -1 means no alignment within k
-            continue
-
-        locations = result["locations"]
-        if not locations:
-            continue
-
-        # Evaluate each reported location; keep the best score.
-        best_score = -1.0
-        best_left = 0
-        best_right = 0
-
-        for loc_start, loc_end_inclusive in locations:
-            if loc_start >= len(cand_pos_map):
-                continue
-            if loc_end_inclusive >= len(cand_pos_map):
-                loc_end_inclusive = len(cand_pos_map) - 1
-
-            orig_left = cand_pos_map[loc_start]
-            orig_right = cand_pos_map[loc_end_inclusive] + 1
-
-            segment = candidate[orig_left:orig_right]
-            score = _template_aware_score(ocr_norm, segment)
-
-            if score > best_score:
-                best_score = score
-                best_left = orig_left
-                best_right = orig_right
-
-        if best_score >= threshold:
-            accepted.append((candidate, best_left, best_right, best_score))
+        if match is not None:
+            accepted.append((candidate, *match))
 
     if not accepted:
         return None
 
+    # Prefer normal-direction candidates over reversed-direction ones.
+    # The reversed path uses partial_ratio (more lenient) and is only a
+    # fallback for when OCR is inflated with UI chrome and no candidate
+    # can match via normal HW alignment.
+    normal = [x for x in accepted if not x[4]]
+    pool = normal if normal else accepted
+
     # Winner = highest score; on tie prefer longer segment (more context).
-    winner_cand, winner_left, winner_right, winner_score = max(
-        accepted,
+    winner_cand, winner_left, winner_right, winner_score, _ = max(
+        pool,
         key=lambda x: (x[3], x[2] - x[1]),
     )
 

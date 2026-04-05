@@ -347,6 +347,15 @@ class HoverController(QObject):
         self._settled = False
         self._settle_start = time.monotonic()
 
+    @Slot()
+    def clear_caches(self) -> None:
+        """Flush both the in-memory phash cache and the persistent translation
+        cache.  Safe to call from the main thread via a queued connection."""
+        self._phash_cache.clear()
+        if self._text_cache is not None:
+            self._text_cache.clear()
+        _log.info("Translation caches cleared.")
+
     # ------------------------------------------------------------------
     # Private — poll loop
     # ------------------------------------------------------------------

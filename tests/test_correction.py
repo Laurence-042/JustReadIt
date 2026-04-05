@@ -482,6 +482,132 @@ class TestRealWorld:
         assert "おはよう" in result.text
         assert "大丈夫なのかしら" in result.text
 
+    def test_multigarbage_real_world_vn_block_wins(self) -> None:
+        """Real-world capture: 5 candidates — 4 with garbage prefixes and one
+        wrong-context VN script block.  A valid match containing the core
+        dialog must be returned (previously the algorithm returned None because
+        OCR was *longer* than all candidates, causing edlib HW mode to reject
+        every candidate).
+
+        OCR from screenshot has header noise ("3馬飼いの青年 SKIP A …CLOSE"),
+        OCR kana degradation (こめん → ごめん, ヒスカ → ビスカ).
+
+        Note: when OCR is longer than all candidates (due to captured UI
+        chrome), a reversed alignment fallback is used.  Differentiating the
+        clean VN script block from garbage-prefix copies in this mode requires
+        a more sophisticated scorer — current behaviour is to accept any
+        candidate whose dialog content scores above the threshold.
+        """
+        ocr = (
+            "3馬飼いの青年\n"
+            "SKIP A [理0 SAVE LOAD EDIT CON呂CLOSE\n"
+            "・・ん、ああ、おはよう。\n"
+            "こめん。僕の責任だ。ヒスカに騙されてね・・\n"
+            "帰ってきたら折檻してやる!"
+        )
+        needle = "おはよう"
+        candidates = [
+            # Clean VN script block with name tag and \w
+            "~【馬飼いの青年】\n"
+            "\u201c……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！\\w",
+            # different dialogue (wrong context)
+            "~【馬飼いの青年】\n\u201c……街に行くまでの道で、牧場がある村がある。",
+            # garbage prefix :Ma + 3 dialog lines
+            ":Ma\u9696\uffb4\u0e7c\u8000……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+            # garbage prefix 茳￘ᕍ退
+            "\u8cb3\uffD8\u154d\u9000……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+            # garbage prefix 뱌菀蓥세 — only last line
+            "\ub874\u83c0\u84e5\uc138\ufba7\ufd2a\uc246\u9000"
+            "帰ってきたら折檻してやる！",
+            # garbage prefix 㾀嬆鋺瘇ꬩﾳ᥻退
+            "\u3f80\u5b06\u937a\u7607\uab29\uff73\u195b\u9000……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+        ]
+        result = best_match_with_details(ocr, candidates, needle)
+        # Primary guarantee: the algorithm must return a match (not None).
+        # Previously this returned None because all candidates were shorter
+        # than the noisy OCR, causing edlib HW mode to fail for every one.
+        assert result is not None, (
+            "Expected a match — reversed-alignment fallback should fire "
+            "when OCR is longer than all candidates."
+        )
+        # The result should carry the core dialog content regardless of which
+        # candidate won.
+        assert "おはよう" in result.text, f"Dialog line 1 missing: {result.text!r}"
+        assert "帰ってきたら折檻してやる" in result.text, f"Dialog line 3 missing: {result.text!r}"
+        # The wrong-context candidate must not win (different story).
+        assert "街に行くまでの道" not in result.text, (
+            f"Wrong-context candidate won: {result.text!r}"
+        )
+
+    def test_clean_partial_does_not_beat_full_vn_block(self) -> None:
+        """Regression: a clean partial candidate (last N lines only, no garbage
+        prefix) must NOT beat the full VN script block even when OCR contains
+        UI chrome that inflates its length past all candidates.
+
+        Root cause: the partial candidate (shorter) is forced into the reversed
+        alignment path and scored with ``fuzz.partial_ratio`` (lenient), while
+        the full VN block goes through normal HW alignment and is scored with
+        ``fuzz.ratio`` against the noisy OCR — an unfair comparison that made
+        the partial candidate win.
+
+        Fix: reversed-direction candidates are only used when *no* normal-
+        direction candidate passed; the full VN block (normal path) therefore
+        always beats any reversed-direction partial match.
+        """
+        ocr = (
+            "3馬飼いの青年\n"
+            "SKIP A [理0 SAVE LOAD EDIT CON呂CLOSE\n"
+            "・・ん、ああ、おはよう。\n"
+            "S S KI P\n"
+            "こめん。僕の責任だ。ヒスカに騙されてね・・\n"
+            "帰ってきたら折檻してやる!"
+        )
+        needle = "たら折檻"
+        candidates = [
+            # 1 — correct: full VN script block with name tag and \w
+            "~【馬飼いの青年】\n"
+            "\u201c……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！\\w",
+            # 2 — wrong context (different dialogue)
+            "~【馬飼いの青年】\n\u201c……街に行くまでの道で、牧場がある村がある。",
+            # 3-5 — garbage-prefix copies of the full dialog
+            "\u0712\u8e80\ue000……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+            "\u0755\u7050\ufc00\ue000……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+            "\u0bb4\u9340\uec01……ん、あぁ、おはよう。\n"
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+            # 6 — clean partial (last 2 lines only, no prefix) — reversed path
+            "……ごめん。僕の責任だ。ビスカに騙されてね……。\n"
+            "帰ってきたら折檻してやる！",
+        ]
+        result = best_match_with_details(ocr, candidates, needle)
+        assert result is not None
+
+        # The full VN block (candidate 1) must win over the clean partial.
+        assert "~【馬飼いの青年】" in result.text, (
+            f"Name tag missing — partial candidate won instead: {result.text!r}"
+        )
+        assert "……ん、あぁ、おはよう" in result.text, (
+            f"First dialog line missing: {result.text!r}"
+        )
+        assert "帰ってきたら折檻してやる" in result.text
+
+        # Wrong-context candidate must not win.
+        assert "街に行くまでの道" not in result.text
+
     def test_name_tag_included_across_newline(self) -> None:
         """Bug: ~【name】 on a separate line must be included in the result.
 
