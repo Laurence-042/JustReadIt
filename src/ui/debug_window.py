@@ -25,15 +25,15 @@ _cfg = AppConfig()
 _log = logging.getLogger(__name__)
 
 from PySide6.QtGui import (
-    QColor, QFont, QImage, QPainter, QPen, QPixmap,
+    QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFrame, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
-    QTabWidget, QTextEdit, QToolBar,
+    QTabWidget, QTextEdit, QToolBar, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -603,23 +603,38 @@ class DebugWindow(QMainWindow):
         tb.addWidget(self._cmb_freeze_key)
         tb.addSeparator()
 
-        self._btn_clear_cache = QPushButton("🗑  Clear Cache")
-        self._btn_clear_cache.setToolTip(
+        # ── Right-aligned tools menu ──────────────────────────────────
+        _spacer = QWidget()
+        _spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        tb.addWidget(_spacer)
+
+        self._act_clear_cache = QAction("🗑  清除缓存", self)
+        self._act_clear_cache.setToolTip(
             "Flush the in-memory and persistent translation caches.\n"
             "Use this after updating the app to force re-translation with improved logic."
         )
-        self._btn_clear_cache.setEnabled(False)
-        self._btn_clear_cache.clicked.connect(self._on_clear_cache)
-        tb.addWidget(self._btn_clear_cache)
-        tb.addSeparator()
+        self._act_clear_cache.setEnabled(False)
+        self._act_clear_cache.triggered.connect(self._on_clear_cache)
 
-        self._btn_knowledge = QPushButton("📚  Knowledge")
-        self._btn_knowledge.setToolTip(
-            "Open the Knowledge Manager to browse or delete terms and events."
+        act_knowledge = QAction("📚  Knowledge Manager", self)
+        act_knowledge.setToolTip("Browse or delete knowledge-base terms and events.")
+        act_knowledge.triggered.connect(self._on_open_knowledge_manager)
+
+        _tools_menu = QMenu(self)
+        _tools_menu.addAction(self._act_clear_cache)
+        _tools_menu.addSeparator()
+        _tools_menu.addAction(act_knowledge)
+
+        self._btn_tools = QToolButton()
+        self._btn_tools.setText("工具")
+        self._btn_tools.setToolTip("缓存 / Knowledge 管理")
+        self._btn_tools.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
         )
-        self._btn_knowledge.clicked.connect(self._on_open_knowledge_manager)
-        tb.addWidget(self._btn_knowledge)
-        tb.addSeparator()
+        self._btn_tools.setMenu(_tools_menu)
+        tb.addWidget(self._btn_tools)
 
         # ── Restore persisted settings ───────────────────────────────
         saved_lang = _cfg.ocr_language
@@ -1025,7 +1040,7 @@ class DebugWindow(QMainWindow):
         )
 
     def _stop(self) -> None:
-        self._btn_clear_cache.setEnabled(False)
+        self._act_clear_cache.setEnabled(False)
         if self._worker_thread is not None:
             self._worker_thread.quit()
             if not self._worker_thread.wait(3000):
@@ -1043,7 +1058,7 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _on_worker_ready(self) -> None:
-        self._btn_clear_cache.setEnabled(True)
+        self._act_clear_cache.setEnabled(True)
         lang = self._selected_language
         interval = self._spn_interval.value()
         self.statusBar().showMessage(
