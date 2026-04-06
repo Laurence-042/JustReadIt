@@ -200,6 +200,7 @@ class HoverController(QObject):
 
     translation_ready = Signal(str, object, object)   # text, near_rect, screen_origin
     freeze_triggered = Signal(object, int, int, int, int)  # img, left, top, pid, hwnd
+    dump_triggered = Signal()           # debug-dump hotkey pressed
     pipeline_debug = Signal(object)  # PipelineResult
     pipeline_progress = Signal(str, object, object)  # step_label, near_rect, screen_origin
     cursor_moved = Signal()  # emitted on large cursor movement; hide overlay before next capture
@@ -214,6 +215,7 @@ class HoverController(QObject):
         source_lang: str = "ja",
         target_lang: str = "zh-CN",
         freeze_vk: int = 0x78,  # VK_F9
+        dump_vk: int = 0x77,    # VK_F8
         poll_ms: int = _POLL_MS,
         continuous: bool = False,
     ) -> None:
@@ -224,6 +226,7 @@ class HoverController(QObject):
         self._source_lang = source_lang
         self._target_lang = target_lang
         self._freeze_vk = freeze_vk
+        self._dump_vk = dump_vk
         self._poll_ms = poll_ms
         self._continuous = continuous
 
@@ -249,6 +252,8 @@ class HoverController(QObject):
 
         # Freeze hotkey edge-detection: True if key was down last tick
         self._freeze_key_was_down: bool = False
+        # Dump hotkey edge-detection
+        self._dump_key_was_down: bool = False
 
         self._poll_timer: QTimer | None = None
 
@@ -331,6 +336,11 @@ class HoverController(QObject):
         """Change the freeze-mode hotkey virtual-key code."""
         self._freeze_vk = vk
 
+    @Slot(int)
+    def set_dump_vk(self, vk: int) -> None:
+        """Change the debug-dump hotkey virtual-key code."""
+        self._dump_vk = vk
+
     # ------------------------------------------------------------------
     # Freeze-mode slots (called from main thread via queued connection)
     # ------------------------------------------------------------------
@@ -378,7 +388,11 @@ class HoverController(QObject):
             self._trigger_freeze()
             return
         self._freeze_key_was_down = key_down
-
+        # ── Debug-dump hotkey (edge-triggered) ─────────────────
+        dump_down = bool(_user32.GetAsyncKeyState(self._dump_vk) & 0x8000)
+        if dump_down and not self._dump_key_was_down:
+            self.dump_triggered.emit()
+        self._dump_key_was_down = dump_down
         if self._in_freeze:
             return  # hover events drive the pipeline in freeze mode
 

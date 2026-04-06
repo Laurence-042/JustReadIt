@@ -207,6 +207,17 @@ class AppConfig:
     # ── Hover overlay ──────────────────────────────────────────────────
 
     @property
+    def dump_vk(self) -> int:
+        """Virtual-key code for the debug-dump hotkey (default 0x77 = F8)."""
+        return int(_make_qsettings().value("overlay/dump_vk", 0x77))
+
+    @dump_vk.setter
+    def dump_vk(self, value: int) -> None:
+        s = _make_qsettings()
+        s.setValue("overlay/dump_vk", value)
+        s.sync()
+
+    @property
     def freeze_vk(self) -> int:
         """Virtual-key code for the Freeze hotkey (default 0x78 = F9)."""
         return int(_make_qsettings().value("overlay/freeze_vk", 0x78))

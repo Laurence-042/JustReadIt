@@ -536,6 +536,9 @@ class DebugWindow(QMainWindow):
         self._freeze_overlay = FreezeOverlay()
         self._freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
 
+        # -- state for debug dump --
+        self._last_result: PipelineResult | None = None
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -590,6 +593,14 @@ class DebugWindow(QMainWindow):
         tb.addWidget(self._cmb_freeze_key)
         tb.addSeparator()
 
+        tb.addWidget(QLabel(" Dump key: "))
+        self._cmb_dump_key = QComboBox()
+        for label, vk in _VK_FKEYS:
+            self._cmb_dump_key.addItem(label, userData=vk)
+        self._cmb_dump_key.setToolTip("Press to copy OCR / Memory / Corrected snapshot to clipboard")
+        tb.addWidget(self._cmb_dump_key)
+        tb.addSeparator()
+
         # ── Right-aligned tools menu ──────────────────────────────────
         _spacer = QWidget()
         _spacer.setSizePolicy(
@@ -632,6 +643,11 @@ class DebugWindow(QMainWindow):
             if self._cmb_freeze_key.itemData(i) == saved_vk:
                 self._cmb_freeze_key.setCurrentIndex(i)
                 break
+        saved_dump_vk = _cfg.dump_vk
+        for i in range(self._cmb_dump_key.count()):
+            if self._cmb_dump_key.itemData(i) == saved_dump_vk:
+                self._cmb_dump_key.setCurrentIndex(i)
+                break
         for i in range(self._cmb_lang.count()):
             if self._cmb_lang.itemData(i) == saved_lang:
                 self._cmb_lang.setCurrentIndex(i)
@@ -639,6 +655,7 @@ class DebugWindow(QMainWindow):
 
         # Live-update freeze hotkey when combo changes.
         self._cmb_freeze_key.currentIndexChanged.connect(self._on_freeze_key_changed)
+        self._cmb_dump_key.currentIndexChanged.connect(self._on_dump_key_changed)
 
         # Live-update poll interval when spinbox changes.
         self._spn_interval.valueChanged.connect(self._on_interval_changed)
@@ -987,6 +1004,7 @@ class DebugWindow(QMainWindow):
         target_lang = _cfg.translator_target_lang
         interval = self._spn_interval.value()
         freeze_vk = self._cmb_freeze_key.currentData() or 0x78
+        dump_vk = self._cmb_dump_key.currentData() or 0x77
 
         self._controller = HoverController(
             self._target,
@@ -995,6 +1013,7 @@ class DebugWindow(QMainWindow):
             source_lang=lang,
             target_lang=target_lang,
             freeze_vk=freeze_vk,
+            dump_vk=dump_vk,
             poll_ms=interval,
             continuous=True,
         )
@@ -1006,6 +1025,7 @@ class DebugWindow(QMainWindow):
         self._controller.translation_ready.connect(self._on_translation)
         self._controller.pipeline_progress.connect(self._on_pipeline_progress)
         self._controller.freeze_triggered.connect(self._on_freeze_triggered)
+        self._controller.dump_triggered.connect(self._on_dump_triggered)
         self._controller.cursor_moved.connect(self._translation_overlay.hide)
         self._controller.error.connect(self._on_error)
         self._controller.ready.connect(self._on_worker_ready)
@@ -1059,6 +1079,7 @@ class DebugWindow(QMainWindow):
     @Slot(object)
     def _on_result(self, result: PipelineResult) -> None:
         """Update debug panels with intermediate pipeline data."""
+        self._last_result = result
         ocr = result.ocr.value
         rng = result.range_det.value
         self._preview.update_frame(
@@ -1150,6 +1171,7 @@ class DebugWindow(QMainWindow):
         # Persist toolbar settings.
         _cfg.interval_ms = self._spn_interval.value()
         _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
+        _cfg.dump_vk = self._cmb_dump_key.currentData() or 0x77
         # Close overlays and knowledge base.
         self._translation_overlay.close()
         self._freeze_overlay.close()
@@ -1174,6 +1196,38 @@ class DebugWindow(QMainWindow):
             _cfg.freeze_vk = vk
             if self._controller is not None:
                 self._controller.set_freeze_vk(vk)
+
+    @Slot(int)
+    def _on_dump_key_changed(self, index: int) -> None:
+        """Update the live dump hotkey VK code and persist it."""
+        vk = self._cmb_dump_key.itemData(index)
+        if vk is not None:
+            _cfg.dump_vk = vk
+            if self._controller is not None:
+                self._controller.set_dump_vk(vk)
+
+    @Slot()
+    def _on_dump_triggered(self) -> None:
+        """Copy OCR / Memory / Corrected snapshot to clipboard and notify."""
+        r = self._last_result
+        if r is None:
+            self.statusBar().showMessage("暂无流水线结果可导出。", 3000)
+            return
+        ocr_text  = r.range_det.value.region_text.strip()
+        mem_text  = r.scan.value.strip()
+        corr_text = r.corr.value.strip()
+        tl_text   = r.translate.value.strip()
+        lines = [
+            "=== JustReadIt Debug Snapshot ===",
+            f"[OCR]\n{ocr_text}",
+            f"[Memory]\n{mem_text}" if mem_text else "[Memory]\n无结果",
+            f"[Corrected]\n{corr_text}" if corr_text else "[Corrected]\n无结果",
+        ]
+        if tl_text:
+            lines.append(f"[Translation]\n{tl_text}")
+        text = "\n\n".join(lines)
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage("调试快照已复制到剪贴板。", 4000)
 
     @Slot()
     def _on_freeze_dismissed(self) -> None:
