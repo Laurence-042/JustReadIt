@@ -43,7 +43,7 @@ from src.ocr.windows_ocr import _ensure_apartment
 from src.ocr.range_detectors import BoundingBox
 from src.translators.base import PROVIDERS, PROVIDERS_BY_KEY, Translator
 from src.translators.factory import build_translator
-from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT
+from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT, OPENAI_PRESETS
 from src.knowledge import KnowledgeBase
 from src.paths import knowledge_db_path
 from src.overlay import FreezeOverlay, TranslationOverlay
@@ -532,9 +532,7 @@ class DebugWindow(QMainWindow):
         self._install_timer.timeout.connect(self._poll_install)
 
         # Overlays — translation popup + freeze screenshot.
-        self._translation_overlay = TranslationOverlay(
-            auto_hide_ms=_cfg.overlay_auto_hide_ms,
-        )
+        self._translation_overlay = TranslationOverlay()
         self._freeze_overlay = FreezeOverlay()
         self._freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
 
@@ -577,17 +575,6 @@ class DebugWindow(QMainWindow):
         self._spn_interval.setValue(1500)
         self._spn_interval.setSuffix(" ms")
         tb.addWidget(self._spn_interval)
-        tb.addSeparator()
-
-        tb.addWidget(QLabel(" Auto-hide: "))
-        self._spn_auto_hide = QSpinBox()
-        self._spn_auto_hide.setRange(0, 30000)
-        self._spn_auto_hide.setSingleStep(500)
-        self._spn_auto_hide.setSuffix(" ms")
-        self._spn_auto_hide.setToolTip(
-            "Translation popup auto-hide delay (0 = never hide)"
-        )
-        tb.addWidget(self._spn_auto_hide)
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Freeze key: "))
@@ -640,7 +627,6 @@ class DebugWindow(QMainWindow):
         saved_lang = _cfg.ocr_language
         saved_interval = _cfg.interval_ms
         self._spn_interval.setValue(saved_interval)
-        self._spn_auto_hide.setValue(_cfg.overlay_auto_hide_ms)
         saved_vk = _cfg.freeze_vk
         for i in range(self._cmb_freeze_key.count()):
             if self._cmb_freeze_key.itemData(i) == saved_vk:
@@ -1020,6 +1006,7 @@ class DebugWindow(QMainWindow):
         self._controller.translation_ready.connect(self._on_translation)
         self._controller.pipeline_progress.connect(self._on_pipeline_progress)
         self._controller.freeze_triggered.connect(self._on_freeze_triggered)
+        self._controller.cursor_moved.connect(self._translation_overlay.hide)
         self._controller.error.connect(self._on_error)
         self._controller.ready.connect(self._on_worker_ready)
 
@@ -1162,7 +1149,6 @@ class DebugWindow(QMainWindow):
         self._stop()
         # Persist toolbar settings.
         _cfg.interval_ms = self._spn_interval.value()
-        _cfg.overlay_auto_hide_ms = self._spn_auto_hide.value()
         _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
         # Close overlays and knowledge base.
         self._translation_overlay.close()
@@ -1259,6 +1245,19 @@ class DebugWindow(QMainWindow):
         of_lay.setContentsMargins(0, 0, 0, 0)
         of_lay.setSpacing(4)
 
+        # Preset row: quick-fill button
+        row_preset = QHBoxLayout()
+        row_preset.addWidget(QLabel("快速预设:"))
+        self._cmb_preset = QComboBox()
+        self._cmb_preset.addItem("— 选择预设自动填充—", userData=None)
+        for _p in OPENAI_PRESETS:
+            self._cmb_preset.addItem(_p.label, userData=_p)
+        self._cmb_preset.setToolTip(
+            "选择后自动填充下方相应参数（不会立即保存，仍需点击 Apply）"
+        )
+        row_preset.addWidget(self._cmb_preset, 1)
+        of_lay.addLayout(row_preset)
+
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("Model:"))
         self._le_model = QLineEdit()
@@ -1323,6 +1322,16 @@ class DebugWindow(QMainWindow):
         )
         self._chk_tools_enabled.setChecked(True)
         row_ctx.addWidget(self._chk_tools_enabled)
+        row_ctx.addSpacing(16)
+        self._chk_disable_thinking = QCheckBox("禁止 thinking")
+        self._chk_disable_thinking.setToolTip(
+            "预填空 <think></think> 强制跳过推理阶段。\n"
+            "仅适用于 Ollama/LM Studio 上运行的思维链模型\n"
+            "（DeepSeek-R1-Distill、QwQ 等）。\n"
+            "请勿对 OpenAI 官方 API 启用，会导致 API 报错。"
+        )
+        self._chk_disable_thinking.setChecked(True)
+        row_ctx.addWidget(self._chk_disable_thinking)
         row_ctx.addStretch()
         of_lay.addLayout(row_ctx)
 
@@ -1348,6 +1357,7 @@ class DebugWindow(QMainWindow):
         self._cmb_backend.currentIndexChanged.connect(self._on_backend_changed)
         self._btn_apply_tl.clicked.connect(self._on_apply_translator)
         self._btn_test_tl.clicked.connect(self._on_test_translator)
+        self._cmb_preset.currentIndexChanged.connect(self._on_preset_selected)
 
         self._restore_translator_settings()
         self._on_backend_changed(self._cmb_backend.currentIndex())
@@ -1368,6 +1378,7 @@ class DebugWindow(QMainWindow):
         self._spn_context_window.setValue(_cfg.openai_context_window)
         self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
         self._chk_tools_enabled.setChecked(_cfg.openai_tools_enabled)
+        self._chk_disable_thinking.setChecked(_cfg.openai_disable_thinking)
         if backend == "openai":
             self._le_api_key.setText(_cfg.openai_api_key)
             self._le_model.setText(_cfg.openai_model)
@@ -1394,6 +1405,24 @@ class DebugWindow(QMainWindow):
         """Restore the built-in default system prompt template."""
         self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
 
+    @Slot(int)
+    def _on_preset_selected(self, index: int) -> None:
+        """Apply the selected preset to the OpenAI fields (no save)."""
+        preset = self._cmb_preset.itemData(index)
+        if preset is None:
+            return  # placeholder item
+        self._le_model.setPlaceholderText(preset.model_placeholder)
+        self._le_base_url.setPlaceholderText(preset.base_url_placeholder)
+        self._chk_tools_enabled.setChecked(preset.tools_enabled)
+        self._chk_disable_thinking.setChecked(preset.disable_thinking)
+        self._spn_context_window.setValue(preset.context_window)
+        self._spn_summary_trigger.setValue(preset.summary_trigger)
+        self._te_system_prompt.setPlainText(preset.system_prompt)
+        # Reset the combo back to placeholder so re-selecting same preset works
+        self._cmb_preset.blockSignals(True)
+        self._cmb_preset.setCurrentIndex(0)
+        self._cmb_preset.blockSignals(False)
+
     @Slot()
     def _on_apply_translator(self) -> None:
         """Persist settings and (re-)build the translator.  Auto-installs deps."""
@@ -1414,6 +1443,7 @@ class DebugWindow(QMainWindow):
             _cfg.openai_context_window = self._spn_context_window.value()
             _cfg.openai_summary_trigger = self._spn_summary_trigger.value()
             _cfg.openai_tools_enabled = self._chk_tools_enabled.isChecked()
+            _cfg.openai_disable_thinking = self._chk_disable_thinking.isChecked()
 
         if backend == "none":
             self._translator = None

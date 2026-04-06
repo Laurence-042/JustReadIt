@@ -133,23 +133,21 @@ class Overlay(QWidget):
 class TranslationOverlay(Overlay):
     """Semi-transparent popup that displays translated text near the source.
 
+    The popup is dismissed only when the next translation cycle starts
+    (i.e. :meth:`show_translation` or :meth:`show_progress` is called again)
+    or when the user clicks anywhere on it.
+
     Parameters
     ----------
     parent:
         Qt parent widget (normally ``None``).
-    auto_hide_ms:
-        Timeout before the popup hides itself.  ``0`` disables auto-hide.
     """
-
-    _DEFAULT_AUTO_HIDE_MS: int = 5000
 
     def __init__(
         self,
         parent: QWidget | None = None,
-        auto_hide_ms: int = _DEFAULT_AUTO_HIDE_MS,
     ) -> None:
         super().__init__(parent)
-        self._auto_hide_ms = auto_hide_ms
         self._text: str = ""
         self._is_loading: bool = False
 
@@ -219,9 +217,6 @@ class TranslationOverlay(Overlay):
         self.update()
         self.show()
 
-        if self._auto_hide_ms > 0:
-            self._hide_timer.start(self._auto_hide_ms)
-
     def show_progress(
         self,
         step: str,
@@ -287,6 +282,11 @@ class TranslationOverlay(Overlay):
     # ------------------------------------------------------------------
     # Qt overrides
     # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """Dismiss on click."""
+        self.hide()
+        super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         if not self._text:

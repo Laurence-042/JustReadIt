@@ -55,7 +55,7 @@ Usage::
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from src.translators._installer import ensure_package
@@ -83,6 +83,107 @@ DEFAULT_SYSTEM_PROMPT: str = (
     "record_term to save it.\n"
     "- Source language: {source_lang}.  Target language: {target_lang}."
 )
+
+# System prompt for mid-range local models (~9 B) that support tool-calling
+# but have shallower context budgets — keep instructions tight.
+_SYSTEM_PROMPT_9B: str = (
+    "You are a Japanese-to-{target_lang} visual novel translator.\n"
+    "Rules:\n"
+    "- Output ONLY the translated text, no commentary.\n"
+    "- Preserve punctuation and line breaks.\n"
+    "- Call search_terms before translating unfamiliar names or terms.\n"
+    "- Call record_term to save newly encountered character names and game-specific "
+    "terms for future reference.\n"
+    "- Source: {source_lang}.  Target: {target_lang}."
+)
+
+# Ultra-minimal system prompt for small models (~4 B) that cannot reliably
+# execute function-calling prompts.
+_SYSTEM_PROMPT_4B: str = (
+    "Translate the following {source_lang} visual novel text into {target_lang}.\n"
+    "Output ONLY the translation. Preserve punctuation and line breaks exactly."
+)
+
+# ---------------------------------------------------------------------------
+# Preset configurations
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OpenAIPreset:
+    """A bundle of recommended settings for a class of OpenAI-compatible model.
+
+    All string fields that are empty mean "keep the current UI value".
+    ``system_prompt`` of ``None`` signals "use the built-in default".
+    """
+
+    label: str
+    """Human-readable name shown in the UI dropdown."""
+
+    description: str
+    """One-line hint shown as tooltip."""
+
+    model_placeholder: str
+    """Suggested model name (used as QLineEdit placeholder, not written to config)."""
+
+    base_url_placeholder: str
+    """Suggested base URL (used as QLineEdit placeholder, not written to config)."""
+
+    tools_enabled: bool
+    """Whether KB tool-calling should be enabled."""
+
+    context_window: int
+    """Recommended recent-pair context window size."""
+
+    summary_trigger: int
+    """History length that triggers oldest-chunk summarisation (0 = off)."""
+
+    system_prompt: str
+    """System-prompt template (supports ``{source_lang}``/``{target_lang}``)."""
+
+    disable_thinking: bool = False
+    """When ``True``, prepend an empty ``<think></think>`` assistant prefill to
+    suppress the model's reasoning phase.  Effective only on local endpoints
+    (Ollama / LM Studio) running thinking-capable models such as
+    DeepSeek-R1-Distill or QwQ.  Has no effect—and will likely cause an API
+    error—on the standard OpenAI endpoint."""
+
+
+#: Ordered list of ready-made presets offered in the UI.
+OPENAI_PRESETS: list[OpenAIPreset] = [
+    OpenAIPreset(
+        label="强大在线服务（GPT-4o / Claude / Gemini …）",
+        description="适合 OpenAI、OpenRouter、Google 等在线旗舰模型。全功能：工具调用+RAG+长上下文。",
+        model_placeholder="gpt-4o-mini",
+        base_url_placeholder="https://api.openai.com/v1  （留空使用默认）",
+        tools_enabled=True,
+        context_window=20,
+        summary_trigger=40,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        disable_thinking=True,
+    ),
+    OpenAIPreset(
+        label="9B 本地模型（支持工具调用，如 Qwen2.5:9b）",
+        description="适合 Ollama/LM Studio 运行的 7–13 B 模型。支持工具调用但上下文较短，精简提示词。",
+        model_placeholder="qwen2.5:9b",
+        base_url_placeholder="http://localhost:11434/v1",
+        tools_enabled=True,
+        context_window=6,
+        summary_trigger=15,
+        system_prompt=_SYSTEM_PROMPT_9B,
+        disable_thinking=True,
+    ),
+    OpenAIPreset(
+        label="4B 及以下本地模型（不支持工具调用）",
+        description="适合 Ollama/LM Studio 运行的 3–4 B 小模型。禁用工具调用，使用极简提示词。",
+        model_placeholder="qwen2.5:3b",
+        base_url_placeholder="http://localhost:11434/v1",
+        tools_enabled=False,
+        context_window=3,
+        summary_trigger=0,
+        system_prompt=_SYSTEM_PROMPT_4B,
+        disable_thinking=True,
+    ),
+]
 
 # ---------------------------------------------------------------------------
 # Internal data structures
@@ -135,6 +236,13 @@ class OpenAICompatTranslator(Translator):
             include KB tools in every API call.  Set to ``False`` to use RAG
             injection only (no function calling), useful for models with
             poor function-calling support.
+        disable_thinking: If ``True``, prepend an empty
+            ``<think>\n</think>`` assistant message (prefill) to every
+            request, suppressing the model's reasoning phase.  Useful for
+            local thinking-capable models (DeepSeek-R1-Distill, QwQ, etc.)
+            when run via Ollama or LM Studio.  **Do not enable for OpenAI
+            endpoints** — the standard API requires the last message to be
+            from the user / tool role.
         timeout: Per-request timeout in seconds (default 30).
     """
 
@@ -148,6 +256,7 @@ class OpenAICompatTranslator(Translator):
         base_url: str | None = None,
         knowledge_base: "KnowledgeBase | None" = None,
         tools_enabled: bool = True,
+        disable_thinking: bool = False,
         timeout: float = 30.0,
         progress: "Callable[[str], None] | None" = None,
     ) -> None:
@@ -173,6 +282,7 @@ class OpenAICompatTranslator(Translator):
         self._timeout = timeout
         self._kb = knowledge_base
         self._tools_enabled = tools_enabled
+        self._disable_thinking = disable_thinking
 
         # Short-term volatile context — only grows when add_to_history=True.
         self._recent: list[_HistoryEntry] = []
@@ -362,6 +472,11 @@ class OpenAICompatTranslator(Translator):
             messages.append({"role": "user", "content": entry.source})
             messages.append({"role": "assistant", "content": entry.translation})
         messages.append({"role": "user", "content": text})
+        if self._disable_thinking:
+            # Prefill with an empty think block so the model skips its
+            # reasoning phase entirely (effective on Ollama / LM Studio;
+            # do NOT use with the standard OpenAI endpoint).
+            messages.append({"role": "assistant", "content": "<think>\n</think>"})
         return messages
 
     def _build_system_content(

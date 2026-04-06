@@ -202,6 +202,7 @@ class HoverController(QObject):
     freeze_triggered = Signal(object, int, int, int, int)  # img, left, top, pid, hwnd
     pipeline_debug = Signal(object)  # PipelineResult
     pipeline_progress = Signal(str, object, object)  # step_label, near_rect, screen_origin
+    cursor_moved = Signal()  # emitted on large cursor movement; hide overlay before next capture
     error = Signal(str)
     ready = Signal()
 
@@ -414,10 +415,12 @@ class HoverController(QObject):
         dist = math.hypot(dx, dy)
 
         if dist >= _MOVE_THRESHOLD:
-            # Large movement — reset settle timer
+            # Large movement — reset settle timer and notify overlay to hide
+            # *before* the next capture so the bubble is not caught by DXGI.
             self._last_pos = (cx, cy)
             self._settle_start = time.monotonic()
             self._settled = False
+            self.cursor_moved.emit()
             return
 
         # ── Check cursor-inside-game-window ──────────────────────────

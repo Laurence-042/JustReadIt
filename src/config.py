@@ -185,6 +185,25 @@ class AppConfig:
         s.setValue("openai/tools_enabled", value)
         s.sync()
 
+    @property
+    def openai_disable_thinking(self) -> bool:
+        """Prepend empty ``<think></think>`` prefill to suppress reasoning.
+
+        Only effective on local endpoints (Ollama / LM Studio) running
+        thinking-capable models (DeepSeek-R1-Distill, QwQ, …).
+        **Must not be enabled for the standard OpenAI endpoint.**
+        """
+        v = _make_qsettings().value("openai/disable_thinking", True)
+        if isinstance(v, str):
+            return v.lower() not in ("false", "0", "no")
+        return bool(v)
+
+    @openai_disable_thinking.setter
+    def openai_disable_thinking(self, value: bool) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/disable_thinking", value)
+        s.sync()
+
     # ── Hover overlay ──────────────────────────────────────────────────
 
     @property
@@ -196,15 +215,4 @@ class AppConfig:
     def freeze_vk(self, value: int) -> None:
         s = _make_qsettings()
         s.setValue("overlay/freeze_vk", value)
-        s.sync()
-
-    @property
-    def overlay_auto_hide_ms(self) -> int:
-        """Auto-hide delay for the translation popup in ms (default 5000)."""
-        return int(_make_qsettings().value("overlay/auto_hide_ms", 5000))
-
-    @overlay_auto_hide_ms.setter
-    def overlay_auto_hide_ms(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("overlay/auto_hide_ms", value)
         s.sync()
