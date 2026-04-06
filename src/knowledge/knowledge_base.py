@@ -290,6 +290,7 @@ class KnowledgeBase:
         """Return every term in the knowledge base (no ranking)."""
         rows = self._conn.execute(
             "SELECT category, original, reading, translation, description FROM terms"
+            " ORDER BY updated_at DESC"
         ).fetchall()
         return [
             KnowledgeEntry(
@@ -320,6 +321,41 @@ class KnowledgeBase:
             )
             for r in rows
         ]
+
+    def get_all_events_rows(self) -> list[tuple[int, str]]:
+        """Return all events as ``(id, summary)`` tuples, newest first.
+
+        Intended for admin/management UIs that need to identify rows by ID
+        for deletion.
+        """
+        rows = self._conn.execute(
+            "SELECT id, summary FROM events ORDER BY id DESC"
+        ).fetchall()
+        return [(r["id"], r["summary"]) for r in rows]
+
+    # ── Delete API ────────────────────────────────────────────────────────────
+
+    def delete_term(self, original: str) -> bool:
+        """Delete the term whose ``original`` matches exactly.
+
+        Returns ``True`` if a row was deleted, ``False`` if not found.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM terms WHERE original = ?", (original,)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_event(self, event_id: int) -> bool:
+        """Delete the event with *event_id*.
+
+        Returns ``True`` if a row was deleted, ``False`` if not found.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM events WHERE id = ?", (event_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def close(self) -> None:
         """Close the database connection."""

@@ -77,6 +77,7 @@ def build_translator(
             context_window=config.openai_context_window,
             base_url=config.openai_base_url.strip() or None,
             knowledge_base=knowledge_base,  # type: ignore[arg-type]
+            tools_enabled=config.openai_tools_enabled,
             progress=progress,
         )
 

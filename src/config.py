@@ -166,6 +166,25 @@ class AppConfig:
         s.setValue("openai/summary_trigger", value)
         s.sync()
 
+    @property
+    def openai_tools_enabled(self) -> bool:
+        """Whether to expose KB tool-calling functions to the model (default ``True``).
+
+        Disable for small or instruction-tuned models that struggle with
+        function-calling prompts.
+        """
+        v = _make_qsettings().value("openai/tools_enabled", True)
+        # QSettings may return str "true"/"false" when read back from INI.
+        if isinstance(v, str):
+            return v.lower() not in ("false", "0", "no")
+        return bool(v)
+
+    @openai_tools_enabled.setter
+    def openai_tools_enabled(self, value: bool) -> None:
+        s = _make_qsettings()
+        s.setValue("openai/tools_enabled", value)
+        s.sync()
+
     # ── Hover overlay ──────────────────────────────────────────────────
 
     @property

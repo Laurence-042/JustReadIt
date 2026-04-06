@@ -28,10 +28,12 @@ from PySide6.QtGui import (
     QColor, QFont, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFrame, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
-    QSpinBox, QSplitter, QStatusBar, QTextEdit, QToolBar,
+    QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
+    QTabWidget, QTextEdit, QToolBar,
     QVBoxLayout, QWidget,
 )
 
@@ -80,6 +82,155 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040
 _WAIT_TIMEOUT            = 0x00000102
 _kernel32_ui = ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Manager dialog
+# ---------------------------------------------------------------------------
+
+class _KnowledgeManagerDialog(QDialog):
+    """Modal dialog for browsing and deleting knowledge-base entries."""
+
+    def __init__(self, knowledge_base: "KnowledgeBase", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._kb = knowledge_base
+        self.setWindowTitle("📚 Knowledge Manager")
+        self.setMinimumSize(800, 500)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+
+        layout = QVBoxLayout(self)
+
+        self._tabs = QTabWidget()
+        layout.addWidget(self._tabs, 1)
+
+        # ── Terms tab ──
+        self._terms_table = QTableWidget()
+        self._terms_table.setColumnCount(4)
+        self._terms_table.setHorizontalHeaderLabels(["Category", "Original", "Translation", "Description"])
+        self._terms_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self._terms_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._terms_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._terms_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._terms_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._terms_table.setSortingEnabled(True)
+        terms_widget = QWidget()
+        terms_lay = QVBoxLayout(terms_widget)
+        terms_lay.setContentsMargins(4, 4, 4, 4)
+        terms_btn_row = QHBoxLayout()
+        self._btn_del_term = QPushButton("🗑  Delete Selected")
+        self._btn_del_term.clicked.connect(self._on_delete_term)
+        terms_btn_row.addWidget(self._btn_del_term)
+        terms_btn_row.addStretch()
+        self._lbl_terms_count = QLabel()
+        terms_btn_row.addWidget(self._lbl_terms_count)
+        terms_lay.addLayout(terms_btn_row)
+        terms_lay.addWidget(self._terms_table)
+        self._tabs.addTab(terms_widget, "Terms")
+
+        # ── Events tab ──
+        self._events_table = QTableWidget()
+        self._events_table.setColumnCount(2)
+        self._events_table.setHorizontalHeaderLabels(["ID", "Summary"])
+        self._events_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._events_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._events_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._events_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._events_table.setSortingEnabled(True)
+        events_widget = QWidget()
+        events_lay = QVBoxLayout(events_widget)
+        events_lay.setContentsMargins(4, 4, 4, 4)
+        events_btn_row = QHBoxLayout()
+        self._btn_del_event = QPushButton("🗑  Delete Selected")
+        self._btn_del_event.clicked.connect(self._on_delete_event)
+        events_btn_row.addWidget(self._btn_del_event)
+        events_btn_row.addStretch()
+        self._lbl_events_count = QLabel()
+        events_btn_row.addWidget(self._lbl_events_count)
+        events_lay.addLayout(events_btn_row)
+        events_lay.addWidget(self._events_table)
+        self._tabs.addTab(events_widget, "Events")
+
+        # ── Bottom buttons ──
+        btn_box = QHBoxLayout()
+        self._btn_refresh = QPushButton("🔄  Refresh")
+        self._btn_refresh.clicked.connect(self._load_data)
+        btn_box.addWidget(self._btn_refresh)
+        btn_box.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_box.addWidget(close_btn)
+        layout.addLayout(btn_box)
+
+        self._load_data()
+
+    def _load_data(self) -> None:
+        """Reload both tables from the knowledge base."""
+        self._load_terms()
+        self._load_events()
+
+    def _load_terms(self) -> None:
+        self._terms_table.setSortingEnabled(False)
+        self._terms_table.setRowCount(0)
+        terms = self._kb.get_all_terms()
+        self._terms_table.setRowCount(len(terms))
+        for row, entry in enumerate(terms):
+            self._terms_table.setItem(row, 0, QTableWidgetItem(entry.category))
+            item_orig = QTableWidgetItem(entry.original)
+            self._terms_table.setItem(row, 1, item_orig)
+            self._terms_table.setItem(row, 2, QTableWidgetItem(entry.translation))
+            self._terms_table.setItem(row, 3, QTableWidgetItem(entry.description))
+        self._terms_table.setSortingEnabled(True)
+        self._lbl_terms_count.setText(f"{len(terms)} term(s)")
+
+    def _load_events(self) -> None:
+        self._events_table.setSortingEnabled(False)
+        self._events_table.setRowCount(0)
+        rows = self._kb.get_all_events_rows()
+        self._events_table.setRowCount(len(rows))
+        for row, (eid, summary) in enumerate(rows):
+            id_item = QTableWidgetItem()
+            id_item.setData(Qt.ItemDataRole.DisplayRole, eid)
+            self._events_table.setItem(row, 0, id_item)
+            self._events_table.setItem(row, 1, QTableWidgetItem(summary))
+        self._events_table.setSortingEnabled(True)
+        self._lbl_events_count.setText(f"{len(rows)} event(s)")
+
+    def _on_delete_term(self) -> None:
+        selected = self._terms_table.selectedItems()
+        if not selected:
+            return
+        rows = sorted({item.row() for item in selected}, reverse=True)
+        originals = [self._terms_table.item(r, 1).text() for r in rows]
+        if QMessageBox.question(
+            self,
+            "Delete Terms",
+            f"Delete {len(originals)} term(s)?\n" + "\n".join(f"  • {o}" for o in originals[:10]),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for orig in originals:
+            self._kb.delete_term(orig)
+        self._load_terms()
+
+    def _on_delete_event(self) -> None:
+        selected = self._events_table.selectedItems()
+        if not selected:
+            return
+        row_indices = sorted({item.row() for item in selected}, reverse=True)
+        event_ids = [
+            self._events_table.item(r, 0).data(Qt.ItemDataRole.DisplayRole)
+            for r in row_indices
+        ]
+        if QMessageBox.question(
+            self,
+            "Delete Events",
+            f"Delete {len(event_ids)} event(s)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for eid in event_ids:
+            self._kb.delete_event(int(eid))
+        self._load_events()
 
 
 
@@ -460,6 +611,14 @@ class DebugWindow(QMainWindow):
         self._btn_clear_cache.setEnabled(False)
         self._btn_clear_cache.clicked.connect(self._on_clear_cache)
         tb.addWidget(self._btn_clear_cache)
+        tb.addSeparator()
+
+        self._btn_knowledge = QPushButton("📚  Knowledge")
+        self._btn_knowledge.setToolTip(
+            "Open the Knowledge Manager to browse or delete terms and events."
+        )
+        self._btn_knowledge.clicked.connect(self._on_open_knowledge_manager)
+        tb.addWidget(self._btn_knowledge)
         tb.addSeparator()
 
         # ── Restore persisted settings ───────────────────────────────
@@ -1029,6 +1188,16 @@ class DebugWindow(QMainWindow):
         if self._controller is not None:
             self._controller.set_poll_interval(ms)
 
+    # ------------------------------------------------------------------
+    # Knowledge Manager
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_open_knowledge_manager(self) -> None:
+        """Open the Knowledge Manager dialog."""
+        dlg = _KnowledgeManagerDialog(self._knowledge_base, parent=self)
+        dlg.exec()
+
 
     # ------------------------------------------------------------------
     # Translator settings panel
@@ -1130,6 +1299,15 @@ class DebugWindow(QMainWindow):
         )
         self._spn_summary_trigger.setMaximumWidth(80)
         row_ctx.addWidget(self._spn_summary_trigger)
+        row_ctx.addSpacing(16)
+        self._chk_tools_enabled = QCheckBox("启用 KB 工具调用")
+        self._chk_tools_enabled.setToolTip(
+            "允许模型通过 function calling 读写知识库。\n"
+            "对于小模型（如 Qwen-7B、Gemma 等）建议关闭，\n"
+            "避免复杂 tool prompt 引起注意力消耗和格式混乱。"
+        )
+        self._chk_tools_enabled.setChecked(True)
+        row_ctx.addWidget(self._chk_tools_enabled)
         row_ctx.addStretch()
         of_lay.addLayout(row_ctx)
 
@@ -1174,6 +1352,7 @@ class DebugWindow(QMainWindow):
         # API key: show whichever is set
         self._spn_context_window.setValue(_cfg.openai_context_window)
         self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
+        self._chk_tools_enabled.setChecked(_cfg.openai_tools_enabled)
         if backend == "openai":
             self._le_api_key.setText(_cfg.openai_api_key)
             self._le_model.setText(_cfg.openai_model)
@@ -1219,6 +1398,7 @@ class DebugWindow(QMainWindow):
             _cfg.openai_system_prompt = self._te_system_prompt.toPlainText().strip()
             _cfg.openai_context_window = self._spn_context_window.value()
             _cfg.openai_summary_trigger = self._spn_summary_trigger.value()
+            _cfg.openai_tools_enabled = self._chk_tools_enabled.isChecked()
 
         if backend == "none":
             self._translator = None
@@ -1284,6 +1464,7 @@ class DebugWindow(QMainWindow):
                 context_window=self._spn_context_window.value(),
                 base_url=self._le_base_url.text().strip() or None,
                 knowledge_base=self._knowledge_base,
+                tools_enabled=self._chk_tools_enabled.isChecked(),
                 progress=progress,
             )
         raise RuntimeError(f"Unknown backend: {backend!r}")
