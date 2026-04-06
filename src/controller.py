@@ -256,6 +256,7 @@ class HoverController(QObject):
         self._dump_key_was_down: bool = False
 
         self._poll_timer: QTimer | None = None
+        self._hotkey_timer: QTimer | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -297,6 +298,14 @@ class HoverController(QObject):
         self._poll_timer.setInterval(self._poll_ms)
         self._poll_timer.timeout.connect(self._poll)
         self._poll_timer.start()
+
+        # Dedicated fast-poll timer for hotkeys — 100 ms ensures even
+        # brief key presses are caught regardless of pipeline interval.
+        self._hotkey_timer = QTimer(self)
+        self._hotkey_timer.setInterval(100)
+        self._hotkey_timer.timeout.connect(self._poll_hotkeys)
+        self._hotkey_timer.start()
+
         self.ready.emit()
 
     @Slot()
@@ -305,6 +314,9 @@ class HoverController(QObject):
         if self._poll_timer is not None:
             self._poll_timer.stop()
             self._poll_timer = None
+        if self._hotkey_timer is not None:
+            self._hotkey_timer.stop()
+            self._hotkey_timer = None
         if self._capturer is not None:
             self._capturer.close()
             self._capturer = None
@@ -379,20 +391,24 @@ class HoverController(QObject):
     # ------------------------------------------------------------------
 
     @Slot()
-    def _poll(self) -> None:
-        """Main polling tick — called every ``poll_ms`` ms by QTimer."""
+    def _poll_hotkeys(self) -> None:
+        """Fast hotkey poll — runs every 100 ms independent of pipeline interval."""
         # ── Freeze hotkey (edge-triggered) ───────────────────────────
         key_down = bool(_user32.GetAsyncKeyState(self._freeze_vk) & 0x8000)
         if key_down and not self._freeze_key_was_down and not self._in_freeze:
             self._freeze_key_was_down = True
             self._trigger_freeze()
-            return
-        self._freeze_key_was_down = key_down
+        else:
+            self._freeze_key_was_down = key_down
         # ── Debug-dump hotkey (edge-triggered) ─────────────────
         dump_down = bool(_user32.GetAsyncKeyState(self._dump_vk) & 0x8000)
         if dump_down and not self._dump_key_was_down:
             self.dump_triggered.emit()
         self._dump_key_was_down = dump_down
+
+    @Slot()
+    def _poll(self) -> None:
+        """Main polling tick — called every ``poll_ms`` ms by QTimer."""
         if self._in_freeze:
             return  # hover events drive the pipeline in freeze mode
 

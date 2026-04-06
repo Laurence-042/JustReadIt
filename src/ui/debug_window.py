@@ -764,6 +764,13 @@ class DebugWindow(QMainWindow):
 
         # ── Status bar ─────────────────────────────────────────────────
         self.setStatusBar(QStatusBar(self))
+        # Right-aligned notification label for transient action feedback.
+        self._notify_label = QLabel("")
+        self._notify_label.setStyleSheet("padding-right: 8px; color: #ccc;")
+        self.statusBar().addPermanentWidget(self._notify_label)
+        self._notify_timer = QTimer(self)
+        self._notify_timer.setSingleShot(True)
+        self._notify_timer.timeout.connect(lambda: self._notify_label.setText(""))
 
         # Connect AFTER populating to avoid spurious install prompt.
         self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
@@ -1099,9 +1106,6 @@ class DebugWindow(QMainWindow):
         self._panel_mem.update_timing(result.scan.ms, total)
         self._panel_corr.update_timing(result.corr.ms, total)
         self._panel_tl.update_timing(result.translate.ms, total)
-        self.statusBar().showMessage(
-            f"Last tick: {result.elapsed_ms:.0f} ms  |  {len(ocr.boxes)} boxes"
-        )
 
     @Slot(str, object, object)
     def _on_pipeline_progress(
@@ -1146,13 +1150,12 @@ class DebugWindow(QMainWindow):
         self._freeze_overlay.freeze(
             screenshot, window_left, window_top, pid, hwnd,
         )
-        self.statusBar().showMessage(
-            "Freeze mode \u2014 right-click or Esc to dismiss."
-        )
+        freeze_key = self._cmb_freeze_key.currentText()
+        self.statusBar().showMessage(f"❄ Freeze — 右键/Esc 退出  ({freeze_key} 再次切换)")
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
-        self.statusBar().showMessage(f"⚠  {message}", 10000)
+        self._notify(f"⚠  {message}", 10000)
         self._te_wocr.append(f"\n[worker error] {message}")
 
     # ------------------------------------------------------------------
@@ -1208,10 +1211,10 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _on_dump_triggered(self) -> None:
-        """Copy OCR / Memory / Corrected snapshot to clipboard and notify."""
+        """Show OCR / Memory / Corrected snapshot in a dialog and copy to clipboard."""
         r = self._last_result
         if r is None:
-            self.statusBar().showMessage("暂无流水线结果可导出。", 3000)
+            QMessageBox.information(self, "调试快照", "暂无流水线结果可导出。")
             return
         ocr_text  = r.range_det.value.region_text.strip()
         mem_text  = r.scan.value.strip()
@@ -1227,15 +1230,24 @@ class DebugWindow(QMainWindow):
             lines.append(f"[Translation]\n{tl_text}")
         text = "\n\n".join(lines)
         QApplication.clipboard().setText(text)
-        self.statusBar().showMessage("调试快照已复制到剪贴板。", 4000)
+        self.statusBar().showMessage("📋 调试快照已复制到剪贴板", 4000)
 
     @Slot()
     def _on_freeze_dismissed(self) -> None:
-        self.statusBar().showMessage("Freeze mode dismissed.", 3000)
+        lang = self._selected_language
+        interval = self._spn_interval.value()
+        self.statusBar().showMessage(
+            f"Running — lang={lang}  interval={interval} ms"
+        )
 
     # ------------------------------------------------------------------
     # Interval change
     # ------------------------------------------------------------------
+
+    def _notify(self, msg: str, ms: int = 4000) -> None:
+        """Show a transient right-aligned message in the status bar."""
+        self._notify_label.setText(msg)
+        self._notify_timer.start(ms)
 
     @Slot(int)
     def _on_interval_changed(self, ms: int) -> None:
