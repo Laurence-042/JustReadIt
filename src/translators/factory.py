@@ -70,14 +70,8 @@ def build_translator(
     if backend == "openai":
         from src.translators.openai_translator import OpenAICompatTranslator
 
-        api_key = config.openai_api_key.strip()
-        if not api_key:
-            raise RuntimeError(
-                "OpenAI-compatible API key is not configured.  "
-                "Set it in the Translation Settings panel."
-            )
         return OpenAICompatTranslator(
-            api_key=api_key,
+            api_key=config.openai_api_key.strip(),
             model=config.openai_model.strip() or "gpt-4o-mini",
             system_prompt=config.openai_system_prompt,
             context_window=config.openai_context_window,

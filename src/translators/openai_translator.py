@@ -159,7 +159,11 @@ class OpenAICompatTranslator(Translator):
                 "openai is not installed.  Run: pip install openai"
             ) from exc
 
-        kwargs: dict = {"api_key": api_key}
+        # Local endpoints (Ollama, LM Studio, etc.) don't need a real key.
+        # Use a placeholder so the openai client doesn't raise at construction
+        # time — real auth errors will surface as 401 responses from the API.
+        effective_key = api_key or "no-key"
+        kwargs: dict = {"api_key": effective_key}
         if base_url:
             kwargs["base_url"] = base_url
         self._client = _openai.OpenAI(**kwargs)

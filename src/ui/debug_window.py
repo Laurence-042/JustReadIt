@@ -1065,7 +1065,7 @@ class DebugWindow(QMainWindow):
         r2.addWidget(QLabel("API Key:"))
         self._le_api_key = QLineEdit()
         self._le_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._le_api_key.setPlaceholderText("Paste API key here")
+        self._le_api_key.setPlaceholderText("Paste API key here  (local models: leave blank)")
         r2.addWidget(self._le_api_key)
         lay.addWidget(self._row_api_key)
 
