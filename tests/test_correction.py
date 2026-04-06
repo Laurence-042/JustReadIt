@@ -608,6 +608,52 @@ class TestRealWorld:
         # Wrong-context candidate must not win.
         assert "街に行くまでの道" not in result.text
 
+    def test_short_single_line_does_not_beat_full_vn_block(self) -> None:
+        """Regression: short candidates (last line only, some with garbage prefix)
+        must NOT beat the full VN script block when OCR contains UI chrome.
+
+        Bug report: OCR captured "綺麗な老女 / SKIP AUTO SAVE … / ああそうた…  /
+        せつかくたから…".  Memory produced the correct full block plus several
+        single-line candidates consisting only of the last sentence (with or
+        without garbage prefixes).
+
+        Root cause: single-line candidates were forced into the reversed alignment
+        path and scored with ``fuzz.partial_ratio`` (finding their one clean line
+        inside OCR's last line), inflating the score to ~89.5 % and beating the
+        full block.
+
+        Fix: reversed-direction score is weighted by coverage so that a candidate
+        covering only ~32 % of the OCR length is penalised appropriately.
+        """
+        ocr = (
+            "綺麗な老女\n"
+            "SKIP AUTO SAVE LOAD EDIT( CONFI 9LOSE\n"
+            "ああそうた。外に行くんたろう?\n"
+            "せつかくたからこれを持っていきなさい。"
+        )
+        needle = "これを持"
+        candidates = [
+            # 1 — correct: full VN script block with character name tag and \w
+            '~【綺麗な老女】\n\u201cあぁそうだ。外に行くんだろう？\nせっかくだからこれを持っていきなさい。\\w',
+            # 2 — partial: second half of dialog only (reversed path, no prefix)
+            "うだ。外に行くんだろう？\nせっかくだからこれを持っていきなさい。\\w",
+            # 3-5 — single last-line copies with garbage prefixes (reversed path)
+            "\u05ce\u31ed\u9001せっかくだからこれを持っていきなさい。",
+            "\u01e1\u06b6\u8c62\u9001せっかくだからこれを持っていきなさい。\\w",
+            "\u0cfb\u6c69\u2ac3\u0545\u6c6d\u04c7\u44df\u9000せっかくだからこれを持っていきなさい。\\w",
+        ]
+        result = best_match_with_details(ocr, candidates, needle)
+        assert result is not None
+
+        # Full VN block (candidate 1) must win.
+        assert "~【綺麗な老女】" in result.text, (
+            f"Name tag missing — single-line candidate won instead: {result.text!r}"
+        )
+        assert "あぁそうだ。外に行くんだろう" in result.text, (
+            f"First dialog line missing: {result.text!r}"
+        )
+        assert "せっかくだからこれを持っていきなさい" in result.text
+
     def test_name_tag_included_across_newline(self) -> None:
         """Bug: ~【name】 on a separate line must be included in the result.
 

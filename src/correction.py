@@ -481,7 +481,17 @@ def _align_candidate(
             cand_align, ocr_align, mode="HW", task="distance", k=rev_k,
         )
         if rev["editDistance"] >= 0:
-            score = fuzz.partial_ratio(_normalize(candidate), ocr_norm)
+            cand_norm = _normalize(candidate)
+            partial = fuzz.partial_ratio(cand_norm, ocr_norm)
+            # Weight partial_ratio by coverage: a short candidate matching
+            # only a small slice of the OCR should not outscore a longer
+            # candidate that explains much more of the OCR.  coverage is
+            # the fraction of the normalised OCR length that the candidate
+            # occupies; (1 - coverage) shifts weight toward fuzz.ratio which
+            # penalises length mismatches and prevents tiny candidates from
+            # winning purely on partial-match accuracy.
+            coverage = min(1.0, len(cand_align) / len(ocr_align))
+            score = partial * coverage + fuzz.ratio(cand_norm, ocr_norm) * (1.0 - coverage)
             if score >= threshold:
                 return 0, len(candidate), score, True
 
