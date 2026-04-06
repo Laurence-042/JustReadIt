@@ -655,15 +655,8 @@ class HoverController(QObject):
         if self._scanner is not None and region_text:
             try:
                 needles = pick_needles(region_text)
-                results: list = []
-                used_needle = ""
                 t = time.monotonic()
-                for needle in needles:
-                    results = self._scanner.scan(needle)
-                    if results:
-                        used_needle = needle
-                        break
-                    used_needle = needle
+                used_needle, results = self._scanner.scan_any(needles)
                 scan_ms = (time.monotonic() - t) * 1000
 
                 t = time.monotonic()

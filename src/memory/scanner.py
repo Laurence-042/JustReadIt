@@ -29,6 +29,7 @@ Performance
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -56,6 +57,9 @@ _MIN_TEXT_LENGTH: int = 2
 # VN engines load entire script files as one null-terminated block;
 # line-level refinement isolates the dialog paragraph for Levenshtein matching.
 _LINE_REFINE_THRESHOLD: int = 300
+
+# How long (seconds) to reuse a cached region list before re-enumerating.
+_REGIONS_CACHE_TTL_S: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +423,9 @@ class MemoryScanner:
         # Regions where CJK text was previously found — scanned first.
         self._hot_regions: list[tuple[int, int]] = []
         self._hot_region_set: set[tuple[int, int]] = set()
+        # Cached result of enumerate_regions() — rebuilt every _REGIONS_CACHE_TTL_S seconds.
+        self._cached_regions: list[tuple[int, int, int, int]] | None = None
+        self._regions_cached_at: float = 0.0
 
     # -- Context manager ---------------------------------------------------
 
@@ -448,6 +455,23 @@ class MemoryScanner:
     @learned_encoding.setter
     def learned_encoding(self, value: str | None) -> None:
         self._learned_encoding = value
+
+    # -- Region cache ------------------------------------------------------
+
+    def _get_regions(self) -> list[tuple[int, int, int, int]]:
+        """Return cached readable regions, re-enumerating after the TTL expires."""
+        now = time.monotonic()
+        if (
+            self._cached_regions is None
+            or (now - self._regions_cached_at) > _REGIONS_CACHE_TTL_S
+        ):
+            self._cached_regions = w32.enumerate_regions(self._handle)
+            self._regions_cached_at = now
+        return self._cached_regions
+
+    def invalidate_regions_cache(self) -> None:
+        """Force re-enumeration of memory regions on the next scan."""
+        self._cached_regions = None
 
     # -- Main API ----------------------------------------------------------
 
@@ -488,7 +512,7 @@ class MemoryScanner:
             raise RuntimeError("MemoryScanner is closed")
 
         enc_order = self._encoding_order(encodings)
-        all_regions = w32.enumerate_regions(self._handle)
+        all_regions = self._get_regions()
 
         results: list[ScanResult] = []
         seen_texts: set[str] = set()
@@ -545,8 +569,9 @@ class MemoryScanner:
             base.insert(0, self._learned_encoding)
         return base
 
-    def _scan_one_region(
+    def _search_region_data(
         self,
+        data: bytes,
         base: int,
         size: int,
         needle_bytes: bytes,
@@ -556,11 +581,7 @@ class MemoryScanner:
         seen_texts: set[str],
         max_results: int,
     ) -> None:
-        """Read one memory region and search for *needle_bytes*."""
-        data = w32.read_region(self._handle, base, size)
-        if data is None:
-            return
-
+        """Search already-read region *data* for *needle_bytes* and append hits to *results*."""
         positions = find_all_positions(data, needle_bytes, max_results=max_results * 4)
 
         for pos in positions:
@@ -595,3 +616,116 @@ class MemoryScanner:
             if key not in self._hot_region_set:
                 self._hot_regions.append(key)
                 self._hot_region_set.add(key)
+
+    def _scan_one_region(
+        self,
+        base: int,
+        size: int,
+        needle_bytes: bytes,
+        needle_text: str,
+        encoding: str,
+        results: list[ScanResult],
+        seen_texts: set[str],
+        max_results: int,
+    ) -> None:
+        """Read one memory region and search for *needle_bytes*."""
+        data = w32.read_region(self._handle, base, size)
+        if data is None:
+            return
+        self._search_region_data(
+            data, base, size, needle_bytes, needle_text, encoding,
+            results, seen_texts, max_results,
+        )
+
+    def scan_any(
+        self,
+        needles: list[str],
+        *,
+        encodings: Sequence[str] | None = None,
+        max_results: int = 10,
+        max_region_bytes: int = _MAX_REGION_BYTES,
+    ) -> tuple[str, list[ScanResult]]:
+        """Return results for the first needle in *needles* that produces hits.
+
+        Reads each memory region **once** and searches for all needles
+        simultaneously, avoiding the redundant ``ReadProcessMemory`` calls that
+        sequential :meth:`scan` invocations would incur when multiple needles are
+        tried.
+
+        Parameters
+        ----------
+        needles:
+            Candidate substrings in priority order (highest priority first).
+            Produced by :func:`pick_needles`.
+        encodings:
+            Encoding priority list.  Defaults to learned encoding first, then
+            ``["utf-16-le", "utf-8", "shift-jis"]``.
+        max_results:
+            Stop collecting for a given needle after this many unique hits.
+        max_region_bytes:
+            Skip regions larger than this.
+
+        Returns
+        -------
+        tuple[str, list[ScanResult]]
+            ``(matched_needle, results)`` — empty string and empty list when
+            nothing is found.
+        """
+        if not needles:
+            return ("", [])
+        if not self._handle:
+            raise RuntimeError("MemoryScanner is closed")
+
+        enc_order = self._encoding_order(encodings)
+        all_regions = self._get_regions()
+
+        for enc in enc_order:
+            # Precompute encoded needle bytes, preserving caller's priority order.
+            encoded: list[tuple[str, bytes]] = []
+            for n in needles:
+                nb = _try_encode(n, enc)
+                if nb is not None:
+                    encoded.append((n, nb))
+            if not encoded:
+                continue
+
+            # Per-needle result accumulators.
+            per_results: dict[str, list[ScanResult]] = {n: [] for n, _ in encoded}
+            per_seen: dict[str, set[str]] = {n: set() for n, _ in encoded}
+
+            def _hit_all_needles(data: bytes, b: int, sz: int) -> None:
+                for nt, nb in encoded:
+                    rl = per_results[nt]
+                    if len(rl) < max_results:
+                        self._search_region_data(
+                            data, b, sz, nb, nt, enc, rl, per_seen[nt], max_results,
+                        )
+
+            # Phase 1: hot regions first.
+            for b, sz in self._hot_regions:
+                data = w32.read_region(self._handle, b, sz)
+                if data is not None:
+                    _hit_all_needles(data, b, sz)
+
+            # Return on the first (highest-priority) needle with hits.
+            for nt, _ in encoded:
+                if per_results[nt]:
+                    self._learned_encoding = enc
+                    return (nt, per_results[nt])
+
+            # Phase 2: remaining regions — single read per region for all needles.
+            for b, sz, _protect, _rtype in all_regions:
+                if (b, sz) in self._hot_region_set:
+                    continue
+                if sz > max_region_bytes:
+                    continue
+                data = w32.read_region(self._handle, b, sz)
+                if data is not None:
+                    _hit_all_needles(data, b, sz)
+
+            for nt, _ in encoded:
+                if per_results[nt]:
+                    self._learned_encoding = enc
+                    return (nt, per_results[nt])
+
+        return ("", [])
