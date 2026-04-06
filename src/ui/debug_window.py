@@ -1172,13 +1172,13 @@ class DebugWindow(QMainWindow):
                 break
         self._le_target_lang.setText(_cfg.translator_target_lang)
         # API key: show whichever is set
+        self._spn_context_window.setValue(_cfg.openai_context_window)
+        self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
         if backend == "openai":
             self._le_api_key.setText(_cfg.openai_api_key)
             self._le_model.setText(_cfg.openai_model)
             self._le_base_url.setText(_cfg.openai_base_url)
             self._te_system_prompt.setPlainText(_cfg.openai_system_prompt or DEFAULT_SYSTEM_PROMPT)
-            self._spn_context_window.setValue(_cfg.openai_context_window)
-            self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
         else:
             self._le_api_key.setText(_cfg.cloud_api_key)
 

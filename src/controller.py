@@ -238,6 +238,10 @@ class HoverController(QObject):
         self._settle_start: float = 0.0
         self._settled = False
 
+        # Last successfully detected region text — used to skip re-running
+        # the full pipeline when the cursor re-settles over the same text.
+        self._last_region_text: str = ""
+
         # Freeze mode state
         self._in_freeze = False
         self._freeze_frame: "PILImage | None" = None
@@ -347,6 +351,7 @@ class HoverController(QObject):
         self._freeze_frame = None
         self._settled = False
         self._settle_start = time.monotonic()
+        self._last_region_text = ""
 
     @Slot()
     def clear_caches(self) -> None:
@@ -355,6 +360,7 @@ class HoverController(QObject):
         self._phash_cache.clear()
         if self._text_cache is not None:
             self._text_cache.clear()
+        self._last_region_text = ""
         _log.info("Translation caches cleared.")
 
     # ------------------------------------------------------------------
@@ -451,7 +457,6 @@ class HoverController(QObject):
             return
 
         # ── Full pipeline ─────────────────────────────────────────────
-        self._emit_progress("正在识别文字\u2026")
         try:
             self._run_pipeline(img, img_x, img_y)
         except Exception as exc:
@@ -544,7 +549,6 @@ class HoverController(QObject):
             return
 
         t0 = time.monotonic()
-        self._emit_progress("正在识别文字\u2026")
 
         # ── Full OCR ─────────────────────────────────────────────────
         t = time.monotonic()
@@ -610,7 +614,18 @@ class HoverController(QObject):
             crop_rect[3] - crop_rect[1],
         ) if crop_rect else (0, 0, 0, 0)
 
-        # ── OCR text cache (fast path) ────────────────────────────
+        # ── Same region as last run ──────────────────────────────────────
+        # If region_text hasn’t changed since the last pipeline run, the cursor
+        # merely re-settled over the same text.  Go straight to the phash cache
+        # and emit silently — no progress indicator, no debug panel update.
+        if region_text == self._last_region_text:
+            cached = self._phash_cache.get(region_text)
+            if cached is not None:
+                wr = self._target.window_rect
+                self.translation_ready.emit(
+                    cached.translation, near_rect, (wr.left, wr.top),
+                )
+                return
         crop_img = img.crop(crop_rect) if crop_rect else None
         cached = self._phash_cache.get(region_text)
         if cached is not None:
@@ -725,7 +740,7 @@ class HoverController(QObject):
                 region_text, translation,
                 mem_text=mem_text, corrected_text=corrected_text,
             )
-
+            self._last_region_text = region_text
         # ── Emit results ─────────────────────────────────────────────
         self._emit_debug(
             img, t0,

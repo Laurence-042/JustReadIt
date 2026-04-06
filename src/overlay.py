@@ -35,7 +35,7 @@ from PySide6.QtCore import (
     QPoint, QRect, Qt, Signal, QTimer,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QFontMetrics, QImage, QPainter, QPixmap, QScreen,
+    QColor, QCursor, QFont, QFontMetrics, QImage, QPainter, QPixmap, QScreen,
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -202,8 +202,7 @@ class TranslationOverlay(Overlay):
             cx = round((ox_phys + rx + rw // 2) / dpr)
             cy = round((oy_phys + ry + rh + 8) / dpr)
         else:
-            app = QApplication.instance()
-            cursor_pos = app.cursorPos() if app is not None else QPoint(0, 0)  # type: ignore[union-attr]
+            cursor_pos = QCursor.pos()
             cx = cursor_pos.x()
             cy = cursor_pos.y() + 24
             screen = QApplication.screenAt(cursor_pos) or screen
@@ -264,8 +263,7 @@ class TranslationOverlay(Overlay):
             cx = round((ox_phys + rx + rw // 2) / dpr)
             cy = round((oy_phys + ry + rh + 8) / dpr)
         else:
-            app = QApplication.instance()
-            cursor_pos = app.cursorPos() if app is not None else QPoint(0, 0)  # type: ignore[union-attr]
+            cursor_pos = QCursor.pos()
             cx = cursor_pos.x()
             cy = cursor_pos.y() + 24
             screen = QApplication.screenAt(cursor_pos) or screen
