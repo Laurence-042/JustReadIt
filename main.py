@@ -3,10 +3,12 @@
 
 Usage::
 
-    python main.py          # open main window (pick window, translate, freeze)
+    python main.py           # compact user window (default)
+    python main.py --debug   # full pipeline debug window
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -25,6 +27,16 @@ def main() -> None:
         format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
     )
 
+    parser = argparse.ArgumentParser(
+        description="JustReadIt — hover-translation tool for Light.VN games",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Open the full pipeline debug window instead of the user window.",
+    )
+    args = parser.parse_args()
+
     try:
         from PySide6.QtWidgets import QApplication
     except ImportError:
@@ -39,8 +51,16 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("JustReadIt")
 
-    from src.ui.debug_window import DebugWindow
-    window = DebugWindow()
+    from src.app_backend import AppBackend
+    backend = AppBackend()
+
+    if args.debug:
+        from src.ui.debug_window import DebugWindow
+        window = DebugWindow(backend)
+    else:
+        from src.ui.main_window import MainWindow
+        window = MainWindow(backend)
+
     window.show()
     sys.exit(app.exec())
 

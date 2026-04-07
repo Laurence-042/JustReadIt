@@ -15,11 +15,13 @@ import ctypes
 import logging
 
 from PySide6.QtCore import (
-    QSize, QThread, QTimer,
-    Slot, Qt,
+    QSize, QTimer,
+    Signal, Slot, Qt,
 )
 
+from src.app_backend import AppBackend
 from src.config import AppConfig
+from src.knowledge import KnowledgeBase
 
 _cfg = AppConfig()
 _log = logging.getLogger(__name__)
@@ -38,16 +40,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from src.controller import HoverController, OcrOutput, PipelineResult, RangeOutput, StepResult
+from src.controller import OcrOutput, PipelineResult, RangeOutput, StepResult
 from src.target import GameTarget
 from src.ocr.windows_ocr import _ensure_apartment
 from src.ocr.range_detectors import BoundingBox
 from src.translators.base import PROVIDERS, PROVIDERS_BY_KEY, Translator
 from src.translators.factory import build_translator
 from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT, OPENAI_PRESETS
-from src.knowledge import KnowledgeBase
-from src.paths import knowledge_db_path
-from src.overlay import FreezeOverlay, TranslationOverlay
 from .window_picker import WindowPicker
 
 
@@ -507,9 +506,17 @@ class DebugWindow(QMainWindow):
     ------
     Left:  Capture preview (scaled, with bbox overlay).
     Right: Windows OCR · Detected Region · Memory Scan · Translation.
+
+    When opened from :class:`MainWindow`, caller passes *knowledge_base*,
+    *translator*, and *target* so that both windows share a single backend
+    instance and knowledge base.  Set *standalone=False* to prevent this
+    window from calling ``QApplication.quit()`` on close.
     """
 
-    def __init__(self) -> None:
+    #: Emitted just before the window closes, regardless of *standalone*.
+    closed = Signal()
+
+    def __init__(self, backend: AppBackend, *, standalone: bool = True) -> None:
         super().__init__()
         self.setWindowTitle("JustReadIt")
         self.resize(1400, 820)
@@ -518,13 +525,8 @@ class DebugWindow(QMainWindow):
         if primary is not None:
             self.move(primary.availableGeometry().center() - self.rect().center())
 
-        self._target: GameTarget | None = None
-        self._controller: HoverController | None = None
-        self._worker_thread: QThread | None = None
-        self._translator: Translator | None = None
-        # Shared knowledge base — persists across translator rebuilds.
-        self._knowledge_base: KnowledgeBase = KnowledgeBase.open(knowledge_db_path())
-
+        self._standalone = standalone
+        self._backend = backend
         self._picker: WindowPicker | None = None
 
         self._install_proc_handle: int | None = None
@@ -532,15 +534,28 @@ class DebugWindow(QMainWindow):
         self._install_timer.setInterval(500)
         self._install_timer.timeout.connect(self._poll_install)
 
-        # Overlays — translation popup + freeze screenshot.
-        self._translation_overlay = TranslationOverlay()
-        self._freeze_overlay = FreezeOverlay()
-        self._freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
-
         # -- state for debug dump --
         self._last_result: PipelineResult | None = None
 
         self._build_ui()
+
+        # Connect to backend signals — views own no backend resources.
+        self._backend.translation_ready.connect(self._on_translation)
+        self._backend.pipeline_debug.connect(self._on_result)
+        self._backend.pipeline_progress.connect(self._on_pipeline_progress)
+        self._backend.freeze_triggered.connect(self._on_freeze_triggered)
+        self._backend.dump_triggered.connect(self._on_dump_triggered)
+        self._backend.error.connect(self._on_error)
+        self._backend.ready.connect(self._on_worker_ready)
+        self._backend.freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
+
+        # Populate target label if backend already has a target.
+        if backend.target is not None:
+            t = backend.target
+            self._lbl_target.setText(
+                f"{t.process_name}  (PID {t.pid})"
+                f"  [{t.window_rect.width}\u00d7{t.window_rect.height}]"
+            )
 
     # ------------------------------------------------------------------
     # UI construction
@@ -823,9 +838,7 @@ class DebugWindow(QMainWindow):
     @Slot(bool)
     def _on_toggle_mem_scan(self, checked: bool) -> None:
         """Persist the memory-scan toggle and propagate to the running controller."""
-        _cfg.memory_scan_enabled = checked
-        if self._controller is not None:
-            self._controller.set_memory_scan_enabled(checked)
+        self._backend.set_memory_scan_enabled(checked)
 
     # ------------------------------------------------------------------
     # Language helpers
@@ -882,9 +895,9 @@ class DebugWindow(QMainWindow):
             except Exception as exc:
                 _log.warning("WinRT OCR language check failed for %r: %s", tag, exc)
 
-        if self._worker_thread is not None and self._worker_thread.isRunning():
+        if self._backend.is_running:
             self.statusBar().showMessage(
-                f"Restarting pipeline with lang={tag} …"
+                f"Restarting pipeline with lang={tag} \u2026"
             )
             self._run()
 
@@ -1006,8 +1019,6 @@ class DebugWindow(QMainWindow):
         self.statusBar().showMessage("Picking cancelled.", 3000)
 
     def _set_target(self, target: GameTarget) -> None:
-        self._stop()
-        self._target = target
         w = target.window_rect.width
         h = target.window_rect.height
         self._lbl_target.setText(
@@ -1018,82 +1029,36 @@ class DebugWindow(QMainWindow):
             f"  output_idx={target.dxcam_output_idx}",
             5000,
         )
-        self._run()
+        self._backend.set_target(target)
 
     # ------------------------------------------------------------------
     # Pipeline run / stop
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        if self._target is None:
+        if self._backend.target is None:
             self.statusBar().showMessage("Pick a window first.", 3000)
             return
-        self._stop()
-
+        # Write UI control values to config so backend.start() picks them up.
         lang = self._selected_language
-        target_lang = _cfg.translator_target_lang
         interval = self._spn_interval.value()
-        freeze_vk = self._cmb_freeze_key.currentData() or 0x78
-        dump_vk = self._cmb_dump_key.currentData() or 0x77
-
-        self._controller = HoverController(
-            self._target,
-            language_tag=lang,
-            translator=self._translator,
-            source_lang=lang,
-            target_lang=target_lang,
-            freeze_vk=freeze_vk,
-            dump_vk=dump_vk,
-            poll_ms=interval,
-            continuous=True,
-            ocr_max_long_edge=_cfg.ocr_max_size,
-            memory_scan_enabled=_cfg.memory_scan_enabled,
-        )
-        self._worker_thread = QThread(self)
-        self._controller.moveToThread(self._worker_thread)
-
-        # Controller → debug panels + overlays
-        self._controller.pipeline_debug.connect(self._on_result)
-        self._controller.translation_ready.connect(self._on_translation)
-        self._controller.pipeline_progress.connect(self._on_pipeline_progress)
-        self._controller.freeze_triggered.connect(self._on_freeze_triggered)
-        self._controller.dump_triggered.connect(self._on_dump_triggered)
-        self._controller.cursor_moved.connect(self._translation_overlay.hide)
-        self._controller.error.connect(self._on_error)
-        self._controller.ready.connect(self._on_worker_ready)
-
-        # Overlay → controller (freeze mode interaction)
-        self._freeze_overlay.hover_requested.connect(
-            self._controller.on_freeze_hover,
-        )
-        self._freeze_overlay.dismissed.connect(
-            self._controller.on_freeze_dismissed,
-        )
-
-        self._worker_thread.started.connect(self._controller.setup)
-        self._worker_thread.finished.connect(self._controller.teardown)
-
-        self._worker_thread.start()
+        _cfg.ocr_language = lang
+        _cfg.interval_ms = interval
+        _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
+        _cfg.dump_vk = self._cmb_dump_key.currentData() or 0x77
+        self._backend.start()
         self.statusBar().showMessage(
             f"Starting — lang={lang}  interval={interval} ms"
         )
 
     def _stop(self) -> None:
         self._act_clear_cache.setEnabled(False)
-        if self._worker_thread is not None:
-            self._worker_thread.quit()
-            if not self._worker_thread.wait(3000):
-                _log.warning("Worker thread did not stop in 3 s — terminating.")
-                self._worker_thread.terminate()
-                self._worker_thread.wait(1000)
-            self._worker_thread = None
-            self._controller = None
+        self._backend.stop()
 
     @Slot()
     def _on_clear_cache(self) -> None:
-        if self._controller is not None:
-            self._controller.clear_caches()
-            self.statusBar().showMessage("Translation caches cleared.", 3000)
+        self._backend.clear_caches()
+        self.statusBar().showMessage("Translation caches cleared.", 3000)
 
     @Slot()
     def _on_worker_ready(self) -> None:
@@ -1139,13 +1104,8 @@ class DebugWindow(QMainWindow):
         near_rect: object,
         screen_origin: object,
     ) -> None:
-        """Show a loading indicator in the appropriate overlay."""
-        if self._freeze_overlay.is_active:
-            self._freeze_overlay.show_translation(f"\u23f3 {step}")
-        elif near_rect is not None and screen_origin is not None:
-            self._translation_overlay.show_progress(step, near_rect, screen_origin)
-        else:
-            self._translation_overlay.show_progress(step, None, screen_origin or (0, 0))
+        """Show a loading indicator in the status bar."""
+        self.statusBar().showMessage(f"⏳ {step}")
 
     @Slot(str, object, object)
     def _on_translation(
@@ -1154,13 +1114,9 @@ class DebugWindow(QMainWindow):
         near_rect: object,
         screen_origin: object,
     ) -> None:
-        """Route translation to the appropriate overlay."""
-        if self._freeze_overlay.is_active:
-            self._freeze_overlay.show_translation(text)
-        elif near_rect is not None and screen_origin is not None:
-            self._translation_overlay.show_translation(
-                text, near_rect, screen_origin,
-            )
+        """Update translation panel (overlay is handled by AppBackend)."""
+        if self._te_tl is not None:
+            self._te_tl.setPlainText(text)
 
     @Slot(object, int, int, int, int)
     def _on_freeze_triggered(
@@ -1171,10 +1127,7 @@ class DebugWindow(QMainWindow):
         pid: int,
         hwnd: int,
     ) -> None:
-        """Enter freeze mode when the controller detects the hotkey."""
-        self._freeze_overlay.freeze(
-            screenshot, window_left, window_top, pid, hwnd,
-        )
+        """Update status bar when freeze mode starts (overlay handled by AppBackend)."""
         freeze_key = self._cmb_freeze_key.currentText()
         self.statusBar().showMessage(f"❄ Freeze — 右键/Esc 退出  ({freeze_key} 再次切换)")
 
@@ -1188,28 +1141,14 @@ class DebugWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        # Disconnect freeze_dismissed first so _on_freeze_dismissed cannot restart
-        # timers after we've already stopped everything.
-        try:
-            self._freeze_overlay.dismissed.disconnect(self._on_freeze_dismissed)
-        except RuntimeError:
-            pass
-        # Stop all timers and the worker thread.
-        self._stop()
         # Persist toolbar settings.
         _cfg.interval_ms = self._spn_interval.value()
         _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
         _cfg.dump_vk = self._cmb_dump_key.currentData() or 0x77
-        # Close overlays and knowledge base.
-        self._translation_overlay.close()
-        self._freeze_overlay.close()
-        try:
-            self._knowledge_base.close()
-        except Exception:
-            pass
+        self.closed.emit()
         super().closeEvent(event)
-        # Ensure the process exits even if dangling threads/resources remain.
-        QApplication.instance().quit()  # type: ignore[union-attr]
+        if self._standalone:
+            QApplication.instance().quit()  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -1221,18 +1160,14 @@ class DebugWindow(QMainWindow):
         """Update the live freeze hotkey VK code and persist it."""
         vk = self._cmb_freeze_key.itemData(index)
         if vk is not None:
-            _cfg.freeze_vk = vk
-            if self._controller is not None:
-                self._controller.set_freeze_vk(vk)
+            self._backend.set_freeze_vk(vk)
 
     @Slot(int)
     def _on_dump_key_changed(self, index: int) -> None:
         """Update the live dump hotkey VK code and persist it."""
         vk = self._cmb_dump_key.itemData(index)
         if vk is not None:
-            _cfg.dump_vk = vk
-            if self._controller is not None:
-                self._controller.set_dump_vk(vk)
+            self._backend.set_dump_vk(vk)
 
     @Slot()
     def _on_dump_triggered(self) -> None:
@@ -1277,8 +1212,7 @@ class DebugWindow(QMainWindow):
     @Slot(int)
     def _on_interval_changed(self, ms: int) -> None:
         """Push the new poll interval to the running controller."""
-        if self._controller is not None:
-            self._controller.set_poll_interval(ms)
+        self._backend.set_poll_interval(ms)
 
     # ------------------------------------------------------------------
     # Knowledge Manager
@@ -1287,7 +1221,7 @@ class DebugWindow(QMainWindow):
     @Slot()
     def _on_open_knowledge_manager(self) -> None:
         """Open the Knowledge Manager dialog."""
-        dlg = _KnowledgeManagerDialog(self._knowledge_base, parent=self)
+        dlg = _KnowledgeManagerDialog(self._backend.knowledge_base, parent=self)
         dlg.exec()
 
 
@@ -1452,8 +1386,13 @@ class DebugWindow(QMainWindow):
 
         self._restore_translator_settings()
         self._on_backend_changed(self._cmb_backend.currentIndex())
-        # Auto-build translator from saved config (non-blocking: errors shown in label)
-        if _cfg.translator_backend not in ("none", ""):
+        # Show status if backend already has a translator; otherwise try build.
+        if self._backend.translator is not None:
+            self._lbl_tl_status.setText(
+                f"\u2713 {_cfg.translator_backend.title()} translator ready"
+                f"  \u2192  {_cfg.translator_target_lang}"
+            )
+        elif _cfg.translator_backend not in ("none", ""):
             self._build_translator_from_config()
         return grp
 
@@ -1537,43 +1476,44 @@ class DebugWindow(QMainWindow):
             _cfg.openai_disable_thinking = self._chk_disable_thinking.isChecked()
 
         if backend == "none":
-            self._translator = None
+            self._backend.set_translator(None)
             self._lbl_tl_status.setText("Translator disabled.")
-            self._restart_worker_with_translator()
             return
 
         self._build_translator_from_config()
-        self._restart_worker_with_translator()
 
     def _build_translator_from_config(self) -> None:
-        """(Re-)build ``self._translator`` from current config.  Updates status label."""
-        backend = _cfg.translator_backend
+        """Build the translator from current config, showing progress in the UI.
+
+        Updates :class:`AppBackend` via :meth:`~AppBackend.set_translator`.
+        """
+        backend_key = _cfg.translator_backend
         target_lang = _cfg.translator_target_lang or "en"
         self._lbl_tl_status.setText("Building translator\u2026")
         QApplication.processEvents()
         try:
-            self._translator = build_translator(
+            translator = build_translator(
                 _cfg,
-                knowledge_base=self._knowledge_base,
+                knowledge_base=self._backend.knowledge_base,
                 progress=lambda msg: (
                     self._lbl_tl_status.setText(msg),
                     QApplication.processEvents(),
                 ),
             )
-            if self._translator is not None:
+            self._backend.set_translator(translator)
+            if translator is not None:
                 self._lbl_tl_status.setText(
-                    f"\u2713 {backend.title()} translator ready  \u2192  {target_lang}"
+                    f"\u2713 {backend_key.title()} translator ready  \u2192  {target_lang}"
                 )
             else:
                 self._lbl_tl_status.setText("Translator disabled.")
         except RuntimeError as exc:
-            self._translator = None
+            self._backend.set_translator(None)
             self._lbl_tl_status.setText(f"\u26a0 {exc}")
 
     def _restart_worker_with_translator(self) -> None:
-        """Push the new translator to the running controller."""
-        if self._controller is not None:
-            self._controller.set_translator(self._translator)
+        """No-op: translator is now propagated via AppBackend.set_translator."""
+        pass  # kept for any legacy callers
 
     def _build_translator_from_ui(self) -> "Translator | None":
         """Instantiate a translator from current UI fields without persisting to config."""
@@ -1599,8 +1539,9 @@ class DebugWindow(QMainWindow):
                 system_prompt=self._te_system_prompt.toPlainText().strip(),
                 context_window=self._spn_context_window.value(),
                 base_url=self._le_base_url.text().strip() or None,
-                knowledge_base=self._knowledge_base,
+                knowledge_base=self._backend.knowledge_base,
                 tools_enabled=self._chk_tools_enabled.isChecked(),
+                disable_thinking=self._chk_disable_thinking.isChecked(),
                 progress=progress,
             )
         raise RuntimeError(f"Unknown backend: {backend!r}")

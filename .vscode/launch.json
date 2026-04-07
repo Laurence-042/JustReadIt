@@ -2,6 +2,32 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Main Window",
+            "type": "debugpy",
+            "request": "launch",
+            "preLaunchTask": "Build mem_scan.dll",
+            "program": "${workspaceFolder}/main.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Main Window (no debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "noDebug": true,
+            "preLaunchTask": "Build mem_scan.dll",
+            "program": "${workspaceFolder}/main.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
             "name": "Debug UI",
             "type": "debugpy",
             "request": "launch",
