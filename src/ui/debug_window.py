@@ -1023,6 +1023,7 @@ class DebugWindow(QMainWindow):
             dump_vk=dump_vk,
             poll_ms=interval,
             continuous=True,
+            ocr_max_long_edge=_cfg.ocr_max_size,
         )
         self._worker_thread = QThread(self)
         self._controller.moveToThread(self._worker_thread)

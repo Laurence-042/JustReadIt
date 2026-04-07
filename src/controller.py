@@ -218,6 +218,7 @@ class HoverController(QObject):
         dump_vk: int = 0x77,    # VK_F8
         poll_ms: int = _POLL_MS,
         continuous: bool = False,
+        ocr_max_long_edge: int = 1920,
     ) -> None:
         super().__init__()
         self._target = target
@@ -229,6 +230,7 @@ class HoverController(QObject):
         self._dump_vk = dump_vk
         self._poll_ms = poll_ms
         self._continuous = continuous
+        self._ocr_max_long_edge = ocr_max_long_edge
 
         # Resources — created in setup() on the worker thread
         self._capturer: Capturer | None = None
@@ -273,7 +275,10 @@ class HoverController(QObject):
             return
 
         try:
-            self._ocr = WindowsOcr(self._language_tag)
+            self._ocr = WindowsOcr(
+                self._language_tag,
+                max_ocr_long_edge=self._ocr_max_long_edge,
+            )
         except MissingOcrLanguageError as exc:
             self.error.emit(str(exc))
         except Exception as exc:

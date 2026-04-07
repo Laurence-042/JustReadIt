@@ -49,6 +49,26 @@ class AppConfig:
         s.setValue("ocr/language", value)
         s.sync()
 
+    @property
+    def ocr_max_size(self) -> int:
+        """Maximum long-edge (px) of the image fed to Windows OCR.
+
+        Acts as a soft cap: the effective scale is
+        ``min(upscale_factor, ocr_max_size / max_dim)``.
+        Small probe crops (< ocr_max_size/2 px) still receive the full
+        upscale boost; full-resolution captures are downsampled to this
+        limit, which dramatically reduces OCR latency on high-DPI screens.
+
+        Default 1920 — leaves 1080p frames untouched and halves 4K frames.
+        """
+        return int(_make_qsettings().value("ocr/max_size", 1920))
+
+    @ocr_max_size.setter
+    def ocr_max_size(self, value: int) -> None:
+        s = _make_qsettings()
+        s.setValue("ocr/max_size", value)
+        s.sync()
+
     # ── Pipeline ───────────────────────────────────────────────────────
 
     @property

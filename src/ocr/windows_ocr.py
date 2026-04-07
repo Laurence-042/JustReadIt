@@ -159,7 +159,12 @@ class WindowsOcr:
             print(box.text, box.x, box.y, box.w, box.h)
     """
 
-    def __init__(self, language_tag: str = "ja", upscale_factor: float = 2.0) -> None:
+    def __init__(
+        self,
+        language_tag: str = "ja",
+        upscale_factor: float = 2.0,
+        max_ocr_long_edge: int = 1920,
+    ) -> None:
         try:
             self._engine: wocr.OcrEngine = _create_engine(language_tag)
         except MissingOcrLanguageError:
@@ -167,10 +172,19 @@ class WindowsOcr:
         # Windows OCR maximum image dimension is 4096 px.  Clamp the factor so
         # we don't exceed it even on large captures.
         self._upscale_factor = upscale_factor
+        # Soft cap on the OCR input dimension.  Upscaling a full-resolution
+        # capture (1080p → 3840×2160 at 2×, or raw 4K) feeds millions of
+        # unnecessary pixels to the OCR kernel and causes huge latency.
+        # With this cap the scale becomes min(upscale_factor, cap/max_dim):
+        #   • Small probe crops (≤960 px wide) still receive the full 2× boost.
+        #   • 1080p full frames are passed as-is (scale=1.0).
+        #   • 4K full frames are halved to 1920×1080 (scale=0.5).
+        self._max_ocr_long_edge = max_ocr_long_edge
         _log.info(
-            "Windows OCR engine ready (language: %s, upscale: %.1f×)",
+            "Windows OCR engine ready (language: %s, upscale: %.1f×, max_edge: %d px)",
             self._engine.recognizer_language.language_tag,
             self._upscale_factor,
+            self._max_ocr_long_edge,
         )
 
     @property
@@ -203,9 +217,19 @@ class WindowsOcr:
             recognised word; line_boxes has one entry per OCR line, with
             the line text joined by spaces.  Both are in reading order.
         """
-        # Compute effective scale — clamp so neither dimension exceeds 4096 px.
+        # Compute effective scale:
+        #   • never exceed the Windows OCR hard limit of 4096 px;
+        #   • never exceed max_ocr_long_edge (our soft cap for speed);
+        #   • upscale_factor still applies unchanged for small crops.
         max_dim = max(image.width, image.height)
-        scale = min(self._upscale_factor, 4096 / max_dim) if max_dim > 0 else 1.0
+        if max_dim > 0:
+            scale = min(
+                self._upscale_factor,
+                4096 / max_dim,
+                self._max_ocr_long_edge / max_dim,
+            )
+        else:
+            scale = 1.0
 
         if scale != 1.0:
             new_w = max(1, int(image.width  * scale))
@@ -248,7 +272,14 @@ class WindowsOcr:
     def recognise_text(self, image: Image.Image) -> str:
         """Return the full recognised text string (no bounding boxes)."""
         max_dim = max(image.width, image.height)
-        scale = min(self._upscale_factor, 4096 / max_dim) if max_dim > 0 else 1.0
+        if max_dim > 0:
+            scale = min(
+                self._upscale_factor,
+                4096 / max_dim,
+                self._max_ocr_long_edge / max_dim,
+            )
+        else:
+            scale = 1.0
         if scale != 1.0:
             image = image.resize(
                 (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
