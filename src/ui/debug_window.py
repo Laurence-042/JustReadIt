@@ -44,9 +44,7 @@ from src.controller import OcrOutput, PipelineResult, RangeOutput, StepResult
 from src.target import GameTarget
 from src.ocr.windows_ocr import _ensure_apartment
 from src.ocr.range_detectors import BoundingBox
-from src.translators.base import PROVIDERS, PROVIDERS_BY_KEY, Translator
-from src.translators.factory import build_translator
-from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT, OPENAI_PRESETS
+from ._translator_settings import TranslatorSettingsWidget
 from .window_picker import WindowPicker
 
 
@@ -456,6 +454,14 @@ class _StepPanel(QWidget):
         self.te = QTextEdit()
         self.te.setReadOnly(True)
         self.te.setFont(QFont("Consolas", 9))
+        self.te.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.te.setStyleSheet(
+            "QScrollBar:vertical { background: #252525; width: 6px; border-radius: 3px; }"
+            "QScrollBar::handle:vertical { background: #4a4a4a; min-height: 20px;"
+            " border-radius: 3px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }"
+        )
         frame_lay.addWidget(self.te, 1)
 
         outer.addWidget(frame, 1)
@@ -793,10 +799,10 @@ class DebugWindow(QMainWindow):
         right.addWidget(self._panel_corr)
         right.addWidget(self._build_translator_settings_panel())
         right.addWidget(self._panel_tl)
-        right.setSizes([220, 120, 100, 140, 180, 100])
+        right.setSizes([80, 120, 100, 140, 280, 140])
 
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
 
         # ── Status bar ─────────────────────────────────────────────────
         self.setStatusBar(QStatusBar(self))
@@ -1230,344 +1236,16 @@ class DebugWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_translator_settings_panel(self) -> QWidget:
-        """Build the collapsible translator configuration group box."""
+        """Translator configuration panel backed by the shared widget."""
         grp = QGroupBox("Translation Settings")
         lay = QVBoxLayout(grp)
         lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(4)
-
-        # Row 1: backend + target lang
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Backend:"))
-        self._cmb_backend = QComboBox()
-        self._cmb_backend.addItem("\u2014 None \u2014", userData="none")
-        for p in PROVIDERS:
-            self._cmb_backend.addItem(p.display_name, userData=p.key)
-        row1.addWidget(self._cmb_backend)
-        row1.addSpacing(12)
-        row1.addWidget(QLabel("Target lang:"))
-        self._le_target_lang = QLineEdit()
-        self._le_target_lang.setMaximumWidth(70)
-        self._le_target_lang.setPlaceholderText("en")
-        row1.addWidget(self._le_target_lang)
-        row1.addStretch()
-        lay.addLayout(row1)
-
-        # Row 2: API key (used by both backends)
-        self._row_api_key = QWidget()
-        r2 = QHBoxLayout(self._row_api_key)
-        r2.setContentsMargins(0, 0, 0, 0)
-        r2.addWidget(QLabel("API Key:"))
-        self._le_api_key = QLineEdit()
-        self._le_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._le_api_key.setPlaceholderText("Paste API key here  (local models: leave blank)")
-        r2.addWidget(self._le_api_key)
-        lay.addWidget(self._row_api_key)
-
-        # Rows 3-4: OpenAI-only fields
-        self._openai_fields = QWidget()
-        of_lay = QVBoxLayout(self._openai_fields)
-        of_lay.setContentsMargins(0, 0, 0, 0)
-        of_lay.setSpacing(4)
-
-        # Preset row: quick-fill button
-        row_preset = QHBoxLayout()
-        row_preset.addWidget(QLabel("快速预设:"))
-        self._cmb_preset = QComboBox()
-        self._cmb_preset.addItem("— 选择预设自动填充—", userData=None)
-        for _p in OPENAI_PRESETS:
-            self._cmb_preset.addItem(_p.label, userData=_p)
-        self._cmb_preset.setToolTip(
-            "选择后自动填充下方相应参数（不会立即保存，仍需点击 Apply）"
+        lay.setSpacing(0)
+        self._tl_settings = TranslatorSettingsWidget(
+            self._backend,
+            show_buttons=True,
+            auto_build=True,
+            parent=grp,
         )
-        row_preset.addWidget(self._cmb_preset, 1)
-        of_lay.addLayout(row_preset)
-
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("Model:"))
-        self._le_model = QLineEdit()
-        self._le_model.setPlaceholderText("gpt-4o-mini")
-        self._le_model.setMaximumWidth(160)
-        row3.addWidget(self._le_model)
-        row3.addSpacing(12)
-        row3.addWidget(QLabel("Base URL:"))
-        self._le_base_url = QLineEdit()
-        self._le_base_url.setPlaceholderText(
-            "https://api.openai.com/v1  (leave blank for default)"
-        )
-        row3.addWidget(self._le_base_url)
-        of_lay.addLayout(row3)
-
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("System Prompt:"))
-        prompt_col = QVBoxLayout()
-        self._te_system_prompt = QTextEdit()
-        self._te_system_prompt.setPlaceholderText(
-            "Supports {source_lang} and {target_lang} placeholders."
-        )
-        self._te_system_prompt.setFixedHeight(72)
-        self._btn_reset_prompt = QPushButton("Reset to default")
-        self._btn_reset_prompt.setToolTip(
-            "Restore the built-in default system prompt template."
-        )
-        self._btn_reset_prompt.setFlat(True)
-        self._btn_reset_prompt.clicked.connect(self._on_reset_system_prompt)
-        prompt_col.addWidget(self._te_system_prompt)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_row.addWidget(self._btn_reset_prompt)
-        prompt_col.addLayout(btn_row)
-        row4.addLayout(prompt_col)
-        of_lay.addLayout(row4)
-
-        row_ctx = QHBoxLayout()
-        row_ctx.addWidget(QLabel("Context window:"))
-        self._spn_context_window = QSpinBox()
-        self._spn_context_window.setRange(0, 100)
-        self._spn_context_window.setToolTip(
-            "Number of recent translation pairs included as context"
-        )
-        self._spn_context_window.setMaximumWidth(80)
-        row_ctx.addWidget(self._spn_context_window)
-        row_ctx.addSpacing(12)
-        row_ctx.addWidget(QLabel("Summary trigger:"))
-        self._spn_summary_trigger = QSpinBox()
-        self._spn_summary_trigger.setRange(0, 200)
-        self._spn_summary_trigger.setToolTip(
-            "History length that triggers summarisation of the oldest chunk"
-        )
-        self._spn_summary_trigger.setMaximumWidth(80)
-        row_ctx.addWidget(self._spn_summary_trigger)
-        row_ctx.addSpacing(16)
-        self._chk_tools_enabled = QCheckBox("启用 KB 工具调用")
-        self._chk_tools_enabled.setToolTip(
-            "允许模型通过 function calling 读写知识库。\n"
-            "对于小模型（如 Qwen-7B、Gemma 等）建议关闭，\n"
-            "避免复杂 tool prompt 引起注意力消耗和格式混乱。"
-        )
-        self._chk_tools_enabled.setChecked(True)
-        row_ctx.addWidget(self._chk_tools_enabled)
-        row_ctx.addSpacing(16)
-        self._chk_disable_thinking = QCheckBox("禁止 thinking")
-        self._chk_disable_thinking.setToolTip(
-            "预填空 <think></think> 强制跳过推理阶段。\n"
-            "仅适用于 Ollama/LM Studio 上运行的思维链模型\n"
-            "（DeepSeek-R1-Distill、QwQ 等）。\n"
-            "请勿对 OpenAI 官方 API 启用，会导致 API 报错。"
-        )
-        self._chk_disable_thinking.setChecked(True)
-        row_ctx.addWidget(self._chk_disable_thinking)
-        row_ctx.addStretch()
-        of_lay.addLayout(row_ctx)
-
-        lay.addWidget(self._openai_fields)
-
-        # Row 5: Apply / Test + status
-        row5 = QHBoxLayout()
-        self._btn_apply_tl = QPushButton("Apply")
-        self._btn_apply_tl.setToolTip(
-            "Save settings and (re-)initialise the translator.\n"
-            "Missing packages are installed automatically."
-        )
-        self._btn_test_tl = QPushButton("Test")
-        self._btn_test_tl.setToolTip("Send a short test string to verify the translator is working.")
-        self._lbl_tl_status = QLabel("")
-        self._lbl_tl_status.setWordWrap(True)
-        row5.addWidget(self._btn_apply_tl)
-        row5.addWidget(self._btn_test_tl)
-        row5.addWidget(self._lbl_tl_status, 1)
-        lay.addLayout(row5)
-
-        # Wire up
-        self._cmb_backend.currentIndexChanged.connect(self._on_backend_changed)
-        self._btn_apply_tl.clicked.connect(self._on_apply_translator)
-        self._btn_test_tl.clicked.connect(self._on_test_translator)
-        self._cmb_preset.currentIndexChanged.connect(self._on_preset_selected)
-
-        self._restore_translator_settings()
-        self._on_backend_changed(self._cmb_backend.currentIndex())
-        # Show status if backend already has a translator; otherwise try build.
-        if self._backend.translator is not None:
-            self._lbl_tl_status.setText(
-                f"\u2713 {_cfg.translator_backend.title()} translator ready"
-                f"  \u2192  {_cfg.translator_target_lang}"
-            )
-        elif _cfg.translator_backend not in ("none", ""):
-            self._build_translator_from_config()
+        lay.addWidget(self._tl_settings)
         return grp
-
-    def _restore_translator_settings(self) -> None:
-        """Populate translator settings widgets from persisted config."""
-        backend = _cfg.translator_backend
-        for i in range(self._cmb_backend.count()):
-            if self._cmb_backend.itemData(i) == backend:
-                self._cmb_backend.setCurrentIndex(i)
-                break
-        self._le_target_lang.setText(_cfg.translator_target_lang)
-        # API key: show whichever is set
-        self._spn_context_window.setValue(_cfg.openai_context_window)
-        self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
-        self._chk_tools_enabled.setChecked(_cfg.openai_tools_enabled)
-        self._chk_disable_thinking.setChecked(_cfg.openai_disable_thinking)
-        if backend == "openai":
-            self._le_api_key.setText(_cfg.openai_api_key)
-            self._le_model.setText(_cfg.openai_model)
-            self._le_base_url.setText(_cfg.openai_base_url)
-            self._te_system_prompt.setPlainText(_cfg.openai_system_prompt or DEFAULT_SYSTEM_PROMPT)
-        else:
-            self._le_api_key.setText(_cfg.cloud_api_key)
-
-    @Slot(int)
-    def _on_backend_changed(self, index: int) -> None:
-        """Show/hide backend-specific fields based on the selected backend."""
-        backend = self._cmb_backend.itemData(index) or "none"
-        info = PROVIDERS_BY_KEY.get(backend)
-        self._row_api_key.setVisible(bool(info and info.needs_api_key))
-        self._openai_fields.setVisible(backend == "openai")
-        # Repopulate API key field with the relevant stored value
-        if backend == "openai":
-            self._le_api_key.setText(_cfg.openai_api_key)
-        elif backend == "cloud":
-            self._le_api_key.setText(_cfg.cloud_api_key)
-
-    @Slot()
-    def _on_reset_system_prompt(self) -> None:
-        """Restore the built-in default system prompt template."""
-        self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
-
-    @Slot(int)
-    def _on_preset_selected(self, index: int) -> None:
-        """Apply the selected preset to the OpenAI fields (no save)."""
-        preset = self._cmb_preset.itemData(index)
-        if preset is None:
-            return  # placeholder item
-        self._le_model.setPlaceholderText(preset.model_placeholder)
-        self._le_base_url.setPlaceholderText(preset.base_url_placeholder)
-        self._chk_tools_enabled.setChecked(preset.tools_enabled)
-        self._chk_disable_thinking.setChecked(preset.disable_thinking)
-        self._spn_context_window.setValue(preset.context_window)
-        self._spn_summary_trigger.setValue(preset.summary_trigger)
-        self._te_system_prompt.setPlainText(preset.system_prompt)
-        # Reset the combo back to placeholder so re-selecting same preset works
-        self._cmb_preset.blockSignals(True)
-        self._cmb_preset.setCurrentIndex(0)
-        self._cmb_preset.blockSignals(False)
-
-    @Slot()
-    def _on_apply_translator(self) -> None:
-        """Persist settings and (re-)build the translator.  Auto-installs deps."""
-        backend = self._cmb_backend.currentData() or "none"
-        target_lang = self._le_target_lang.text().strip() or "en"
-        api_key = self._le_api_key.text().strip()
-
-        # Persist ALL fields first, regardless of backend
-        _cfg.translator_backend = backend
-        _cfg.translator_target_lang = target_lang
-        if backend == "cloud":
-            _cfg.cloud_api_key = api_key
-        elif backend == "openai":
-            _cfg.openai_api_key = api_key
-            _cfg.openai_model = self._le_model.text().strip() or "gpt-4o-mini"
-            _cfg.openai_base_url = self._le_base_url.text().strip()
-            _cfg.openai_system_prompt = self._te_system_prompt.toPlainText().strip()
-            _cfg.openai_context_window = self._spn_context_window.value()
-            _cfg.openai_summary_trigger = self._spn_summary_trigger.value()
-            _cfg.openai_tools_enabled = self._chk_tools_enabled.isChecked()
-            _cfg.openai_disable_thinking = self._chk_disable_thinking.isChecked()
-
-        if backend == "none":
-            self._backend.set_translator(None)
-            self._lbl_tl_status.setText("Translator disabled.")
-            return
-
-        self._build_translator_from_config()
-
-    def _build_translator_from_config(self) -> None:
-        """Build the translator from current config, showing progress in the UI.
-
-        Updates :class:`AppBackend` via :meth:`~AppBackend.set_translator`.
-        """
-        backend_key = _cfg.translator_backend
-        target_lang = _cfg.translator_target_lang or "en"
-        self._lbl_tl_status.setText("Building translator\u2026")
-        QApplication.processEvents()
-        try:
-            translator = build_translator(
-                _cfg,
-                knowledge_base=self._backend.knowledge_base,
-                progress=lambda msg: (
-                    self._lbl_tl_status.setText(msg),
-                    QApplication.processEvents(),
-                ),
-            )
-            self._backend.set_translator(translator)
-            if translator is not None:
-                self._lbl_tl_status.setText(
-                    f"\u2713 {backend_key.title()} translator ready  \u2192  {target_lang}"
-                )
-            else:
-                self._lbl_tl_status.setText("Translator disabled.")
-        except RuntimeError as exc:
-            self._backend.set_translator(None)
-            self._lbl_tl_status.setText(f"\u26a0 {exc}")
-
-    def _restart_worker_with_translator(self) -> None:
-        """No-op: translator is now propagated via AppBackend.set_translator."""
-        pass  # kept for any legacy callers
-
-    def _build_translator_from_ui(self) -> "Translator | None":
-        """Instantiate a translator from current UI fields without persisting to config."""
-        backend = self._cmb_backend.currentData() or "none"
-        if backend in ("none", ""):
-            return None
-        progress = lambda msg: (  # noqa: E731
-            self._lbl_tl_status.setText(msg),
-            QApplication.processEvents(),
-        )
-        api_key = self._le_api_key.text().strip()
-        if backend == "cloud":
-            from src.translators.cloud_translation import CloudTranslationTranslator
-            return CloudTranslationTranslator(api_key=api_key or None, progress=progress)
-        if backend == "google_free":
-            from src.translators.google_free import GoogleFreeTranslator
-            return GoogleFreeTranslator(progress=progress)
-        if backend == "openai":
-            from src.translators.openai_translator import OpenAICompatTranslator
-            return OpenAICompatTranslator(
-                api_key=api_key,
-                model=self._le_model.text().strip() or "gpt-4o-mini",
-                system_prompt=self._te_system_prompt.toPlainText().strip(),
-                context_window=self._spn_context_window.value(),
-                base_url=self._le_base_url.text().strip() or None,
-                knowledge_base=self._backend.knowledge_base,
-                tools_enabled=self._chk_tools_enabled.isChecked(),
-                disable_thinking=self._chk_disable_thinking.isChecked(),
-                progress=progress,
-            )
-        raise RuntimeError(f"Unknown backend: {backend!r}")
-
-    @Slot()
-    def _on_test_translator(self) -> None:
-        """Build a temporary translator from current UI fields and run a test translation.
-
-        Does *not* persist settings or replace the active translator — use Apply for that.
-        """
-        target_lang = self._le_target_lang.text().strip() or "en"
-        self._lbl_tl_status.setText("Building\u2026")
-        QApplication.processEvents()
-        try:
-            translator = self._build_translator_from_ui()
-        except RuntimeError as exc:
-            self._lbl_tl_status.setText(f"\u26a0 {exc}")
-            return
-        if translator is None:
-            self._lbl_tl_status.setText("No backend selected.")
-            return
-        test_src = "\u3053\u3093\u306b\u3061\u306f\u3001\u4e16\u754c\uff01"  # "こんにちは、世界！"
-        self._lbl_tl_status.setText("Testing\u2026")
-        QApplication.processEvents()
-        try:
-            result = translator.translate(test_src, target_lang=target_lang)
-            self._lbl_tl_status.setText(f"Test \u2713  {test_src!r} \u2192 {result!r}")
-        except Exception as exc:
-            self._lbl_tl_status.setText(f"Test failed: {exc}")
