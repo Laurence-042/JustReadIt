@@ -41,8 +41,16 @@ _DEEP_TRANSLATOR_LANG: dict[str, str] = {
 
 
 def _to_deep_translator_lang(bcp47: str) -> str:
-    """Map a canonical BCP-47 tag to the code deep-translator accepts."""
-    return _DEEP_TRANSLATOR_LANG.get(bcp47, bcp47)
+    """Map a canonical BCP-47 tag to the code deep-translator accepts.
+
+    Falls back to the bare ISO 639-1 subtag when the full BCP-47 tag
+    (e.g. ``"en-US"``) is not in deep-translator's supported language set.
+    """
+    if bcp47 in _DEEP_TRANSLATOR_LANG:
+        return _DEEP_TRANSLATOR_LANG[bcp47]
+    # Strip region / script subtag: "en-US" → "en", "zh-CN" is kept above.
+    bare = bcp47.split("-")[0].lower()
+    return bare if bare != bcp47.lower() else bcp47
 
 
 class GoogleFreeTranslator(Translator):
@@ -91,7 +99,7 @@ class GoogleFreeTranslator(Translator):
         if not text.strip():
             return text
 
-        src = source_lang if source_lang else "auto"
+        src = _to_deep_translator_lang(source_lang) if source_lang else "auto"
         tgt = _to_deep_translator_lang(target_lang)
         try:
             result: str = self._gt_cls(source=src, target=tgt).translate(text)

@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
     QTabWidget, QTextEdit, QToolBar, QToolButton,
+    QScrollArea,
     QVBoxLayout, QWidget,
 )
 
@@ -703,6 +704,19 @@ class DebugWindow(QMainWindow):
                     self._chk_labels, self._chk_region):
             chk.setChecked(True)
             toggle_row.addWidget(chk)
+
+        toggle_row.addWidget(_vsep := QFrame())
+        _vsep.setFrameShape(QFrame.Shape.VLine)
+        _vsep.setFrameShadow(QFrame.Shadow.Sunken)
+        _vsep.setFixedWidth(2)
+
+        self._chk_mem_scan = QCheckBox("内存扫描")
+        self._chk_mem_scan.setChecked(_cfg.memory_scan_enabled)
+        self._chk_mem_scan.setToolTip(
+            "启用 ReadProcessMemory 内存扫描（提升文本精度，但会增加内存占用）\n"
+            "内存较大的游戏建议关闭以使用纯 OCR 模式"
+        )
+        toggle_row.addWidget(self._chk_mem_scan)
         toggle_row.addStretch()
 
         left_lay.addLayout(toggle_row)
@@ -716,12 +730,19 @@ class DebugWindow(QMainWindow):
         self._chk_boxes.toggled.connect(self._on_toggle_boxes)
         self._chk_labels.toggled.connect(self._on_toggle_labels)
         self._chk_region.toggled.connect(self._on_toggle_region)
+        self._chk_mem_scan.toggled.connect(self._on_toggle_mem_scan)
 
         splitter.addWidget(left)
 
-        # -- Right column: text panels --
+        # -- Right column: text panels (in a scroll area for small screens) --
         right = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(right)
+        right.setMinimumHeight(860)  # 220+120+100+140+180+100 = 860; scroll below this
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
 
         self._panel_wocr   = _StepPanel("Windows OCR",          (80,  160, 255))
         self._panel_region = _StepPanel("Detected Region",       (80,  210, 120))
@@ -799,6 +820,13 @@ class DebugWindow(QMainWindow):
         self._preview.show_region = checked
         self._preview._render()
 
+    @Slot(bool)
+    def _on_toggle_mem_scan(self, checked: bool) -> None:
+        """Persist the memory-scan toggle and propagate to the running controller."""
+        _cfg.memory_scan_enabled = checked
+        if self._controller is not None:
+            self._controller.set_memory_scan_enabled(checked)
+
     # ------------------------------------------------------------------
     # Language helpers
     # ------------------------------------------------------------------
@@ -807,27 +835,22 @@ class DebugWindow(QMainWindow):
         """Fill lang combo with available Windows OCR languages."""
         try:
             import winrt.windows.media.ocr as wocr
-            import winrt.windows.globalization as glob
             _ensure_apartment()
 
             installed_tags: set[str] = set()
             for lang in wocr.OcrEngine.available_recognizer_languages:
                 tag = lang.language_tag
                 installed_tags.add(tag)
-                self._cmb_lang.addItem(
-                    f"{tag}  ({lang.display_name})", userData=tag
-                )
+                self._cmb_lang.addItem(tag, userData=tag)
 
             for tag, capability in _LANG_CAPABILITIES.items():
-                if tag in installed_tags:
+                # WinRT tags are region-specific (e.g. "ja-JP"), while
+                # _LANG_CAPABILITIES keys are bare subtags ("ja").  Accept
+                # any installed tag that equals or starts with "<tag>-".
+                if any(t == tag or t.startswith(tag + "-") for t in installed_tags):
                     continue
-                try:
-                    display = glob.Language(tag).display_name
-                except Exception as exc:
-                    _log.debug("Could not get display name for lang %r: %s", tag, exc)
-                    display = tag
                 self._cmb_lang.addItem(
-                    f"{tag}  ({display})  ⬇ select to install via DISM (~6 MB)",
+                    f"{tag}  ⬇ 点击安装 (~6 MB)",
                     userData=tag,
                 )
 
@@ -1024,6 +1047,7 @@ class DebugWindow(QMainWindow):
             poll_ms=interval,
             continuous=True,
             ocr_max_long_edge=_cfg.ocr_max_size,
+            memory_scan_enabled=_cfg.memory_scan_enabled,
         )
         self._worker_thread = QThread(self)
         self._controller.moveToThread(self._worker_thread)

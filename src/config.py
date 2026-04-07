@@ -81,6 +81,24 @@ class AppConfig:
         s.setValue("pipeline/interval_ms", value)
         s.sync()
 
+    @property
+    def memory_scan_enabled(self) -> bool:
+        """Whether to run ReadProcessMemory scanning (default ``True``).
+
+        Disable for games with very large memory footprints where scanning
+        causes noticeable stutter; the pipeline falls back to pure OCR text.
+        """
+        v = _make_qsettings().value("pipeline/memory_scan_enabled", True)
+        if isinstance(v, str):
+            return v.lower() not in ("false", "0", "no")
+        return bool(v)
+
+    @memory_scan_enabled.setter
+    def memory_scan_enabled(self, value: bool) -> None:
+        s = _make_qsettings()
+        s.setValue("pipeline/memory_scan_enabled", value)
+        s.sync()
+
     # ── Translation backend ────────────────────────────────────────────
 
     @property

@@ -219,6 +219,7 @@ class HoverController(QObject):
         poll_ms: int = _POLL_MS,
         continuous: bool = False,
         ocr_max_long_edge: int = 1920,
+        memory_scan_enabled: bool = True,
     ) -> None:
         super().__init__()
         self._target = target
@@ -231,6 +232,7 @@ class HoverController(QObject):
         self._poll_ms = poll_ms
         self._continuous = continuous
         self._ocr_max_long_edge = ocr_max_long_edge
+        self._memory_scan_enabled: bool = memory_scan_enabled
 
         # Resources — created in setup() on the worker thread
         self._capturer: Capturer | None = None
@@ -357,6 +359,16 @@ class HoverController(QObject):
     def set_dump_vk(self, vk: int) -> None:
         """Change the debug-dump hotkey virtual-key code."""
         self._dump_vk = vk
+
+    @Slot(bool)
+    def set_memory_scan_enabled(self, enabled: bool) -> None:
+        """Enable or disable the ReadProcessMemory scan step at runtime.
+
+        When disabled the pipeline uses OCR text directly, skipping the
+        memory-scan and Levenshtein-correction steps.  The scanner object
+        remains open so re-enabling takes effect immediately.
+        """
+        self._memory_scan_enabled = enabled
 
     # ------------------------------------------------------------------
     # Freeze-mode slots (called from main thread via queued connection)
@@ -688,7 +700,7 @@ class HoverController(QObject):
         mem_text = ""
         corrected_text = region_text
         scan_ms = corr_ms = 0.0
-        if self._scanner is not None and region_text:
+        if self._scanner is not None and region_text and self._memory_scan_enabled:
             try:
                 needles = pick_needles(region_text)
                 t = time.monotonic()
