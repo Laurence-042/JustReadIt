@@ -412,12 +412,16 @@ class HoverController(QObject):
         if self._in_freeze:
             return  # hover events drive the pipeline in freeze mode
 
+        # Always refresh target geometry first so cursor hit-testing and
+        # overlay origin use up-to-date window coordinates after moving the
+        # game window across monitors.
+        try:
+            self._target = self._target.refresh()
+        except Exception as exc:
+            _log.warning("target.refresh() failed: %s", exc)
+
         if self._continuous:
             # Continuous mode: always capture and run pipeline.
-            try:
-                self._target = self._target.refresh()
-            except Exception as exc:
-                _log.warning("target.refresh() failed: %s", exc)
             img = self._capture_current()
             if img is None:
                 return
@@ -466,12 +470,6 @@ class HoverController(QObject):
             return  # already ran pipeline for this settle event
 
         self._settled = True
-
-        # ── Refresh target and capture ────────────────────────────────
-        try:
-            self._target = self._target.refresh()
-        except Exception as exc:
-            _log.warning("target.refresh() failed: %s", exc)
 
         img = self._capture_current()
         if img is None:
