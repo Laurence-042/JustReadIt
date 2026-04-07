@@ -11,7 +11,7 @@ Mouse hover / Freeze hotkey
   → DXGI Desktop Duplication capture (src/capture.py)
     → Windows OCR small-area probe (src/ocr/windows_ocr.py)
       → no text → return to idle
-      → text found → phash of translation region (src/cache.py PhashCache)
+      → text found → PhashCache lookup by OCR text (src/cache.py)
         → cache hit → show overlay
         → cache miss:
             → full-screen Windows OCR → range detection (src/ocr/range_detectors.py)
@@ -37,7 +37,7 @@ Mouse hover / Freeze hotkey
 | Memory Win32 | `src/memory/_win32.py` | `VirtualQueryEx` / `ReadProcessMemory` bindings. `PROCESS_VM_READ` only — read-only, zero intrusion |
 | Memory search | `src/memory/_search.py` | `find_all_positions()` byte search. Python fallback (`bytes.find`) + optional `mem_scan.dll` via ctypes |
 | Correction | `src/correction.py` | `best_match(ocr_text, candidates)` — Levenshtein cross-match (rapidfuzz) between OCR text and memory scan results. Returns best candidate or `None` (fall back to OCR) |
-| Cache | `src/cache.py` | Two-level caching: `PhashCache` (in-memory, perceptual hash of translated-region screenshot) → `TranslationCache` (persistent SQLite `translations.db`, keyed by `(source_text, source_lang, target_lang)`) |
+| Cache | `src/cache.py` | Two-level caching: `PhashCache` (in-memory, OCR-text-keyed; class name kept for backward compat) → `TranslationCache` (persistent SQLite `translations.db`, keyed by `(source_text, source_lang, target_lang)`) |
 | Translation | `src/translators/` | `Translator` ABC in `base.py`. Three backends: `GoogleFreeTranslator`, `CloudTranslationTranslator`, `OpenAICompatTranslator`. Factory in `factory.py`. Error hierarchy: `TranslationError` → `AuthError`, `RateLimitError`, `NetworkError` |
 | Translator installer | `src/translators/_installer.py` | `ensure_package()` — runtime auto-install of optional translator deps. Works in both venv and PyInstaller frozen mode |
 | Knowledge base | `src/knowledge/` | `KnowledgeBase` — persistent SQLite with hybrid BM25 + vector retrieval (RRF). `OPENAI_TOOLS` + `execute_tool()` for LLM function-calling. Shared by `OpenAICompatTranslator` and MCP server |
@@ -125,7 +125,7 @@ Three built-in backends:
 
 ### Two-level caching
 
-1. `PhashCache` — in-memory, session-scoped, keyed by `imagehash.phash()` with Hamming distance threshold. Same screenshot → skip entire pipeline.
+1. `PhashCache` — in-memory, session-scoped, keyed by exact OCR region text (string dict). Class name kept for backward compat — perceptual hashing was removed. Stores `(translation, mem_text, corrected_text)` so debug panels can replay a cache hit without re-running the pipeline.
 2. `TranslationCache` — persistent SQLite (`translations.db`), keyed by `(source_text, source_lang, target_lang)`. Same source text → skip translation API.
 
 ### Value objects — frozen dataclasses
@@ -186,7 +186,7 @@ Key exceptions: `ProcessNotFoundError`, `WindowNotFoundError`, `AmbiguousProcess
 
 `AppConfig` wraps `QSettings` (INI, `%APPDATA%\JustReadIt\config.ini`) — each setting is a `@property` with getter/setter, coercion, and default. Fresh `QSettings` handle per access via `_make_qsettings()`; `.sync()` after every write.
 
-Key settings (14 total): `ocr_language`, `interval_ms`, `settle_ms`, `translator_backend`, `translator_target_lang`, `cloud_api_key`, `openai_api_key`, `openai_model` (`gpt-4o-mini`), `openai_base_url`, `openai_system_prompt`, `openai_context_window` (10), `openai_summary_trigger` (20), `freeze_vk` (`0x78` / F9), `overlay_auto_hide_ms` (5000).
+Key settings: `ocr_language`, `ocr_max_size` (1920 — caps image fed to OCR; halves 4K frames), `interval_ms` (1500), `settle_ms`, `memory_scan_enabled` (True), `translator_backend`, `translator_target_lang`, `cloud_api_key`, `openai_api_key`, `openai_model` (`gpt-4o-mini`), `openai_base_url`, `openai_system_prompt`, `openai_context_window` (10), `openai_summary_trigger` (20), `openai_tools_enabled` (True — disable for models that struggle with function-calling), `openai_disable_thinking` (True — prepends empty `<think></think>` prefill to suppress reasoning on local thinking models; **never enable on standard OpenAI endpoint**), `dump_vk` (`0x77` / F8), `freeze_vk` (`0x78` / F9).
 
 ### Persistent data paths
 
@@ -244,7 +244,7 @@ python -m src.mcp_server [--db <path>]
 - Windows-only; Python ≥ 3.11.
 - OCR: Windows OCR only — no GPU dependency, no manga-ocr.
 - Focus return: `AllowSetForegroundWindow(pid)` — direct cross-process `SetForegroundWindow` is blocked by Windows.
-- phash cache key: perceptual hash of the *translated region screenshot*, not the full screen.
+- `PhashCache` key: exact OCR region text string (no longer perceptual hash — class name preserved for backward compat).
 
 ## Reference
 
