@@ -261,19 +261,13 @@ class TranslatorSettingsWidget(QWidget):
             self._btn_test.setToolTip(
                 "Send a short test string to verify the translator is working."
             )
-            self._btn_clear_cache = QPushButton("清除缓存")
-            self._btn_clear_cache.setToolTip(
-                "Flush the in-memory and persistent translation caches."
-            )
             btn_row.addWidget(self._btn_apply)
             btn_row.addWidget(self._btn_test)
-            btn_row.addWidget(self._btn_clear_cache)
             btn_row.addWidget(self._lbl_status, 1)
             lay.addLayout(btn_row)
 
             self._btn_apply.clicked.connect(self._on_apply)
             self._btn_test.clicked.connect(self._on_test)
-            self._btn_clear_cache.clicked.connect(self._on_clear_cache)
         else:
             lay.addWidget(self._lbl_status)
 
@@ -452,11 +446,6 @@ class TranslatorSettingsWidget(QWidget):
             self._set_status(f"✓  {result!r}")
         except Exception as exc:
             self._set_status(f"⚠ {exc}")
-
-    @Slot()
-    def _on_clear_cache(self) -> None:
-        self._backend.clear_caches()
-        self._set_status("Translation caches cleared.")
 
     @Slot(int)
     def _on_backend_changed(self, index: int) -> None:

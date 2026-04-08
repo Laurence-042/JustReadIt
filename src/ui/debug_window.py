@@ -602,6 +602,19 @@ class DebugWindow(QMainWindow):
         tb.addWidget(self._spn_interval)
         tb.addSeparator()
 
+        tb.addWidget(QLabel(" OCR max: "))
+        self._spn_ocr_max = QSpinBox()
+        self._spn_ocr_max.setRange(480, 7680)
+        self._spn_ocr_max.setSingleStep(240)
+        self._spn_ocr_max.setSuffix(" px")
+        self._spn_ocr_max.setToolTip(
+            "Maximum long-edge (px) of the image fed to Windows OCR.\n"
+            "1920 leaves 1080p untouched and halves 4K frames.\n"
+            "Takes effect on next pipeline start."
+        )
+        tb.addWidget(self._spn_ocr_max)
+        tb.addSeparator()
+
         tb.addWidget(QLabel(" Freeze key: "))
         self._cmb_freeze_key = QComboBox()
         _VK_FKEYS = [
@@ -635,7 +648,6 @@ class DebugWindow(QMainWindow):
             "Flush the in-memory and persistent translation caches.\n"
             "Use this after updating the app to force re-translation with improved logic."
         )
-        self._act_clear_cache.setEnabled(False)
         self._act_clear_cache.triggered.connect(self._on_clear_cache)
 
         act_knowledge = QAction("📚  Knowledge Manager", self)
@@ -660,6 +672,7 @@ class DebugWindow(QMainWindow):
         saved_lang = _cfg.ocr_language
         saved_interval = _cfg.interval_ms
         self._spn_interval.setValue(saved_interval)
+        self._spn_ocr_max.setValue(_cfg.ocr_max_size)
         saved_vk = _cfg.freeze_vk
         for i in range(self._cmb_freeze_key.count()):
             if self._cmb_freeze_key.itemData(i) == saved_vk:
@@ -801,8 +814,9 @@ class DebugWindow(QMainWindow):
         right.addWidget(self._panel_tl)
         right.setSizes([80, 120, 100, 140, 280, 140])
 
-        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
+        splitter.setSizes([420, 980])
 
         # ── Status bar ─────────────────────────────────────────────────
         self.setStatusBar(QStatusBar(self))
@@ -1050,6 +1064,7 @@ class DebugWindow(QMainWindow):
         interval = self._spn_interval.value()
         _cfg.ocr_language = lang
         _cfg.interval_ms = interval
+        _cfg.ocr_max_size = self._spn_ocr_max.value()
         _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
         _cfg.dump_vk = self._cmb_dump_key.currentData() or 0x77
         self._backend.start()
@@ -1058,7 +1073,6 @@ class DebugWindow(QMainWindow):
         )
 
     def _stop(self) -> None:
-        self._act_clear_cache.setEnabled(False)
         self._backend.stop()
 
     @Slot()
@@ -1068,7 +1082,6 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _on_worker_ready(self) -> None:
-        self._act_clear_cache.setEnabled(True)
         lang = self._selected_language
         interval = self._spn_interval.value()
         self.statusBar().showMessage(

@@ -9,7 +9,7 @@ A compact window (460 px wide) that exposes the core workflow:
   2. The translation pipeline starts automatically; results appear in the
      floating overlay and in this window's translation panel.
   3. Press the Freeze hotkey (default F9) to enter screenshot-inspection mode.
-  4. Click *Settings* to configure the translator, OCR language, and hotkeys.
+  4. Open *Debug view* to configure the translator, OCR, and hotkeys.
   5. Minimising hides the window to the system tray — the pipeline keeps
      running.
 
@@ -19,31 +19,21 @@ The full debug view is available via ``python main.py --debug`` or the
 """
 from __future__ import annotations
 
-import ctypes
 import logging
 
 from PySide6.QtCore import QEvent, QTimer, Qt, Slot
 from PySide6.QtGui import QAction, QFont, QIcon, QPainter, QPixmap, QColor
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QPushButton,
     QSizePolicy,
-    QSpinBox,
     QSystemTrayIcon,
-    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -53,47 +43,10 @@ from src.app_backend import AppBackend
 from src.config import AppConfig
 from src.ocr.windows_ocr import _ensure_apartment
 from src.target import GameTarget
-from ._translator_settings import TranslatorSettingsWidget
 from .window_picker import WindowPicker
 
 _cfg = AppConfig()
 _log = logging.getLogger(__name__)
-
-# ── Virtual-key codes F1–F12 ───────────────────────────────────────────────────
-_VK_FKEYS: list[tuple[str, int]] = [
-    ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73),
-    ("F5", 0x74), ("F6", 0x75), ("F7", 0x76), ("F8", 0x77),
-    ("F9", 0x78), ("F10", 0x79), ("F11", 0x7A), ("F12", 0x7B),
-]
-
-# ── BCP-47 tag → DISM capability name ─────────────────────────────────────────
-_LANG_CAPABILITIES: dict[str, str] = {
-    "ja": "Language.OCR~~~ja-JP~0.0.1.0",
-}
-
-# ── Win32: ShellExecuteEx for OCR pack install (elevated) ─────────────────────
-class _SHELLEXECUTEINFOW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize",         ctypes.c_ulong),
-        ("fMask",          ctypes.c_ulong),
-        ("hwnd",           ctypes.c_void_p),
-        ("lpVerb",         ctypes.c_wchar_p),
-        ("lpFile",         ctypes.c_wchar_p),
-        ("lpParameters",   ctypes.c_wchar_p),
-        ("lpDirectory",    ctypes.c_wchar_p),
-        ("nShow",          ctypes.c_int),
-        ("hInstApp",       ctypes.c_void_p),
-        ("lpIDList",       ctypes.c_void_p),
-        ("lpClass",        ctypes.c_wchar_p),
-        ("hkeyClass",      ctypes.c_void_p),
-        ("dwHotKey",       ctypes.c_ulong),
-        ("hIconOrMonitor", ctypes.c_void_p),
-        ("hProcess",       ctypes.c_void_p),
-    ]
-
-_SEE_MASK_NOCLOSEPROCESS = 0x00000040
-_WAIT_TIMEOUT            = 0x00000102
-_kernel32_mw = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -111,252 +64,6 @@ def _make_tray_icon() -> QIcon:
     p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "J")
     p.end()
     return QIcon(pm)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Settings dialog  (Translation / OCR & Pipeline / Hotkeys)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class _SettingsDialog(QDialog):
-    """Three-tab settings dialog.  Writes to :class:`AppConfig` only on OK."""
-
-    def __init__(self, backend: AppBackend, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._backend = backend
-        self.setWindowTitle("Settings — JustReadIt")
-        self.setMinimumWidth(540)
-        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-
-        # OCR language-pack install
-        self._install_proc_handle: int | None = None
-        self._install_timer = QTimer(self)
-        self._install_timer.setInterval(500)
-        self._install_timer.timeout.connect(self._poll_install)
-
-        layout = QVBoxLayout(self)
-        self._tabs = QTabWidget()
-        layout.addWidget(self._tabs)
-
-        self._tabs.addTab(self._build_translation_tab(), "Translation")
-        self._tabs.addTab(self._build_ocr_tab(),         "OCR & Pipeline")
-        self._tabs.addTab(self._build_hotkeys_tab(),     "Hotkeys")
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel,
-        )
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-        self._restore_values()
-
-    # ── Translation tab ───────────────────────────────────────────────────
-
-    def _build_translation_tab(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self._tl_settings = TranslatorSettingsWidget(
-            self._backend, show_buttons=True, auto_build=False, parent=w
-        )
-        lay.addWidget(self._tl_settings)
-        return w
-
-    # ── OCR & Pipeline tab ────────────────────────────────────────────────
-
-    def _build_ocr_tab(self) -> QWidget:
-        w = QWidget()
-        lay = QFormLayout(w)
-        lay.setSpacing(12)
-        lay.setContentsMargins(10, 12, 10, 10)
-
-        self._cmb_lang = QComboBox()
-        self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
-        self._populate_languages()
-        lang_row = QHBoxLayout()
-        lang_row.addWidget(self._cmb_lang, 1)
-        self._lbl_install = QLabel("")
-        lang_row.addWidget(self._lbl_install)
-        lay.addRow("OCR Language:", lang_row)
-
-        self._spn_max_size = QSpinBox()
-        self._spn_max_size.setRange(480, 7680)
-        self._spn_max_size.setSingleStep(240)
-        self._spn_max_size.setSuffix(" px")
-        self._spn_max_size.setToolTip(
-            "Maximum long-edge (px) of the image fed to Windows OCR.\n"
-            "1920 leaves 1080p images untouched and halves 4K frames.\n"
-            "Lower values speed up OCR at the cost of accuracy."
-        )
-        lay.addRow("OCR max size:", self._spn_max_size)
-
-        self._spn_interval = QSpinBox()
-        self._spn_interval.setRange(200, 15000)
-        self._spn_interval.setSuffix(" ms")
-        self._spn_interval.setToolTip("Cursor poll + translation pipeline interval.")
-        lay.addRow("Interval:", self._spn_interval)
-
-        self._chk_mem = QCheckBox("Enable ReadProcessMemory scanning")
-        self._chk_mem.setToolTip(
-            "Extract cleaner text directly from game memory.\n"
-            "Disable for games with very large heaps to reduce stutter."
-        )
-        lay.addRow("Memory scan:", self._chk_mem)
-        return w
-
-    # ── Hotkeys tab ───────────────────────────────────────────────────────
-
-    def _build_hotkeys_tab(self) -> QWidget:
-        w = QWidget()
-        lay = QFormLayout(w)
-        lay.setSpacing(12)
-        lay.setContentsMargins(10, 12, 10, 10)
-
-        self._cmb_freeze = QComboBox()
-        self._cmb_dump = QComboBox()
-        for label, vk in _VK_FKEYS:
-            self._cmb_freeze.addItem(label, userData=vk)
-            self._cmb_dump.addItem(label, userData=vk)
-        self._cmb_freeze.setToolTip("Hotkey to enter / exit Freeze screenshot mode.")
-        self._cmb_dump.setToolTip(
-            "Hotkey to copy an OCR / memory / translation snapshot to the clipboard."
-        )
-        lay.addRow("Freeze mode:", self._cmb_freeze)
-        lay.addRow("Debug dump:", self._cmb_dump)
-        return w
-
-    # ── Persist / restore ─────────────────────────────────────────────────
-
-    def _restore_values(self) -> None:
-        # OCR & Pipeline
-        self._spn_max_size.setValue(_cfg.ocr_max_size)
-        self._spn_interval.setValue(_cfg.interval_ms)
-        self._chk_mem.setChecked(_cfg.memory_scan_enabled)
-        saved_lang = _cfg.ocr_language
-        for i in range(self._cmb_lang.count()):
-            if self._cmb_lang.itemData(i) == saved_lang:
-                self._cmb_lang.setCurrentIndex(i)
-                break
-
-        # Hotkeys
-        for cmb, saved_vk in [
-            (self._cmb_freeze, _cfg.freeze_vk),
-            (self._cmb_dump, _cfg.dump_vk),
-        ]:
-            for i in range(cmb.count()):
-                if cmb.itemData(i) == saved_vk:
-                    cmb.setCurrentIndex(i)
-                    break
-
-    def accept(self) -> None:  # noqa: N802
-        """Persist all settings to :class:`AppConfig` and close."""
-        # Translator settings are saved + applied via the embedded widget.
-        self._tl_settings.apply()
-
-        # OCR & Pipeline
-        _cfg.ocr_language = self._cmb_lang.currentData() or "ja"
-        _cfg.ocr_max_size = self._spn_max_size.value()
-        _cfg.interval_ms = self._spn_interval.value()
-        _cfg.memory_scan_enabled = self._chk_mem.isChecked()
-        _cfg.freeze_vk = self._cmb_freeze.currentData() or 0x78
-        _cfg.dump_vk = self._cmb_dump.currentData() or 0x77
-
-        super().accept()
-
-    # ── OCR language (for OCR & Pipeline tab) ────────────────────────────
-
-    def _populate_languages(self) -> None:
-        try:
-            import winrt.windows.media.ocr as wocr
-            _ensure_apartment()
-            installed: set[str] = set()
-            for lang in wocr.OcrEngine.available_recognizer_languages:
-                tag = lang.language_tag
-                installed.add(tag)
-                self._cmb_lang.addItem(tag, userData=tag)
-            for tag in _LANG_CAPABILITIES:
-                if any(t == tag or t.startswith(tag + "-") for t in installed):
-                    continue
-                self._cmb_lang.addItem(f"{tag}  ⬇ click Install", userData=tag)
-        except Exception as exc:
-            self._cmb_lang.addItem(f"(error: {exc})", userData="ja")
-
-    @Slot(int)
-    def _on_lang_changed(self, index: int) -> None:
-        tag = self._cmb_lang.itemData(index)
-        if not tag or tag not in _LANG_CAPABILITIES:
-            self._lbl_install.setText("")
-            return
-        # Check whether the pack is already installed
-        try:
-            import winrt.windows.media.ocr as wocr
-            import winrt.windows.globalization as glob
-            _ensure_apartment()
-            if wocr.OcrEngine.is_language_supported(glob.Language(tag)):
-                self._lbl_install.setText("")
-                return
-        except Exception:
-            pass
-        # Offer to install
-        self._lbl_install.setText("")
-        if QMessageBox.question(
-            self,
-            "Install OCR Language Pack",
-            f"The OCR pack for '{tag}' is not installed.\n\n"
-            "Install now? (~6 MB, requires UAC elevation)",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        ) == QMessageBox.StandardButton.Yes:
-            self._start_install(tag)
-
-    def _start_install(self, lang_tag: str) -> None:
-        capability = _LANG_CAPABILITIES[lang_tag]
-        args = (
-            f"-NoProfile -ExecutionPolicy Bypass "
-            f"-Command \"Add-WindowsCapability -Online -Name '{capability}'\""
-        )
-        sei = _SHELLEXECUTEINFOW()
-        sei.cbSize       = ctypes.sizeof(sei)
-        sei.fMask        = _SEE_MASK_NOCLOSEPROCESS
-        sei.lpVerb       = "runas"
-        sei.lpFile       = "powershell.exe"
-        sei.lpParameters = args
-        sei.nShow        = 1  # SW_SHOWNORMAL
-        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) or not sei.hProcess:
-            self._lbl_install.setText("UAC denied.")
-            return
-        self._install_proc_handle = sei.hProcess
-        self._lbl_install.setText("Installing…")
-        self._install_timer.start()
-
-    @Slot()
-    def _poll_install(self) -> None:
-        if self._install_proc_handle is None:
-            self._install_timer.stop()
-            return
-        if (
-            _kernel32_mw.WaitForSingleObject(
-                ctypes.c_void_p(self._install_proc_handle), 0
-            )
-            != _WAIT_TIMEOUT
-        ):
-            self._finish_install()
-
-    def _finish_install(self) -> None:
-        self._install_timer.stop()
-        if self._install_proc_handle is not None:
-            _kernel32_mw.CloseHandle(ctypes.c_void_p(self._install_proc_handle))
-            self._install_proc_handle = None
-        current_tag = self._cmb_lang.currentData()
-        self._cmb_lang.currentIndexChanged.disconnect(self._on_lang_changed)
-        self._cmb_lang.clear()
-        self._populate_languages()
-        self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
-        for i in range(self._cmb_lang.count()):
-            if self._cmb_lang.itemData(i) == current_tag:
-                self._cmb_lang.setCurrentIndex(i)
-                break
-        self._lbl_install.setText("✓ Installed")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -442,9 +149,9 @@ class MainWindow(QMainWindow):
         _lbl_ocr = QLabel("OCR:")
         _lbl_ocr.setStyleSheet("color: #777; font-size: 9pt;")
         self._cmb_src_lang = QComboBox()
-        self._cmb_src_lang.setMaximumWidth(120)
+        self._cmb_src_lang.setMaximumWidth(140)
         self._cmb_src_lang.setToolTip(
-            "OCR source language — changes take effect immediately."
+            "OCR source language \u2014 changes take effect immediately."
         )
         self._populate_src_languages()
         _saved_src = _cfg.ocr_language
@@ -453,17 +160,9 @@ class MainWindow(QMainWindow):
                 self._cmb_src_lang.setCurrentIndex(_i)
                 break
         self._cmb_src_lang.currentIndexChanged.connect(self._on_src_lang_changed)
-        _lbl_arr = QLabel("\u2192")
-        _lbl_arr.setStyleSheet("color: #555; font-size: 9pt;")
-        self._lbl_tgt_lang = QLabel(_cfg.translator_target_lang or "en")
-        self._lbl_tgt_lang.setStyleSheet("color: #777; font-size: 9pt;")
         lang_row.addWidget(_lbl_ocr)
         lang_row.addSpacing(4)
         lang_row.addWidget(self._cmb_src_lang)
-        lang_row.addSpacing(6)
-        lang_row.addWidget(_lbl_arr)
-        lang_row.addSpacing(4)
-        lang_row.addWidget(self._lbl_tgt_lang)
         lang_row.addStretch()
         lay.addLayout(lang_row)
 
@@ -487,8 +186,7 @@ class MainWindow(QMainWindow):
         self._te_translation.setMinimumHeight(110)
         self._te_translation.setPlaceholderText(
             "Hover over game text to translate.\n\n"
-            "If this area stays blank, make sure a translator backend is "
-            "configured in Settings."
+            "Open Debug view to configure a translator backend."
         )
         lay.addWidget(self._te_translation, 1)
 
@@ -496,15 +194,10 @@ class MainWindow(QMainWindow):
 
         # ── Bottom buttons ────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        self._btn_settings = QPushButton("⚙  Settings")
-        self._btn_settings.clicked.connect(self._open_settings)
-        self._btn_knowledge = QPushButton("📚  Knowledge")
+        self._btn_knowledge = QPushButton("\U0001f4da  Knowledge")
         self._btn_knowledge.clicked.connect(self._open_knowledge)
-        self._btn_debug = QPushButton("🔧  Debug view")
-        self._btn_debug.setFlat(True)
-        self._btn_debug.setStyleSheet("color: #777;")
+        self._btn_debug = QPushButton("\U0001f527  Debug / Settings")
         self._btn_debug.clicked.connect(self._open_debug)
-        btn_row.addWidget(self._btn_settings)
         btn_row.addWidget(self._btn_knowledge)
         btn_row.addStretch()
         btn_row.addWidget(self._btn_debug)
@@ -526,13 +219,13 @@ class MainWindow(QMainWindow):
 
         menu = QMenu()
         act_show     = QAction("Show", self)
-        act_settings = QAction("⚙ Settings", self)
+        act_debug    = QAction("\U0001f527 Debug / Settings", self)
         act_exit     = QAction("Exit", self)
         act_show.triggered.connect(self._show_from_tray)
-        act_settings.triggered.connect(self._open_settings)
+        act_debug.triggered.connect(self._open_debug)
         act_exit.triggered.connect(self._quit)
         menu.addAction(act_show)
-        menu.addAction(act_settings)
+        menu.addAction(act_debug)
         menu.addSeparator()
         menu.addAction(act_exit)
 
@@ -575,15 +268,9 @@ class MainWindow(QMainWindow):
         try:
             import winrt.windows.media.ocr as wocr  # noqa: PLC0415
             _ensure_apartment()
-            installed: set[str] = set()
             for lang in wocr.OcrEngine.available_recognizer_languages:
                 tag = lang.language_tag
-                installed.add(tag)
                 self._cmb_src_lang.addItem(tag, userData=tag)
-            for tag in _LANG_CAPABILITIES:
-                if any(t == tag or t.startswith(tag + "-") for t in installed):
-                    continue
-                self._cmb_src_lang.addItem(f"{tag}  \u2b07 Install", userData=tag)
         except Exception as exc:
             self._cmb_src_lang.addItem(f"(error: {exc})", userData="ja")
 
@@ -596,18 +283,6 @@ class MainWindow(QMainWindow):
         _cfg.ocr_language = tag
         if self._backend.is_running:
             self._backend.start()
-
-    def _sync_lang_display(self) -> None:
-        """Sync the source-lang combo and target-lang label from :class:`AppConfig`."""
-        saved = _cfg.ocr_language
-        for i in range(self._cmb_src_lang.count()):
-            if self._cmb_src_lang.itemData(i) == saved:
-                if self._cmb_src_lang.currentIndex() != i:
-                    self._cmb_src_lang.blockSignals(True)
-                    self._cmb_src_lang.setCurrentIndex(i)
-                    self._cmb_src_lang.blockSignals(False)
-                break
-        self._lbl_tgt_lang.setText(_cfg.translator_target_lang or "en")
 
     # ── Window picking ────────────────────────────────────────────────────
 
@@ -659,12 +334,6 @@ class MainWindow(QMainWindow):
     def _stop(self) -> None:
         self._backend.stop()
 
-    def _rebuild_translator(self, *, silent: bool = False) -> None:
-        """Delegate translator rebuild to :class:`AppBackend`."""
-        err = self._backend.rebuild_translator(silent=silent)
-        if err and not silent:
-            QMessageBox.warning(self, "Translator error", err)
-
     # ── Controller → UI signals ───────────────────────────────────────────
 
     @Slot()
@@ -694,13 +363,12 @@ class MainWindow(QMainWindow):
         hwnd: int,
     ) -> None:
         # The freeze overlay is managed by AppBackend; we only update status.
-        freeze_key_name = ""
-        for label, vk in _VK_FKEYS:
-            if vk == _cfg.freeze_vk:
-                freeze_key_name = label
-                break
+        vk = _cfg.freeze_vk
+        key_name = next(
+            (f"F{i}" for i in range(1, 13) if 0x6F + i == vk), f"0x{vk:02X}"
+        )
         self._set_status(
-            f"❄ Freeze mode — right-click or Esc to exit  ({freeze_key_name})",
+            f"\u2744 Freeze mode \u2014 right-click or Esc to exit  ({key_name})",
             "#60b0ff",
         )
 
@@ -721,16 +389,6 @@ class MainWindow(QMainWindow):
         text = self._te_translation.toPlainText()
         if text:
             QApplication.clipboard().setText(text)
-
-    @Slot()
-    def _open_settings(self) -> None:
-        dlg = _SettingsDialog(self._backend, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        self._sync_lang_display()
-        # Restart picks up all new config values (language, interval, hotkeys).
-        if self._backend.target is not None:
-            self._backend.start()
 
     @Slot()
     def _open_knowledge(self) -> None:
