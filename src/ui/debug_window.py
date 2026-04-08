@@ -92,7 +92,7 @@ class _KnowledgeManagerDialog(QDialog):
     def __init__(self, knowledge_base: "KnowledgeBase", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._kb = knowledge_base
-        self.setWindowTitle("📚 Knowledge Manager")
+        self.setWindowTitle("📚 知识库管理")
         self.setMinimumSize(800, 500)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
 
@@ -104,7 +104,7 @@ class _KnowledgeManagerDialog(QDialog):
         # ── Terms tab ──
         self._terms_table = QTableWidget()
         self._terms_table.setColumnCount(4)
-        self._terms_table.setHorizontalHeaderLabels(["Category", "Original", "Translation", "Description"])
+        self._terms_table.setHorizontalHeaderLabels(["分类", "原文", "译文", "描述"])
         self._terms_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self._terms_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._terms_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -115,7 +115,7 @@ class _KnowledgeManagerDialog(QDialog):
         terms_lay = QVBoxLayout(terms_widget)
         terms_lay.setContentsMargins(4, 4, 4, 4)
         terms_btn_row = QHBoxLayout()
-        self._btn_del_term = QPushButton("🗑  Delete Selected")
+        self._btn_del_term = QPushButton("🗑 删除所选")
         self._btn_del_term.clicked.connect(self._on_delete_term)
         terms_btn_row.addWidget(self._btn_del_term)
         terms_btn_row.addStretch()
@@ -123,12 +123,12 @@ class _KnowledgeManagerDialog(QDialog):
         terms_btn_row.addWidget(self._lbl_terms_count)
         terms_lay.addLayout(terms_btn_row)
         terms_lay.addWidget(self._terms_table)
-        self._tabs.addTab(terms_widget, "Terms")
+        self._tabs.addTab(terms_widget, "术语")
 
         # ── Events tab ──
         self._events_table = QTableWidget()
         self._events_table.setColumnCount(2)
-        self._events_table.setHorizontalHeaderLabels(["ID", "Summary"])
+        self._events_table.setHorizontalHeaderLabels(["ID", "摘要"])
         self._events_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._events_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self._events_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -138,7 +138,7 @@ class _KnowledgeManagerDialog(QDialog):
         events_lay = QVBoxLayout(events_widget)
         events_lay.setContentsMargins(4, 4, 4, 4)
         events_btn_row = QHBoxLayout()
-        self._btn_del_event = QPushButton("🗑  Delete Selected")
+        self._btn_del_event = QPushButton("🗑 删除所选")
         self._btn_del_event.clicked.connect(self._on_delete_event)
         events_btn_row.addWidget(self._btn_del_event)
         events_btn_row.addStretch()
@@ -146,15 +146,15 @@ class _KnowledgeManagerDialog(QDialog):
         events_btn_row.addWidget(self._lbl_events_count)
         events_lay.addLayout(events_btn_row)
         events_lay.addWidget(self._events_table)
-        self._tabs.addTab(events_widget, "Events")
+        self._tabs.addTab(events_widget, "事件")
 
         # ── Bottom buttons ──
         btn_box = QHBoxLayout()
-        self._btn_refresh = QPushButton("🔄  Refresh")
+        self._btn_refresh = QPushButton("🔄 刷新")
         self._btn_refresh.clicked.connect(self._load_data)
         btn_box.addWidget(self._btn_refresh)
         btn_box.addStretch()
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         btn_box.addWidget(close_btn)
         layout.addLayout(btn_box)
@@ -178,7 +178,7 @@ class _KnowledgeManagerDialog(QDialog):
             self._terms_table.setItem(row, 2, QTableWidgetItem(entry.translation))
             self._terms_table.setItem(row, 3, QTableWidgetItem(entry.description))
         self._terms_table.setSortingEnabled(True)
-        self._lbl_terms_count.setText(f"{len(terms)} term(s)")
+        self._lbl_terms_count.setText(f"{len(terms)} 条术语")
 
     def _load_events(self) -> None:
         self._events_table.setSortingEnabled(False)
@@ -191,7 +191,7 @@ class _KnowledgeManagerDialog(QDialog):
             self._events_table.setItem(row, 0, id_item)
             self._events_table.setItem(row, 1, QTableWidgetItem(summary))
         self._events_table.setSortingEnabled(True)
-        self._lbl_events_count.setText(f"{len(rows)} event(s)")
+        self._lbl_events_count.setText(f"{len(rows)} 条事件")
 
     def _on_delete_term(self) -> None:
         selected = self._terms_table.selectedItems()
@@ -201,8 +201,8 @@ class _KnowledgeManagerDialog(QDialog):
         originals = [self._terms_table.item(r, 1).text() for r in rows]
         if QMessageBox.question(
             self,
-            "Delete Terms",
-            f"Delete {len(originals)} term(s)?\n" + "\n".join(f"  • {o}" for o in originals[:10]),
+            "删除术语",
+            f"确定删除 {len(originals)} 条术语？\n" + "\n".join(f"  • {o}" for o in originals[:10]),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
@@ -221,8 +221,8 @@ class _KnowledgeManagerDialog(QDialog):
         ]
         if QMessageBox.question(
             self,
-            "Delete Events",
-            f"Delete {len(event_ids)} event(s)?",
+            "删除事件",
+            f"确定删除 {len(event_ids)} 条事件？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
@@ -255,7 +255,7 @@ class _PreviewLabel(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(QSize(400, 300))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setText("No capture yet.\nPick a window and press ▶ Run.")
+        self.setText("暂无画面。\n请选择游戏窗口。")
         self._raw: QPixmap | None = None
         self._boxes: list[BoundingBox] = []
         self._crop_rect: tuple[int, int, int, int] | None = None
@@ -466,7 +466,17 @@ class _StepPanel(QWidget):
 
         outer.addWidget(frame, 1)
 
+        # Reference kept for add_settings_row()
+        self._frame_lay = frame_lay
+
     # ------------------------------------------------------------------
+
+    def add_settings_row(self, widget: QWidget) -> None:
+        """Insert a compact settings row between the proportion bar and text.
+
+        The widget is inserted at index 2 (after header + bar, before te).
+        """
+        self._frame_lay.insertWidget(2, widget)
 
     def set_subtitle(self, subtitle: str) -> None:
         """Update the optional subtitle appended to the title label."""
@@ -573,49 +583,32 @@ class DebugWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        self._btn_pick = QPushButton("⊕  Pick Window")
-        self._btn_pick.setToolTip(
-            "Minimises this window; click the game window to select it"
-        )
+        self._btn_pick = QPushButton("⊕ 选择窗口")
+        self._btn_pick.setToolTip("最小化本窗口，点击游戏窗口以选中目标")
         self._btn_pick.clicked.connect(self._start_picking)
         tb.addWidget(self._btn_pick)
         tb.addSeparator()
 
-        tb.addWidget(QLabel("Target: "))
+        tb.addWidget(QLabel("目标: "))
         self._lbl_target = QLabel("—")
         self._lbl_target.setMinimumWidth(260)
         tb.addWidget(self._lbl_target)
         tb.addSeparator()
 
-        tb.addWidget(QLabel(" OCR lang: "))
-        self._cmb_lang = QComboBox()
-        self._cmb_lang.setToolTip("Windows OCR language to use")
-        self._populate_languages()
-        tb.addWidget(self._cmb_lang)
-        tb.addSeparator()
-
-        tb.addWidget(QLabel(" Interval: "))
+        tb.addWidget(QLabel(" 悬停延迟: "))
         self._spn_interval = QSpinBox()
         self._spn_interval.setRange(200, 15000)
         self._spn_interval.setValue(1500)
         self._spn_interval.setSuffix(" ms")
+        self._spn_interval.setToolTip(
+            "鼠标悬停多久（毫秒）后触发翻译流水线。\n"
+            "鼠标大幅移动（≥20 px）会重置计时器，\n"
+            "即鼠标不停移动时不会重复触发。"
+        )
         tb.addWidget(self._spn_interval)
         tb.addSeparator()
 
-        tb.addWidget(QLabel(" OCR max: "))
-        self._spn_ocr_max = QSpinBox()
-        self._spn_ocr_max.setRange(480, 7680)
-        self._spn_ocr_max.setSingleStep(240)
-        self._spn_ocr_max.setSuffix(" px")
-        self._spn_ocr_max.setToolTip(
-            "Maximum long-edge (px) of the image fed to Windows OCR.\n"
-            "1920 leaves 1080p untouched and halves 4K frames.\n"
-            "Takes effect on next pipeline start."
-        )
-        tb.addWidget(self._spn_ocr_max)
-        tb.addSeparator()
-
-        tb.addWidget(QLabel(" Freeze key: "))
+        tb.addWidget(QLabel(" 冻结键: "))
         self._cmb_freeze_key = QComboBox()
         _VK_FKEYS = [
             ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73),
@@ -624,15 +617,15 @@ class DebugWindow(QMainWindow):
         ]
         for label, vk in _VK_FKEYS:
             self._cmb_freeze_key.addItem(label, userData=vk)
-        self._cmb_freeze_key.setToolTip("Hotkey to toggle freeze mode")
+        self._cmb_freeze_key.setToolTip("切换冻结模式的快捷键")
         tb.addWidget(self._cmb_freeze_key)
         tb.addSeparator()
 
-        tb.addWidget(QLabel(" Dump key: "))
+        tb.addWidget(QLabel(" 快照键: "))
         self._cmb_dump_key = QComboBox()
         for label, vk in _VK_FKEYS:
             self._cmb_dump_key.addItem(label, userData=vk)
-        self._cmb_dump_key.setToolTip("Press to copy OCR / Memory / Corrected snapshot to clipboard")
+        self._cmb_dump_key.setToolTip("按下后将 OCR / 内存 / 校正文本快照复制到剪贴板")
         tb.addWidget(self._cmb_dump_key)
         tb.addSeparator()
 
@@ -643,15 +636,15 @@ class DebugWindow(QMainWindow):
         )
         tb.addWidget(_spacer)
 
-        self._act_clear_cache = QAction("🗑  清除缓存", self)
+        self._act_clear_cache = QAction("🗑 清除缓存", self)
         self._act_clear_cache.setToolTip(
-            "Flush the in-memory and persistent translation caches.\n"
-            "Use this after updating the app to force re-translation with improved logic."
+            "清空内存缓存和持久化翻译缓存。\n"
+            "更新应用后使用，强制以改进的逻辑重新翻译。"
         )
         self._act_clear_cache.triggered.connect(self._on_clear_cache)
 
-        act_knowledge = QAction("📚  Knowledge Manager", self)
-        act_knowledge.setToolTip("Browse or delete knowledge-base terms and events.")
+        act_knowledge = QAction("📚 知识库管理", self)
+        act_knowledge.setToolTip("浏览或删除知识库中的术语和事件。")
         act_knowledge.triggered.connect(self._on_open_knowledge_manager)
 
         _tools_menu = QMenu(self)
@@ -661,7 +654,7 @@ class DebugWindow(QMainWindow):
 
         self._btn_tools = QToolButton()
         self._btn_tools.setText("工具")
-        self._btn_tools.setToolTip("缓存 / Knowledge 管理")
+        self._btn_tools.setToolTip("缓存 / 知识库管理")
         self._btn_tools.setPopupMode(
             QToolButton.ToolButtonPopupMode.InstantPopup
         )
@@ -669,10 +662,8 @@ class DebugWindow(QMainWindow):
         tb.addWidget(self._btn_tools)
 
         # ── Restore persisted settings ───────────────────────────────
-        saved_lang = _cfg.ocr_language
         saved_interval = _cfg.interval_ms
         self._spn_interval.setValue(saved_interval)
-        self._spn_ocr_max.setValue(_cfg.ocr_max_size)
         saved_vk = _cfg.freeze_vk
         for i in range(self._cmb_freeze_key.count()):
             if self._cmb_freeze_key.itemData(i) == saved_vk:
@@ -682,10 +673,6 @@ class DebugWindow(QMainWindow):
         for i in range(self._cmb_dump_key.count()):
             if self._cmb_dump_key.itemData(i) == saved_dump_vk:
                 self._cmb_dump_key.setCurrentIndex(i)
-                break
-        for i in range(self._cmb_lang.count()):
-            if self._cmb_lang.itemData(i) == saved_lang:
-                self._cmb_lang.setCurrentIndex(i)
                 break
 
         # Live-update freeze hotkey when combo changes.
@@ -699,7 +686,7 @@ class DebugWindow(QMainWindow):
         self._install_bar = QWidget()
         _ibl = QHBoxLayout(self._install_bar)
         _ibl.setContentsMargins(6, 3, 6, 3)
-        self._install_lbl = QLabel("Installing …")
+        self._install_lbl = QLabel("正在安装…")
         self._install_prog = QProgressBar()
         self._install_prog.setRange(0, 0)   # indeterminate
         self._install_prog.setFixedHeight(16)
@@ -778,11 +765,44 @@ class DebugWindow(QMainWindow):
         right_scroll.setWidget(right)
         splitter.addWidget(right_scroll)
 
-        self._panel_wocr   = _StepPanel("Windows OCR",          (80,  160, 255))
-        self._panel_region = _StepPanel("Detected Region",       (80,  210, 120))
-        self._panel_mem    = _StepPanel("Memory Scan",           (255, 160,  50))
-        self._panel_corr   = _StepPanel("Levenshtein Corrected", (180, 100, 255))
-        self._panel_tl     = _StepPanel("Translation",           ( 80, 220, 200))
+        self._panel_wocr   = _StepPanel("Windows OCR",  (80,  160, 255))
+        self._panel_region = _StepPanel("检测区域",      (80,  210, 120))
+        self._panel_mem    = _StepPanel("内存扫描",      (255, 160,  50))
+        self._panel_corr   = _StepPanel("校正文本",      (180, 100, 255))
+        self._panel_tl     = _StepPanel("翻译",          ( 80, 220, 200))
+
+        # ── OCR settings row (embedded inside the Windows OCR panel) ──
+        ocr_settings = QWidget()
+        ocr_sl = QHBoxLayout(ocr_settings)
+        ocr_sl.setContentsMargins(0, 2, 0, 2)
+        ocr_sl.setSpacing(6)
+        ocr_sl.addWidget(QLabel("语言:"))
+        self._cmb_lang = QComboBox()
+        self._cmb_lang.setToolTip("Windows OCR 识别语言")
+        self._populate_languages()
+        ocr_sl.addWidget(self._cmb_lang)
+        ocr_sl.addSpacing(12)
+        ocr_sl.addWidget(QLabel("最大尺寸:"))
+        self._spn_ocr_max = QSpinBox()
+        self._spn_ocr_max.setRange(480, 7680)
+        self._spn_ocr_max.setSingleStep(240)
+        self._spn_ocr_max.setSuffix(" px")
+        self._spn_ocr_max.setToolTip(
+            "送入 Windows OCR 的图像最大长边（像素）。\n"
+            "1920 对 1080p 无影响，4K 帧减半。\n"
+            "下次启动流水线时生效。"
+        )
+        ocr_sl.addWidget(self._spn_ocr_max)
+        ocr_sl.addStretch()
+        self._panel_wocr.add_settings_row(ocr_settings)
+
+        # Restore persisted OCR settings
+        self._spn_ocr_max.setValue(_cfg.ocr_max_size)
+        saved_lang = _cfg.ocr_language
+        for i in range(self._cmb_lang.count()):
+            if self._cmb_lang.itemData(i) == saved_lang:
+                self._cmb_lang.setCurrentIndex(i)
+                break
 
         # Convenience aliases so the rest of the code keeps working unchanged.
         self._te_wocr   = self._panel_wocr.te
@@ -792,18 +812,18 @@ class DebugWindow(QMainWindow):
         self._te_tl     = self._panel_tl.te
 
         self._te_region.setPlaceholderText(
-            "Region text will appear after range detection."
+            "区域文本将在范围检测后显示。"
         )
         self._te_mem.setPlaceholderText(
-            "Memory scan results appear here.\n"
-            "ReadProcessMemory scans the game's heap for OCR text substrings."
+            "内存扫描结果显示在此。\n"
+            "通过 ReadProcessMemory 扫描游戏堆内存中的 OCR 文本子串。"
         )
         self._te_corr.setPlaceholderText(
-            "Corrected text (best OCR\u2194memory match) appears here.\n"
-            "Falls back to OCR region text when no confident match is found."
+            "校正文本（OCR ↔ 内存最佳匹配）显示在此。\n"
+            "无高置信匹配时回退到 OCR 区域文本。"
         )
         self._te_tl.setPlaceholderText(
-            "Configure a translator backend below and click \"Apply\" to enable."
+            "请在下方配置翻译后端并点击「应用」以启用。"
         )
 
         right.addWidget(self._panel_wocr)
@@ -917,7 +937,7 @@ class DebugWindow(QMainWindow):
 
         if self._backend.is_running:
             self.statusBar().showMessage(
-                f"Restarting pipeline with lang={tag} \u2026"
+                f"正在以 lang={tag} 重启流水线…"
             )
             self._run()
 
@@ -931,11 +951,11 @@ class DebugWindow(QMainWindow):
         capability = _LANG_CAPABILITIES[lang_tag]
         reply = QMessageBox.question(
             self,
-            "Install Windows OCR Language Pack",
-            f"The OCR language pack for '{lang_tag}' is not installed.\n\n"
+            "安装 Windows OCR 语言包",
+            f"OCR 语言 '{lang_tag}' 的语言包尚未安装。\n\n"
             f"Capability:  {capability}\n\n"
-            "Install now?  (~6 MB, OCR data only — does not change system language)\n"
-            "An administrator (UAC) elevation prompt will appear.",
+            "是否立即安装？（约 6 MB，仅 OCR 数据 — 不会更改系统语言）\n"
+            "安装时会出现管理员（UAC）提权提示。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
@@ -956,19 +976,19 @@ class DebugWindow(QMainWindow):
         ok = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
         if not ok or not sei.hProcess:
             self.statusBar().showMessage(
-                "Could not launch installer — UAC denied or PowerShell not found.",
+                "无法启动安装程序 — UAC 被拒绝或未找到 PowerShell。",
                 8000,
             )
             return
 
         self._install_proc_handle = sei.hProcess
         self._install_lbl.setText(
-            f"Installing {capability} …  "
-            "(this may take a minute — do not close this window)"
+            f"正在安装 {capability}…  "
+            "（可能需要一分钟 — 请勿关闭此窗口）"
         )
         self._install_bar.setVisible(True)
         self._install_timer.start()
-        self.statusBar().showMessage(f"Installing {capability} …")
+        self.statusBar().showMessage(f"正在安装 {capability}…")
 
     @Slot()
     def _poll_install(self) -> None:
@@ -1000,7 +1020,7 @@ class DebugWindow(QMainWindow):
                 self._cmb_lang.setCurrentIndex(i)
                 break
         self.statusBar().showMessage(
-            "Language pack installation complete — press ▶ Run to start.", 8000
+            "语言包安装完成 — 已自动生效。", 8000
         )
 
     # ------------------------------------------------------------------
@@ -1009,7 +1029,7 @@ class DebugWindow(QMainWindow):
 
     def _start_picking(self) -> None:
         self.statusBar().showMessage(
-            "Click the game window to select it …  (right-click to cancel)"
+            "请点击游戏窗口以选中目标…  （右键取消）"
         )
         self._btn_pick.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.CrossCursor)
@@ -1036,7 +1056,7 @@ class DebugWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
         self.showNormal()
         self._btn_pick.setEnabled(True)
-        self.statusBar().showMessage("Picking cancelled.", 3000)
+        self.statusBar().showMessage("已取消选择。", 3000)
 
     def _set_target(self, target: GameTarget) -> None:
         w = target.window_rect.width
@@ -1045,7 +1065,7 @@ class DebugWindow(QMainWindow):
             f"{target.process_name}  (PID {target.pid})  [{w}×{h}]"
         )
         self.statusBar().showMessage(
-            f"Target: {target.process_name}  PID={target.pid}"
+            f"目标: {target.process_name}  PID={target.pid}"
             f"  output_idx={target.dxcam_output_idx}",
             5000,
         )
@@ -1057,7 +1077,7 @@ class DebugWindow(QMainWindow):
 
     def _run(self) -> None:
         if self._backend.target is None:
-            self.statusBar().showMessage("Pick a window first.", 3000)
+            self.statusBar().showMessage("请先选择游戏窗口。", 3000)
             return
         # Write UI control values to config so backend.start() picks them up.
         lang = self._selected_language
@@ -1069,7 +1089,7 @@ class DebugWindow(QMainWindow):
         _cfg.dump_vk = self._cmb_dump_key.currentData() or 0x77
         self._backend.start()
         self.statusBar().showMessage(
-            f"Starting — lang={lang}  interval={interval} ms"
+            f"启动中 — 语言={lang}  延迟={interval} ms"
         )
 
     def _stop(self) -> None:
@@ -1078,14 +1098,14 @@ class DebugWindow(QMainWindow):
     @Slot()
     def _on_clear_cache(self) -> None:
         self._backend.clear_caches()
-        self.statusBar().showMessage("Translation caches cleared.", 3000)
+        self.statusBar().showMessage("翻译缓存已清除。", 3000)
 
     @Slot()
     def _on_worker_ready(self) -> None:
         lang = self._selected_language
         interval = self._spn_interval.value()
         self.statusBar().showMessage(
-            f"Running — lang={lang}  interval={interval} ms"
+            f"运行中 — 语言={lang}  延迟={interval} ms"
         )
 
     # ------------------------------------------------------------------
@@ -1216,7 +1236,7 @@ class DebugWindow(QMainWindow):
         lang = self._selected_language
         interval = self._spn_interval.value()
         self.statusBar().showMessage(
-            f"Running — lang={lang}  interval={interval} ms"
+            f"运行中 — 语言={lang}  延迟={interval} ms"
         )
 
     # ------------------------------------------------------------------
@@ -1250,7 +1270,7 @@ class DebugWindow(QMainWindow):
 
     def _build_translator_settings_panel(self) -> QWidget:
         """Translator configuration panel backed by the shared widget."""
-        grp = QGroupBox("Translation Settings")
+        grp = QGroupBox("翻译设置")
         lay = QVBoxLayout(grp)
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(0)

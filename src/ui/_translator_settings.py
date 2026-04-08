@@ -101,7 +101,7 @@ class TranslatorSettingsWidget(QWidget):
         # Show existing translator status or attempt initial build.
         if backend.translator is not None:
             self._set_status(
-                f"✓ {_cfg.translator_backend.title()} ready"
+                f"✓ {_cfg.translator_backend.title()} 就绪"
                 f" → {_cfg.translator_target_lang}"
             )
         elif auto_build and _cfg.translator_backend not in ("none", ""):
@@ -118,9 +118,9 @@ class TranslatorSettingsWidget(QWidget):
 
         # ── Row 1: backend + target language ──────────────────────────
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Backend:"))
+        row1.addWidget(QLabel("翻译后端:"))
         self._cmb_backend = QComboBox()
-        self._cmb_backend.addItem("— None —", userData="none")
+        self._cmb_backend.addItem("— 无 —", userData="none")
         for p in PROVIDERS:
             self._cmb_backend.addItem(p.display_name, userData=p.key)
         row1.addWidget(self._cmb_backend)
@@ -133,8 +133,8 @@ class TranslatorSettingsWidget(QWidget):
         for code, label in _BCP47_TARGETS:
             self._cmb_target_lang.addItem(label, userData=code)
         self._cmb_target_lang.setToolTip(
-            "BCP-47 target language tag (e.g. zh-CN, en, ko).\n"
-            "Select from the list or type a custom tag directly."
+            "BCP-47 目标语言标签（如 zh-CN、en、ko）。\n"
+            "从列表中选择或直接输入自定义标签。"
         )
         row1.addWidget(self._cmb_target_lang)
         row1.addStretch()
@@ -144,11 +144,11 @@ class TranslatorSettingsWidget(QWidget):
         self._row_api_key = QWidget()
         r2 = QHBoxLayout(self._row_api_key)
         r2.setContentsMargins(0, 0, 0, 0)
-        r2.addWidget(QLabel("API Key:"))
+        r2.addWidget(QLabel("API 密钥:"))
         self._le_api_key = QLineEdit()
         self._le_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self._le_api_key.setPlaceholderText(
-            "Paste API key here  (local models: leave blank)"
+            "在此粘贴 API 密钥（本地模型留空）"
         )
         r2.addWidget(self._le_api_key)
         lay.addWidget(self._row_api_key)
@@ -166,77 +166,67 @@ class TranslatorSettingsWidget(QWidget):
         for _p in OPENAI_PRESETS:
             self._cmb_preset.addItem(_p.label, userData=_p)
         self._cmb_preset.setToolTip(
-            "Auto-fills fields below — click Apply to save."
+            "自动填充下方字段 — 点击「应用」保存。"
         )
         preset_row.addWidget(self._cmb_preset, 1)
         of_lay.addLayout(preset_row)
 
         row3 = QHBoxLayout()
-        row3.addWidget(QLabel("Model:"))
+        row3.addWidget(QLabel("模型:"))
         self._le_model = QLineEdit()
         self._le_model.setPlaceholderText("gpt-4o-mini")
         self._le_model.setMaximumWidth(160)
         row3.addWidget(self._le_model)
         row3.addSpacing(12)
-        row3.addWidget(QLabel("Base URL:"))
+        row3.addWidget(QLabel("基础 URL:"))
         self._le_base_url = QLineEdit()
         self._le_base_url.setPlaceholderText(
-            "https://api.openai.com/v1  (blank = default)"
+            "https://api.openai.com/v1  (留空 = 默认)"
         )
         row3.addWidget(self._le_base_url)
         of_lay.addLayout(row3)
 
         row4 = QHBoxLayout()
-        row4.addWidget(QLabel("System Prompt:"))
-        prompt_col = QVBoxLayout()
+        row4.addWidget(QLabel("系统提示词:"))
         self._te_system_prompt = QTextEdit()
         self._te_system_prompt.setPlaceholderText(
-            "Supports {source_lang} and {target_lang} placeholders."
+            "支持 {source_lang} 和 {target_lang} 占位符。"
         )
         self._te_system_prompt.setFixedHeight(72)
-        self._btn_reset_prompt = QPushButton("Reset")
-        self._btn_reset_prompt.setFlat(True)
-        self._btn_reset_prompt.setToolTip("Restore the built-in default system prompt.")
-        self._btn_reset_prompt.clicked.connect(self._on_reset_prompt)
-        prompt_col.addWidget(self._te_system_prompt)
-        _btn_row = QHBoxLayout()
-        _btn_row.addStretch()
-        _btn_row.addWidget(self._btn_reset_prompt)
-        prompt_col.addLayout(_btn_row)
-        row4.addLayout(prompt_col)
+        row4.addWidget(self._te_system_prompt)
         of_lay.addLayout(row4)
 
         row_ctx = QHBoxLayout()
-        row_ctx.addWidget(QLabel("Context:"))
+        row_ctx.addWidget(QLabel("上下文:"))
         self._spn_context_window = QSpinBox()
         self._spn_context_window.setRange(0, 100)
         self._spn_context_window.setMaximumWidth(72)
         self._spn_context_window.setToolTip(
-            "Number of recent translation pairs included as context."
+            "作为上下文包含的最近翻译对数量。"
         )
         row_ctx.addWidget(self._spn_context_window)
         row_ctx.addSpacing(12)
-        row_ctx.addWidget(QLabel("Summary:"))
+        row_ctx.addWidget(QLabel("摘要:"))
         self._spn_summary_trigger = QSpinBox()
         self._spn_summary_trigger.setRange(0, 200)
         self._spn_summary_trigger.setMaximumWidth(72)
         self._spn_summary_trigger.setToolTip(
-            "History length that triggers summarisation of the oldest chunk."
+            "触发最旧片段摘要的历史长度。"
         )
         row_ctx.addWidget(self._spn_summary_trigger)
         row_ctx.addSpacing(16)
-        self._chk_tools_enabled = QCheckBox("KB工具调用")
+        self._chk_tools_enabled = QCheckBox("KB 工具调用")
         self._chk_tools_enabled.setToolTip(
-            "Allow the model to read/write the knowledge base via function-calling.\n"
-            "Disable for small models that struggle with tool prompts."
+            "允许模型通过 function-calling 读写知识库。\n"
+            "对于不擅长工具提示的小模型请禁用。"
         )
         row_ctx.addWidget(self._chk_tools_enabled)
         row_ctx.addSpacing(8)
-        self._chk_disable_thinking = QCheckBox("禁止thinking")
+        self._chk_disable_thinking = QCheckBox("禁止推理")
         self._chk_disable_thinking.setToolTip(
-            "Prepend empty <think></think> to suppress chain-of-thought.\n"
-            "Only for local thinking models (DeepSeek-R1-Distill, QwQ…).\n"
-            "Never enable for the standard OpenAI API."
+            "在开头添加空 <think></think> 以抑制思维链。\n"
+            "仅用于本地思维模型（DeepSeek-R1-Distill、QwQ 等）。\n"
+            "切勿对标准 OpenAI API 启用。"
         )
         row_ctx.addWidget(self._chk_disable_thinking)
         row_ctx.addStretch()
@@ -252,14 +242,14 @@ class TranslatorSettingsWidget(QWidget):
         # ── Buttons row (optional) ─────────────────────────────────────
         if show_buttons:
             btn_row = QHBoxLayout()
-            self._btn_apply = QPushButton("Apply")
+            self._btn_apply = QPushButton("应用")
             self._btn_apply.setToolTip(
-                "Save settings and (re-)initialise the translator.\n"
-                "Missing packages are installed automatically."
+                "保存设置并（重新）初始化翻译器。\n"
+                "缺少的依赖包会自动安装。"
             )
-            self._btn_test = QPushButton("Test")
+            self._btn_test = QPushButton("测试")
             self._btn_test.setToolTip(
-                "Send a short test string to verify the translator is working."
+                "发送一段测试文本以验证翻译器是否正常工作。"
             )
             btn_row.addWidget(self._btn_apply)
             btn_row.addWidget(self._btn_test)
@@ -342,7 +332,7 @@ class TranslatorSettingsWidget(QWidget):
         self.save_to_config()
         if _cfg.translator_backend == "none":
             self._backend.set_translator(None)
-            self._set_status("Translator disabled.")
+            self._set_status("翻译器已禁用。")
             self.translator_applied.emit()
             return
         self._build_from_config()
@@ -367,7 +357,7 @@ class TranslatorSettingsWidget(QWidget):
         """Build translator from saved AppConfig and inject into AppBackend."""
         backend_key = _cfg.translator_backend
         target_lang = _cfg.translator_target_lang or "zh-CN"
-        self._set_status("Building…")
+        self._set_status("构建中…")
         QApplication.processEvents()
         try:
             translator = build_translator(
@@ -381,10 +371,10 @@ class TranslatorSettingsWidget(QWidget):
             self._backend.set_translator(translator)
             if translator is not None:
                 self._set_status(
-                    f"✓ {backend_key.title()} ready → {target_lang}"
+                    f"✓ {backend_key.title()} 就绪 → {target_lang}"
                 )
             else:
-                self._set_status("Translator disabled.")
+                self._set_status("翻译器已禁用。")
             self.translator_applied.emit()
         except RuntimeError as exc:
             self._backend.set_translator(None)
@@ -427,7 +417,7 @@ class TranslatorSettingsWidget(QWidget):
     @Slot()
     def _on_test(self) -> None:
         target_lang = self.target_lang_value()
-        self._set_status("Building…")
+        self._set_status("构建中…")
         QApplication.processEvents()
         try:
             translator = self._build_temp_translator()
@@ -435,9 +425,9 @@ class TranslatorSettingsWidget(QWidget):
             self._set_status(f"⚠ {exc}")
             return
         if translator is None:
-            self._set_status("No backend selected.")
+            self._set_status("未选择翻译后端。")
             return
-        self._set_status("Testing…")
+        self._set_status("测试中…")
         QApplication.processEvents()
         try:
             result = translator.translate(
@@ -473,7 +463,3 @@ class TranslatorSettingsWidget(QWidget):
         self._cmb_preset.blockSignals(True)
         self._cmb_preset.setCurrentIndex(0)
         self._cmb_preset.blockSignals(False)
-
-    @Slot()
-    def _on_reset_prompt(self) -> None:
-        self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)

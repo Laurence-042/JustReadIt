@@ -111,10 +111,10 @@ class MainWindow(QMainWindow):
 
         # ── Game picker row ───────────────────────────────────────────
         pick_row = QHBoxLayout()
-        self._btn_pick = QPushButton("⊕  Pick Game Window")
+        self._btn_pick = QPushButton("⊚ 选择游戏窗口")
         self._btn_pick.setFixedHeight(32)
         self._btn_pick.clicked.connect(self._start_picking)
-        self._lbl_target = QLabel("No game selected")
+        self._lbl_target = QLabel("未选择游戏")
         self._lbl_target.setStyleSheet("color: #999;")
         self._lbl_target.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
@@ -136,7 +136,7 @@ class MainWindow(QMainWindow):
         self._lbl_dot = QLabel("\u25cf")
         self._lbl_dot.setStyleSheet("color: #444; font-size: 11px;")
         self._lbl_dot.setFixedWidth(14)
-        self._lbl_status_text = QLabel("Idle \u2014 pick a game window to start")
+        self._lbl_status_text = QLabel("空闲 \u2014 选择游戏窗口以开始")
         self._lbl_status_text.setStyleSheet("color: #888; font-size: 9pt;")
         self._lbl_status_text.setWordWrap(True)
         card_lay.addWidget(self._lbl_dot)
@@ -146,12 +146,12 @@ class MainWindow(QMainWindow):
         # ── Language quick-select ─────────────────────────────────────
         lang_row = QHBoxLayout()
         lang_row.setContentsMargins(0, 0, 0, 0)
-        _lbl_ocr = QLabel("OCR:")
+        _lbl_ocr = QLabel("OCR 语言:")
         _lbl_ocr.setStyleSheet("color: #777; font-size: 9pt;")
         self._cmb_src_lang = QComboBox()
         self._cmb_src_lang.setMaximumWidth(140)
         self._cmb_src_lang.setToolTip(
-            "OCR source language \u2014 changes take effect immediately."
+            "OCR 识别语言 \u2014 更改后立即生效。"
         )
         self._populate_src_languages()
         _saved_src = _cfg.ocr_language
@@ -170,9 +170,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(_hsep())
 
         tl_header = QHBoxLayout()
-        tl_header.addWidget(QLabel("Last translation:"))
+        tl_header.addWidget(QLabel("最近翻译:"))
         tl_header.addStretch()
-        self._btn_copy = QPushButton("Copy")
+        self._btn_copy = QPushButton("复制")
         self._btn_copy.setFlat(True)
         self._btn_copy.setFixedHeight(22)
         self._btn_copy.setStyleSheet("color: #777;")
@@ -185,8 +185,8 @@ class MainWindow(QMainWindow):
         self._te_translation.setFont(QFont("Segoe UI", 12))
         self._te_translation.setMinimumHeight(110)
         self._te_translation.setPlaceholderText(
-            "Hover over game text to translate.\n\n"
-            "Open Debug view to configure a translator backend."
+            "将鼠标悬停在游戏文本上即可翻译。\n\n"
+            "打开调试视图以配置翻译后端。"
         )
         lay.addWidget(self._te_translation, 1)
 
@@ -194,9 +194,9 @@ class MainWindow(QMainWindow):
 
         # ── Bottom buttons ────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        self._btn_knowledge = QPushButton("\U0001f4da  Knowledge")
+        self._btn_knowledge = QPushButton("\U0001f4da 知识库")
         self._btn_knowledge.clicked.connect(self._open_knowledge)
-        self._btn_debug = QPushButton("\U0001f527  Debug / Settings")
+        self._btn_debug = QPushButton("\U0001f527 调试 / 设置")
         self._btn_debug.clicked.connect(self._open_debug)
         btn_row.addWidget(self._btn_knowledge)
         btn_row.addStretch()
@@ -218,9 +218,9 @@ class MainWindow(QMainWindow):
         self._tray.setToolTip("JustReadIt")
 
         menu = QMenu()
-        act_show     = QAction("Show", self)
-        act_debug    = QAction("\U0001f527 Debug / Settings", self)
-        act_exit     = QAction("Exit", self)
+        act_show     = QAction("显示主窗口", self)
+        act_debug    = QAction("\U0001f527 调试 / 设置", self)
+        act_exit     = QAction("退出", self)
         act_show.triggered.connect(self._show_from_tray)
         act_debug.triggered.connect(self._open_debug)
         act_exit.triggered.connect(self._quit)
@@ -259,7 +259,7 @@ class MainWindow(QMainWindow):
         info = f"{lang} → {target_lang}"
         if backend and backend != "none":
             info += f"  ·  {backend}"
-        self._set_status(f"Running  ·  {info}", "#4ec94e")
+        self._set_status(f"运行中  ·  {info}", "#4ec94e")
 
     # ── Language helpers ─────────────────────────────────────────────────
 
@@ -351,7 +351,7 @@ class MainWindow(QMainWindow):
     def _on_pipeline_progress(
         self, step: str, near_rect: object, screen_origin: object
     ) -> None:
-        self._set_status(f"Translating…  ({step})", "#e0c840")
+        self._set_status(f"翻译中…  ({step})", "#e0c840")
 
     @Slot(object, int, int, int, int)
     def _on_freeze_triggered(
@@ -368,7 +368,7 @@ class MainWindow(QMainWindow):
             (f"F{i}" for i in range(1, 13) if 0x6F + i == vk), f"0x{vk:02X}"
         )
         self._set_status(
-            f"\u2744 Freeze mode \u2014 right-click or Esc to exit  ({key_name})",
+            f"\u2744 冻结模式 \u2014 右键或 Esc 退出  ({key_name})",
             "#60b0ff",
         )
 
@@ -425,7 +425,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.hide)
             self._tray.showMessage(
                 "JustReadIt",
-                "Translation running in background.  Click tray icon to restore.",
+                "翻译在后台继续运行。点击托盘图标恢复窗口。",
                 QSystemTrayIcon.MessageIcon.Information,
                 2500,
             )
