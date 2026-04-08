@@ -289,7 +289,7 @@ class TranslatorSettingsWidget(QWidget):
                 self._cmb_backend.setCurrentIndex(i)
                 break
 
-        self._set_target_lang(_cfg.translator_target_lang or "zh-CN")
+        self.set_target_lang(_cfg.translator_target_lang or "zh-CN")
 
         self._spn_context_window.setValue(_cfg.openai_context_window)
         self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
@@ -344,7 +344,7 @@ class TranslatorSettingsWidget(QWidget):
     def _set_status(self, text: str) -> None:
         self._lbl_status.setText(text)
 
-    def _set_target_lang(self, tag: str) -> None:
+    def set_target_lang(self, tag: str) -> None:
         """Set the target-lang combo to the given BCP-47 tag."""
         for i in range(self._cmb_target_lang.count()):
             if self._cmb_target_lang.itemData(i) == tag:

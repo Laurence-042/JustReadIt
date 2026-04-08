@@ -146,12 +146,12 @@ class MainWindow(QMainWindow):
         # ── Language quick-select ─────────────────────────────────────
         lang_row = QHBoxLayout()
         lang_row.setContentsMargins(0, 0, 0, 0)
-        _lbl_ocr = QLabel("OCR 语言:")
-        _lbl_ocr.setStyleSheet("color: #777; font-size: 9pt;")
+        _lbl_src = QLabel("源语言:")
+        _lbl_src.setStyleSheet("color: #777; font-size: 9pt;")
         self._cmb_src_lang = QComboBox()
         self._cmb_src_lang.setMaximumWidth(140)
         self._cmb_src_lang.setToolTip(
-            "OCR 识别语言 \u2014 更改后立即生效。"
+            "翻译源语言（OCR 识别语言）\u2014 更改后立即生效。"
         )
         self._populate_src_languages()
         _saved_src = _cfg.ocr_language
@@ -160,9 +160,49 @@ class MainWindow(QMainWindow):
                 self._cmb_src_lang.setCurrentIndex(_i)
                 break
         self._cmb_src_lang.currentIndexChanged.connect(self._on_src_lang_changed)
-        lang_row.addWidget(_lbl_ocr)
+        lang_row.addWidget(_lbl_src)
         lang_row.addSpacing(4)
         lang_row.addWidget(self._cmb_src_lang)
+
+        lang_row.addSpacing(16)
+        _lbl_tgt = QLabel("目标语言:")
+        _lbl_tgt.setStyleSheet("color: #777; font-size: 9pt;")
+        self._cmb_tgt_lang = QComboBox()
+        self._cmb_tgt_lang.setEditable(True)
+        self._cmb_tgt_lang.setMaximumWidth(180)
+        self._cmb_tgt_lang.setToolTip(
+            "翻译目标语言（BCP-47 标签）\u2014 更改后立即生效。\n"
+            "从列表中选择或直接输入自定义标签。"
+        )
+        _BCP47_TARGETS: list[tuple[str, str]] = [
+            ("zh-CN", "zh-CN \u2014 简体中文"),
+            ("zh-TW", "zh-TW \u2014 繁體中文"),
+            ("en",    "en \u2014 English"),
+            ("ko",    "ko \u2014 한국어"),
+            ("fr",    "fr \u2014 Français"),
+            ("de",    "de \u2014 Deutsch"),
+            ("ja",    "ja \u2014 日本語"),
+            ("es",    "es \u2014 Español"),
+            ("pt",    "pt \u2014 Português"),
+            ("ru",    "ru \u2014 Русский"),
+            ("ar",    "ar \u2014 العربية"),
+            ("it",    "it \u2014 Italiano"),
+        ]
+        for _code, _label in _BCP47_TARGETS:
+            self._cmb_tgt_lang.addItem(_label, userData=_code)
+        _saved_tgt = _cfg.translator_target_lang or "zh-CN"
+        _tgt_found = False
+        for _i in range(self._cmb_tgt_lang.count()):
+            if self._cmb_tgt_lang.itemData(_i) == _saved_tgt:
+                self._cmb_tgt_lang.setCurrentIndex(_i)
+                _tgt_found = True
+                break
+        if not _tgt_found:
+            self._cmb_tgt_lang.setCurrentText(_saved_tgt)
+        self._cmb_tgt_lang.currentIndexChanged.connect(self._on_tgt_lang_changed)
+        lang_row.addWidget(_lbl_tgt)
+        lang_row.addSpacing(4)
+        lang_row.addWidget(self._cmb_tgt_lang)
         lang_row.addStretch()
         lay.addLayout(lang_row)
 
@@ -284,6 +324,31 @@ class MainWindow(QMainWindow):
         if self._backend.is_running:
             self._backend.start()
 
+    @Slot(int)
+    def _on_tgt_lang_changed(self, index: int) -> None:
+        """Persist the selected target language and restart the controller."""
+        idx = self._cmb_tgt_lang.currentIndex()
+        tag: str = ""
+        if idx >= 0:
+            data = self._cmb_tgt_lang.itemData(idx)
+            if data:
+                tag = str(data)
+        if not tag:
+            # Editable combo — raw text
+            text = self._cmb_tgt_lang.currentText().strip()
+            tag = text.split(" ")[0] if text else ""
+        if not tag:
+            return
+        _cfg.translator_target_lang = tag
+        # Sync debug window's translator settings if open.
+        if self._debug_window is not None:
+            try:
+                self._debug_window._tl_settings.set_target_lang(tag)
+            except Exception:
+                pass
+        if self._backend.is_running:
+            self._backend.start()
+
     # ── Window picking ────────────────────────────────────────────────────
 
     def _start_picking(self) -> None:
@@ -315,15 +380,13 @@ class MainWindow(QMainWindow):
         self._btn_pick.setEnabled(True)
 
     def _set_target(self, target: GameTarget) -> None:
-        self._stop()
-        self._target = target
         w = target.window_rect.width
         h = target.window_rect.height
         self._lbl_target.setText(
             f"{target.process_name}  (PID {target.pid})  [{w}×{h}]"
         )
         self._lbl_target.setStyleSheet("color: #ddd;")
-        self._run()
+        self._backend.set_target(target)  # stops old, stores target, starts pipeline
 
     # ── Controller lifecycle ──────────────────────────────────────────────
 
