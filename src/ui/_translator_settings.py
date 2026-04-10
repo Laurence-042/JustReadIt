@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSize, Qt, Signal, Slot
+from PySide6.QtCore import QSignalBlocker, QSize, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -265,6 +265,10 @@ class TranslatorSettingsWidget(QWidget):
         self._cmb_backend.currentIndexChanged.connect(self._on_backend_changed)
         self._cmb_preset.currentIndexChanged.connect(self._on_preset_selected)
 
+        # Reactive config → widget sync: keep target-lang combo current when
+        # another view (e.g. main window) changes the setting.
+        _cfg.translator_target_lang_changed.connect(self._sync_target_lang)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -352,6 +356,12 @@ class TranslatorSettingsWidget(QWidget):
                 return
         # Not in preset list — type it directly (editable combo)
         self._cmb_target_lang.setCurrentText(tag)
+
+    @Slot(str)
+    def _sync_target_lang(self, tag: str) -> None:
+        """React to config change: update target-lang combo without feedback."""
+        with QSignalBlocker(self._cmb_target_lang):
+            self.set_target_lang(tag)
 
     def _build_from_config(self) -> None:
         """Build translator from saved AppConfig and inject into AppBackend."""

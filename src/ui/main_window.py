@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QEvent, QTimer, Qt, Slot
+from PySide6.QtCore import QEvent, QSignalBlocker, QTimer, Qt, Slot
 from PySide6.QtGui import QAction, QFont, QIcon, QPainter, QPixmap, QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,6 +43,7 @@ from src.app_backend import AppBackend
 from src.config import AppConfig
 from src.ocr.windows_ocr import _ensure_apartment
 from src.target import GameTarget
+from ._config_model import ConfigModel
 from .window_picker import WindowPicker
 
 _cfg = AppConfig()
@@ -100,6 +101,10 @@ class MainWindow(QMainWindow):
         self._backend.ready.connect(self._on_worker_ready)
         self._backend.freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
 
+        # Reactive config → widget sync: target-lang combo has custom
+        # parsing logic, so it is not managed by QDataWidgetMapper.
+        _cfg.translator_target_lang_changed.connect(self._sync_tgt_lang_combo)
+
     # ── UI ────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -154,12 +159,11 @@ class MainWindow(QMainWindow):
             "翻译源语言（OCR 识别语言）\u2014 更改后立即生效。"
         )
         self._populate_src_languages()
-        _saved_src = _cfg.ocr_language
-        for _i in range(self._cmb_src_lang.count()):
-            if self._cmb_src_lang.itemData(_i) == _saved_src:
-                self._cmb_src_lang.setCurrentIndex(_i)
-                break
-        self._cmb_src_lang.currentIndexChanged.connect(self._on_src_lang_changed)
+        # Two-way bind: combo ↔ AppConfig.ocr_language via QDataWidgetMapper.
+        self._mapper = ConfigModel.create_mapper(
+            self,
+            (self._cmb_src_lang, ConfigModel.OCR_LANGUAGE),
+        )
         lang_row.addWidget(_lbl_src)
         lang_row.addSpacing(4)
         lang_row.addWidget(self._cmb_src_lang)
@@ -315,18 +319,8 @@ class MainWindow(QMainWindow):
             self._cmb_src_lang.addItem(f"(error: {exc})", userData="ja")
 
     @Slot(int)
-    def _on_src_lang_changed(self, index: int) -> None:
-        """Persist the selected OCR language and restart the controller."""
-        tag = self._cmb_src_lang.itemData(index)
-        if not tag:
-            return
-        _cfg.ocr_language = tag
-        if self._backend.is_running:
-            self._backend.start()
-
-    @Slot(int)
     def _on_tgt_lang_changed(self, index: int) -> None:
-        """Persist the selected target language and restart the controller."""
+        """Persist the selected target language (signal auto-restarts pipeline)."""
         idx = self._cmb_tgt_lang.currentIndex()
         tag: str = ""
         if idx >= 0:
@@ -340,14 +334,20 @@ class MainWindow(QMainWindow):
         if not tag:
             return
         _cfg.translator_target_lang = tag
-        # Sync debug window's translator settings if open.
-        if self._debug_window is not None:
-            try:
-                self._debug_window._tl_settings.set_target_lang(tag)
-            except Exception:
-                pass
-        if self._backend.is_running:
-            self._backend.start()
+
+    # ── Reactive config → widget sync (unmapped widgets only) ─────────
+
+    @Slot(str)
+    def _sync_tgt_lang_combo(self, tag: str) -> None:
+        with QSignalBlocker(self._cmb_tgt_lang):
+            found = False
+            for i in range(self._cmb_tgt_lang.count()):
+                if self._cmb_tgt_lang.itemData(i) == tag:
+                    self._cmb_tgt_lang.setCurrentIndex(i)
+                    found = True
+                    break
+            if not found:
+                self._cmb_tgt_lang.setCurrentText(tag)
 
     # ── Window picking ────────────────────────────────────────────────────
 
@@ -387,15 +387,6 @@ class MainWindow(QMainWindow):
         )
         self._lbl_target.setStyleSheet("color: #ddd;")
         self._backend.set_target(target)  # stops old, stores target, starts pipeline
-
-    # ── Controller lifecycle ──────────────────────────────────────────────
-
-    def _run(self) -> None:
-        """Delegate pipeline start to :class:`AppBackend`."""
-        self._backend.start()
-
-    def _stop(self) -> None:
-        self._backend.stop()
 
     # ── Controller → UI signals ───────────────────────────────────────────
 

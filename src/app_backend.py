@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from src.config import AppConfig
 from src.controller import HoverController
@@ -74,6 +74,26 @@ class AppBackend(QObject):
         # Attempt a silent translator build from saved config.
         self.rebuild_translator(silent=True)
 
+        # ── Reactive config → controller synchronisation ──────────────
+        # Settings that require a full controller restart (passed to the
+        # HoverController constructor).  A short debounce timer coalesces
+        # rapid-fire changes (e.g. batch config writes) into a single
+        # restart.
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.setInterval(50)
+        self._restart_timer.timeout.connect(self._deferred_restart)
+        _cfg.ocr_language_changed.connect(self._schedule_restart)
+        _cfg.ocr_max_size_changed.connect(self._schedule_restart)
+        _cfg.translator_target_lang_changed.connect(self._schedule_restart)
+
+        # Settings that can be pushed to the running controller without
+        # recreating it.
+        _cfg.interval_ms_changed.connect(self._on_cfg_interval)
+        _cfg.freeze_vk_changed.connect(self._on_cfg_freeze_vk)
+        _cfg.dump_vk_changed.connect(self._on_cfg_dump_vk)
+        _cfg.memory_scan_enabled_changed.connect(self._on_cfg_mem_scan)
+
     # ── Properties ───────────────────────────────────────────────────────────
 
     @property
@@ -115,6 +135,7 @@ class AppBackend(QObject):
         """
         if self._target is None:
             return
+        self._restart_timer.stop()  # cancel pending debounced restart
         self.stop()
         self._controller = HoverController(
             self._target,
@@ -212,25 +233,17 @@ class AppBackend(QObject):
             self._controller.set_translator(translator)
 
     def set_poll_interval(self, ms: int) -> None:
-        """Persist and push to the running controller without restart."""
+        """Write to config (triggers signal → auto-push to controller)."""
         _cfg.interval_ms = ms
-        if self._controller is not None:
-            self._controller.set_poll_interval(ms)
 
     def set_freeze_vk(self, vk: int) -> None:
         _cfg.freeze_vk = vk
-        if self._controller is not None:
-            self._controller.set_freeze_vk(vk)
 
     def set_dump_vk(self, vk: int) -> None:
         _cfg.dump_vk = vk
-        if self._controller is not None:
-            self._controller.set_dump_vk(vk)
 
     def set_memory_scan_enabled(self, enabled: bool) -> None:
         _cfg.memory_scan_enabled = enabled
-        if self._controller is not None:
-            self._controller.set_memory_scan_enabled(enabled)
 
     def clear_caches(self) -> None:
         if self._controller is not None:
@@ -245,6 +258,38 @@ class AppBackend(QObject):
             self._knowledge_base.close()
         except Exception:
             pass
+
+    # ── Reactive config → controller slots ────────────────────────────────
+
+    @Slot()
+    def _schedule_restart(self, *_args: object) -> None:
+        """Schedule a debounced pipeline restart after a config change."""
+        if self.is_running:
+            self._restart_timer.start()
+
+    @Slot()
+    def _deferred_restart(self) -> None:
+        self.start()
+
+    @Slot(int)
+    def _on_cfg_interval(self, ms: int) -> None:
+        if self._controller is not None:
+            self._controller.set_poll_interval(ms)
+
+    @Slot(int)
+    def _on_cfg_freeze_vk(self, vk: int) -> None:
+        if self._controller is not None:
+            self._controller.set_freeze_vk(vk)
+
+    @Slot(int)
+    def _on_cfg_dump_vk(self, vk: int) -> None:
+        if self._controller is not None:
+            self._controller.set_dump_vk(vk)
+
+    @Slot(bool)
+    def _on_cfg_mem_scan(self, enabled: bool) -> None:
+        if self._controller is not None:
+            self._controller.set_memory_scan_enabled(enabled)
 
     # ── Internal overlay handling ─────────────────────────────────────────────
 

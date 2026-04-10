@@ -15,7 +15,7 @@ import ctypes
 import logging
 
 from PySide6.QtCore import (
-    QSize, QTimer,
+    QSignalBlocker, QSize, QTimer,
     Signal, Slot, Qt,
 )
 
@@ -44,6 +44,7 @@ from src.controller import OcrOutput, PipelineResult, RangeOutput, StepResult
 from src.target import GameTarget
 from src.ocr.windows_ocr import _ensure_apartment
 from src.ocr.range_detectors import BoundingBox
+from ._config_model import ConfigModel
 from ._translator_settings import TranslatorSettingsWidget
 from .window_picker import WindowPicker
 
@@ -661,27 +662,6 @@ class DebugWindow(QMainWindow):
         self._btn_tools.setMenu(_tools_menu)
         tb.addWidget(self._btn_tools)
 
-        # ── Restore persisted settings ───────────────────────────────
-        saved_interval = _cfg.interval_ms
-        self._spn_interval.setValue(saved_interval)
-        saved_vk = _cfg.freeze_vk
-        for i in range(self._cmb_freeze_key.count()):
-            if self._cmb_freeze_key.itemData(i) == saved_vk:
-                self._cmb_freeze_key.setCurrentIndex(i)
-                break
-        saved_dump_vk = _cfg.dump_vk
-        for i in range(self._cmb_dump_key.count()):
-            if self._cmb_dump_key.itemData(i) == saved_dump_vk:
-                self._cmb_dump_key.setCurrentIndex(i)
-                break
-
-        # Live-update freeze hotkey when combo changes.
-        self._cmb_freeze_key.currentIndexChanged.connect(self._on_freeze_key_changed)
-        self._cmb_dump_key.currentIndexChanged.connect(self._on_dump_key_changed)
-
-        # Live-update poll interval when spinbox changes.
-        self._spn_interval.valueChanged.connect(self._on_interval_changed)
-
         # ── Install progress bar (hidden until capability install) ───
         self._install_bar = QWidget()
         _ibl = QHBoxLayout(self._install_bar)
@@ -732,7 +712,6 @@ class DebugWindow(QMainWindow):
         _vsep.setFixedWidth(2)
 
         self._chk_mem_scan = QCheckBox("内存扫描")
-        self._chk_mem_scan.setChecked(_cfg.memory_scan_enabled)
         self._chk_mem_scan.setToolTip(
             "启用 ReadProcessMemory 内存扫描（提升文本精度，但会增加内存占用）\n"
             "内存较大的游戏建议关闭以使用纯 OCR 模式"
@@ -751,7 +730,6 @@ class DebugWindow(QMainWindow):
         self._chk_boxes.toggled.connect(self._on_toggle_boxes)
         self._chk_labels.toggled.connect(self._on_toggle_labels)
         self._chk_region.toggled.connect(self._on_toggle_region)
-        self._chk_mem_scan.toggled.connect(self._on_toggle_mem_scan)
 
         splitter.addWidget(left)
 
@@ -796,8 +774,8 @@ class DebugWindow(QMainWindow):
         ocr_sl.addStretch()
         self._panel_wocr.add_settings_row(ocr_settings)
 
-        # Restore persisted OCR settings
-        self._spn_ocr_max.setValue(_cfg.ocr_max_size)
+        # Restore OCR language (not managed by the config-model mapper
+        # because the combo has custom language-pack install logic).
         saved_lang = _cfg.ocr_language
         for i in range(self._cmb_lang.count()):
             if self._cmb_lang.itemData(i) == saved_lang:
@@ -848,8 +826,26 @@ class DebugWindow(QMainWindow):
         self._notify_timer.setSingleShot(True)
         self._notify_timer.timeout.connect(lambda: self._notify_label.setText(""))
 
-        # Connect AFTER populating to avoid spurious install prompt.
+        # Connect widget change handlers AFTER populating to avoid spurious
+        # signals (e.g. the install prompt for missing OCR language packs).
         self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
+
+        # ── QDataWidgetMapper ────────────────────────────────────────
+        # Two-way binding: widget edits → config, config changes → widget.
+        # Replaces manual restore loops, widget→config handlers, and
+        # blockSignals sync slots for all mapped widgets.
+        self._mapper = ConfigModel.create_mapper(
+            self,
+            (self._spn_interval, ConfigModel.INTERVAL_MS),
+            (self._spn_ocr_max, ConfigModel.OCR_MAX_SIZE),
+            (self._cmb_freeze_key, ConfigModel.FREEZE_VK),
+            (self._cmb_dump_key, ConfigModel.DUMP_VK),
+            (self._chk_mem_scan, ConfigModel.MEMORY_SCAN_ENABLED),
+        )
+
+        # OCR language combo is NOT mapped (custom install logic in
+        # _on_lang_changed); sync from config manually.
+        _cfg.ocr_language_changed.connect(self._sync_lang_combo)
 
     # ------------------------------------------------------------------
     # Overlay toggle handlers
@@ -874,11 +870,6 @@ class DebugWindow(QMainWindow):
     def _on_toggle_region(self, checked: bool) -> None:
         self._preview.show_region = checked
         self._preview._render()
-
-    @Slot(bool)
-    def _on_toggle_mem_scan(self, checked: bool) -> None:
-        """Persist the memory-scan toggle and propagate to the running controller."""
-        self._backend.set_memory_scan_enabled(checked)
 
     # ------------------------------------------------------------------
     # Language helpers
@@ -935,13 +926,11 @@ class DebugWindow(QMainWindow):
             except Exception as exc:
                 _log.warning("WinRT OCR language check failed for %r: %s", tag, exc)
 
+        _cfg.ocr_language = tag  # signal → backend restart if running
         if self._backend.is_running:
             self.statusBar().showMessage(
                 f"正在以 lang={tag} 重启流水线…"
             )
-            self._run()
-
-        _cfg.ocr_language = tag
 
     # ------------------------------------------------------------------
     # Language pack installation
@@ -1072,28 +1061,8 @@ class DebugWindow(QMainWindow):
         self._backend.set_target(target)
 
     # ------------------------------------------------------------------
-    # Pipeline run / stop
+    # Pipeline lifecycle (delegated to AppBackend)
     # ------------------------------------------------------------------
-
-    def _run(self) -> None:
-        if self._backend.target is None:
-            self.statusBar().showMessage("请先选择游戏窗口。", 3000)
-            return
-        # Write UI control values to config so backend.start() picks them up.
-        lang = self._selected_language
-        interval = self._spn_interval.value()
-        _cfg.ocr_language = lang
-        _cfg.interval_ms = interval
-        _cfg.ocr_max_size = self._spn_ocr_max.value()
-        _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
-        _cfg.dump_vk = self._cmb_dump_key.currentData() or 0x77
-        self._backend.start()
-        self.statusBar().showMessage(
-            f"启动中 — 语言={lang}  延迟={interval} ms"
-        )
-
-    def _stop(self) -> None:
-        self._backend.stop()
 
     @Slot()
     def _on_clear_cache(self) -> None:
@@ -1180,10 +1149,6 @@ class DebugWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        # Persist toolbar settings.
-        _cfg.interval_ms = self._spn_interval.value()
-        _cfg.freeze_vk = self._cmb_freeze_key.currentData() or 0x78
-        _cfg.dump_vk = self._cmb_dump_key.currentData() or 0x77
         self.closed.emit()
         super().closeEvent(event)
         if self._standalone:
@@ -1193,20 +1158,6 @@ class DebugWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Freeze mode
     # ------------------------------------------------------------------
-
-    @Slot(int)
-    def _on_freeze_key_changed(self, index: int) -> None:
-        """Update the live freeze hotkey VK code and persist it."""
-        vk = self._cmb_freeze_key.itemData(index)
-        if vk is not None:
-            self._backend.set_freeze_vk(vk)
-
-    @Slot(int)
-    def _on_dump_key_changed(self, index: int) -> None:
-        """Update the live dump hotkey VK code and persist it."""
-        vk = self._cmb_dump_key.itemData(index)
-        if vk is not None:
-            self._backend.set_dump_vk(vk)
 
     @Slot()
     def _on_dump_triggered(self) -> None:
@@ -1248,11 +1199,6 @@ class DebugWindow(QMainWindow):
         self._notify_label.setText(msg)
         self._notify_timer.start(ms)
 
-    @Slot(int)
-    def _on_interval_changed(self, ms: int) -> None:
-        """Push the new poll interval to the running controller."""
-        self._backend.set_poll_interval(ms)
-
     # ------------------------------------------------------------------
     # Knowledge Manager
     # ------------------------------------------------------------------
@@ -1263,6 +1209,20 @@ class DebugWindow(QMainWindow):
         dlg = _KnowledgeManagerDialog(self._backend.knowledge_base, parent=self)
         dlg.exec()
 
+    # ------------------------------------------------------------------
+    # Reactive config → widget sync (unmapped widgets only)
+    # ------------------------------------------------------------------
+    # Widgets bound via QDataWidgetMapper auto-sync; only the OCR language
+    # combo (which has custom install logic) needs a manual sync slot.
+
+    @Slot(str)
+    def _sync_lang_combo(self, tag: str) -> None:
+        """Update OCR language combo from config (not managed by mapper)."""
+        with QSignalBlocker(self._cmb_lang):
+            for i in range(self._cmb_lang.count()):
+                if self._cmb_lang.itemData(i) == tag:
+                    self._cmb_lang.setCurrentIndex(i)
+                    break
 
     # ------------------------------------------------------------------
     # Translator settings panel

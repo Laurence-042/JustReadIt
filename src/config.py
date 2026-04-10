@@ -5,19 +5,24 @@ Backed by a QSettings INI file at::
     %APPDATA%\\JustReadIt\\config.ini
 
 Typed properties replace raw ``QSettings.value()`` calls so key names and
-default values are defined in one place.
+default values are defined in one place.  Every setter emits a
+``<property>_changed`` signal when the persisted value actually changes,
+enabling reactive UI updates without manual push synchronisation.
+
+``AppConfig`` is a **singleton** — every ``AppConfig()`` call returns the
+same instance so that signal connections are shared across all modules.
 
 Usage::
 
     cfg = AppConfig()
     cfg.ocr_language          # -> str
-    cfg.ocr_language = "ja"
+    cfg.ocr_language = "ja"   # emits ocr_language_changed("ja")
     cfg.interval_ms           # -> int
-    cfg.interval_ms = 1500
+    cfg.interval_ms = 1500    # emits interval_ms_changed(1500)
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QObject, QSettings, Signal
 
 
 def _make_qsettings() -> QSettings:
@@ -29,13 +34,84 @@ def _make_qsettings() -> QSettings:
     )
 
 
-class AppConfig:
-    """Thin typed wrapper around ``QSettings``.
+class AppConfig(QObject):
+    """Reactive typed wrapper around ``QSettings``.
 
-    Each property handles its own key name, type coercion, and default value.
-    A new ``QSettings`` handle is opened on every access, which is cheap and
-    avoids holding a stale handle across long-lived objects.
+    Singleton — every ``AppConfig()`` call returns the same instance.
+
+    Each settable property emits a ``<name>_changed`` signal when the
+    persisted value actually changes.  Views and backends connect to these
+    signals to react; no manual push synchronisation required.
     """
+
+    _instance: "AppConfig | None" = None
+
+    # ── Change signals ─────────────────────────────────────────────────
+    ocr_language_changed = Signal(str)
+    ocr_max_size_changed = Signal(int)
+    interval_ms_changed = Signal(int)
+    memory_scan_enabled_changed = Signal(bool)
+    translator_backend_changed = Signal(str)
+    translator_target_lang_changed = Signal(str)
+    cloud_api_key_changed = Signal(str)
+    openai_api_key_changed = Signal(str)
+    openai_model_changed = Signal(str)
+    openai_base_url_changed = Signal(str)
+    openai_system_prompt_changed = Signal(str)
+    openai_context_window_changed = Signal(int)
+    openai_summary_trigger_changed = Signal(int)
+    openai_tools_enabled_changed = Signal(bool)
+    openai_disable_thinking_changed = Signal(bool)
+    dump_vk_changed = Signal(int)
+    freeze_vk_changed = Signal(int)
+
+    def __new__(cls) -> "AppConfig":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        super().__init__()
+        self._initialized = True
+
+    # ── Setter helpers ─────────────────────────────────────────────────
+
+    def _set_str(
+        self, key: str, value: str, default: str, sig: Signal
+    ) -> None:
+        s = _make_qsettings()
+        if str(s.value(key, default)) == value:
+            return
+        s.setValue(key, value)
+        s.sync()
+        sig.emit(value)
+
+    def _set_int(
+        self, key: str, value: int, default: int, sig: Signal
+    ) -> None:
+        s = _make_qsettings()
+        if int(s.value(key, default)) == value:
+            return
+        s.setValue(key, value)
+        s.sync()
+        sig.emit(value)
+
+    def _set_bool(
+        self, key: str, value: bool, default: bool, sig: Signal  # noqa: FBT001
+    ) -> None:
+        s = _make_qsettings()
+        raw = s.value(key, default)
+        if isinstance(raw, str):
+            old = raw.lower() not in ("false", "0", "no")
+        else:
+            old = bool(raw)
+        if old == value:
+            return
+        s.setValue(key, value)
+        s.sync()
+        sig.emit(value)
 
     # ── OCR ────────────────────────────────────────────────────────────
 
@@ -45,9 +121,7 @@ class AppConfig:
 
     @ocr_language.setter
     def ocr_language(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("ocr/language", value)
-        s.sync()
+        self._set_str("ocr/language", value, "ja", self.ocr_language_changed)
 
     @property
     def ocr_max_size(self) -> int:
@@ -65,9 +139,7 @@ class AppConfig:
 
     @ocr_max_size.setter
     def ocr_max_size(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("ocr/max_size", value)
-        s.sync()
+        self._set_int("ocr/max_size", value, 1920, self.ocr_max_size_changed)
 
     # ── Pipeline ───────────────────────────────────────────────────────
 
@@ -77,9 +149,7 @@ class AppConfig:
 
     @interval_ms.setter
     def interval_ms(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("pipeline/interval_ms", value)
-        s.sync()
+        self._set_int("pipeline/interval_ms", value, 1500, self.interval_ms_changed)
 
     @property
     def memory_scan_enabled(self) -> bool:
@@ -95,9 +165,10 @@ class AppConfig:
 
     @memory_scan_enabled.setter
     def memory_scan_enabled(self, value: bool) -> None:
-        s = _make_qsettings()
-        s.setValue("pipeline/memory_scan_enabled", value)
-        s.sync()
+        self._set_bool(
+            "pipeline/memory_scan_enabled", value, True,
+            self.memory_scan_enabled_changed,
+        )
 
     # ── Translation backend ────────────────────────────────────────────
 
@@ -108,9 +179,10 @@ class AppConfig:
 
     @translator_backend.setter
     def translator_backend(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("translator/backend", value)
-        s.sync()
+        self._set_str(
+            "translator/backend", value, "cloud",
+            self.translator_backend_changed,
+        )
 
     @property
     def translator_target_lang(self) -> str:
@@ -119,9 +191,10 @@ class AppConfig:
 
     @translator_target_lang.setter
     def translator_target_lang(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("translator/target_lang", value)
-        s.sync()
+        self._set_str(
+            "translator/target_lang", value, "en",
+            self.translator_target_lang_changed,
+        )
 
     # ── Cloud Translation API ──────────────────────────────────────────
 
@@ -132,9 +205,7 @@ class AppConfig:
 
     @cloud_api_key.setter
     def cloud_api_key(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("cloud/api_key", value)
-        s.sync()
+        self._set_str("cloud/api_key", value, "", self.cloud_api_key_changed)
 
     # ── OpenAI ────────────────────────────────────────────────────────
 
@@ -145,9 +216,7 @@ class AppConfig:
 
     @openai_api_key.setter
     def openai_api_key(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/api_key", value)
-        s.sync()
+        self._set_str("openai/api_key", value, "", self.openai_api_key_changed)
 
     @property
     def openai_model(self) -> str:
@@ -156,9 +225,9 @@ class AppConfig:
 
     @openai_model.setter
     def openai_model(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/model", value)
-        s.sync()
+        self._set_str(
+            "openai/model", value, "gpt-4o-mini", self.openai_model_changed,
+        )
 
     @property
     def openai_base_url(self) -> str:
@@ -167,9 +236,7 @@ class AppConfig:
 
     @openai_base_url.setter
     def openai_base_url(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/base_url", value)
-        s.sync()
+        self._set_str("openai/base_url", value, "", self.openai_base_url_changed)
 
     @property
     def openai_system_prompt(self) -> str:
@@ -178,9 +245,10 @@ class AppConfig:
 
     @openai_system_prompt.setter
     def openai_system_prompt(self, value: str) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/system_prompt", value)
-        s.sync()
+        self._set_str(
+            "openai/system_prompt", value, "",
+            self.openai_system_prompt_changed,
+        )
 
     @property
     def openai_context_window(self) -> int:
@@ -189,9 +257,10 @@ class AppConfig:
 
     @openai_context_window.setter
     def openai_context_window(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/context_window", value)
-        s.sync()
+        self._set_int(
+            "openai/context_window", value, 10,
+            self.openai_context_window_changed,
+        )
 
     @property
     def openai_summary_trigger(self) -> int:
@@ -200,9 +269,10 @@ class AppConfig:
 
     @openai_summary_trigger.setter
     def openai_summary_trigger(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/summary_trigger", value)
-        s.sync()
+        self._set_int(
+            "openai/summary_trigger", value, 20,
+            self.openai_summary_trigger_changed,
+        )
 
     @property
     def openai_tools_enabled(self) -> bool:
@@ -219,9 +289,10 @@ class AppConfig:
 
     @openai_tools_enabled.setter
     def openai_tools_enabled(self, value: bool) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/tools_enabled", value)
-        s.sync()
+        self._set_bool(
+            "openai/tools_enabled", value, True,
+            self.openai_tools_enabled_changed,
+        )
 
     @property
     def openai_disable_thinking(self) -> bool:
@@ -238,9 +309,10 @@ class AppConfig:
 
     @openai_disable_thinking.setter
     def openai_disable_thinking(self, value: bool) -> None:
-        s = _make_qsettings()
-        s.setValue("openai/disable_thinking", value)
-        s.sync()
+        self._set_bool(
+            "openai/disable_thinking", value, True,
+            self.openai_disable_thinking_changed,
+        )
 
     # ── Hover overlay ──────────────────────────────────────────────────
 
@@ -251,9 +323,7 @@ class AppConfig:
 
     @dump_vk.setter
     def dump_vk(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("overlay/dump_vk", value)
-        s.sync()
+        self._set_int("overlay/dump_vk", value, 0x77, self.dump_vk_changed)
 
     @property
     def freeze_vk(self) -> int:
@@ -262,6 +332,4 @@ class AppConfig:
 
     @freeze_vk.setter
     def freeze_vk(self, value: int) -> None:
-        s = _make_qsettings()
-        s.setValue("overlay/freeze_vk", value)
-        s.sync()
+        self._set_int("overlay/freeze_vk", value, 0x78, self.freeze_vk_changed)
