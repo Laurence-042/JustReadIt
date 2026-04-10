@@ -317,7 +317,11 @@ class AppBackend(QObject):
     def _on_freeze_triggered_internal(
         self, screenshot: object, left: int, top: int, pid: int, hwnd: int
     ) -> None:
-        self._freeze_overlay.freeze(screenshot, left, top, pid, hwnd)
+        # F9 acts as a toggle: if freeze is already active, dismiss it.
+        if self._freeze_overlay.is_active:
+            self._freeze_overlay.dismiss()
+        else:
+            self._freeze_overlay.freeze(screenshot, left, top, pid, hwnd)
 
     @Slot()
     def _on_freeze_dismissed(self) -> None:

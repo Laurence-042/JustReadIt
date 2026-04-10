@@ -250,10 +250,6 @@ class HoverController(QObject):
         # the full pipeline when the cursor re-settles over the same text.
         self._last_region_text: str = ""
 
-        # Freeze mode state
-        self._in_freeze = False
-        self._freeze_frame: "PILImage | None" = None
-
         # Freeze hotkey edge-detection: True if key was down last tick
         self._freeze_key_was_down: bool = False
         # Dump hotkey edge-detection
@@ -375,20 +371,13 @@ class HoverController(QObject):
     # ------------------------------------------------------------------
 
     @Slot(float, float)
-    def on_freeze_hover(self, x: float, y: float) -> None:
-        """Translate the text under ``(x, y)`` in the frozen frame."""
-        if not self._in_freeze or self._freeze_frame is None or self._ocr is None:
-            return
-        try:
-            self._run_pipeline(self._freeze_frame, int(x), int(y))
-        except Exception as exc:
-            _log.exception("Freeze hover pipeline error: %s", exc)
+    def on_freeze_hover(self, x: float, y: float) -> None:  # noqa: ARG002
+        """No-op: the regular poll loop captures the freeze overlay via DXGI,
+        so no special freeze-hover pipeline path is needed."""
 
     @Slot()
     def on_freeze_dismissed(self) -> None:
         """Called when the freeze overlay is closed; resume normal hover mode."""
-        self._in_freeze = False
-        self._freeze_frame = None
         self._settled = False
         self._settle_start = time.monotonic()
         self._last_region_text = ""
@@ -410,13 +399,13 @@ class HoverController(QObject):
     @Slot()
     def _poll_hotkeys(self) -> None:
         """Fast hotkey poll — runs every 100 ms independent of pipeline interval."""
-        # ── Freeze hotkey (edge-triggered) ───────────────────────────
+        # ── Freeze hotkey (edge-triggered) ─────────────────────────────────────────
+        # Always emit freeze_triggered on a rising edge; AppBackend decides whether
+        # to show a new freeze frame or dismiss the existing overlay.
         key_down = bool(_user32.GetAsyncKeyState(self._freeze_vk) & 0x8000)
-        if key_down and not self._freeze_key_was_down and not self._in_freeze:
-            self._freeze_key_was_down = True
+        if key_down and not self._freeze_key_was_down:
             self._trigger_freeze()
-        else:
-            self._freeze_key_was_down = key_down
+        self._freeze_key_was_down = key_down
         # ── Debug-dump hotkey (edge-triggered) ─────────────────
         dump_down = bool(_user32.GetAsyncKeyState(self._dump_vk) & 0x8000)
         if dump_down and not self._dump_key_was_down:
@@ -426,9 +415,6 @@ class HoverController(QObject):
     @Slot()
     def _poll(self) -> None:
         """Main polling tick — called every ``poll_ms`` ms by QTimer."""
-        if self._in_freeze:
-            return  # hover events drive the pipeline in freeze mode
-
         # Always refresh target geometry first so cursor hit-testing and
         # overlay origin use up-to-date window coordinates after moving the
         # game window across monitors.
@@ -525,8 +511,6 @@ class HoverController(QObject):
         if img is None:
             return
 
-        self._in_freeze = True
-        self._freeze_frame = img
         wr = self._target.window_rect
         self.freeze_triggered.emit(
             img,
@@ -745,7 +729,6 @@ class HoverController(QObject):
                 corrected_text = region_text
         scan_step = StepResult(mem_text, scan_ms)
         corr_step = StepResult(corrected_text, corr_ms)
-
         # ── Text cache (persistent) ──────────────────────────────────────────────────────────
         translation = ""
         if self._text_cache is not None:

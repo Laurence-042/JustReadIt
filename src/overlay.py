@@ -44,6 +44,51 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+
+def _bake_freeze_annotation(img_rgb: "PILImage") -> "PILImage":
+    """Return a copy of *img_rgb* with an amber border and a hint label drawn
+    directly onto the pixel data.
+
+    Baking into the image keeps ``FreezeOverlay.paintEvent`` stateless — the
+    overlay only needs to know whether it has a pixmap at all.
+    """
+    from PIL import ImageDraw, ImageFont  # soft import — only needed here
+
+    out = img_rgb.copy()
+    draw = ImageDraw.Draw(out)
+    amber = (255, 140, 0)
+    w, h = out.size
+
+    # ── Amber border (6 px thick) ─────────────────────────────────────
+    border = 6
+    for i in range(border):
+        draw.rectangle([i, i, w - 1 - i, h - 1 - i], outline=amber)
+
+    # ── Hint label (top-right corner) ────────────────────────────────
+    hint = "[ \u51bb\u5c4f ]  \u53f3\u952e / Esc / F9 \u9000\u51fa"
+    font: "ImageFont.FreeTypeFont | ImageFont.ImageFont | None" = None
+    for font_name in ("msyh.ttc", "meiryo.ttc", "segoeui.ttf", "arial.ttf"):
+        try:
+            font = ImageFont.truetype(f"C:/Windows/Fonts/{font_name}", 17)
+            break
+        except Exception:
+            pass
+    if font is None:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), hint, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    pad_x, pad_y = 12, 6
+    rx = w - tw - pad_x * 2 - border - 4
+    ry = border + 4
+    draw.rectangle(
+        [rx - pad_x, ry - pad_y, rx + tw + pad_x, ry + th + pad_y],
+        fill=(20, 20, 20),
+    )
+    draw.text((rx, ry), hint, font=font, fill=amber)
+    return out
+
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 
@@ -392,8 +437,8 @@ class FreezeOverlay(Overlay):
         self._target_hwnd = target_hwnd
         self._text = ""
 
-        # Convert PIL → QPixmap
-        img_rgb = screenshot.convert("RGB")
+        # Bake amber border + hint label into the image before converting.
+        img_rgb = _bake_freeze_annotation(screenshot.convert("RGB"))
         raw = img_rgb.tobytes("raw", "RGB")
         qimg = QImage(
             raw,
