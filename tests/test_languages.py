@@ -22,8 +22,8 @@ class TestDisplayName:
         [
             ("ja",    "日本語"),
             ("ja-JP", "日本語"),
-            ("zh-CN", "中文"),
-            ("zh-TW", "中文"),
+            ("zh-Hans-CN", "中文"),
+            ("zh-Hant-TW", "中文"),
             ("en",    "English"),
             ("ko",    "한국어"),
             ("fr",    "français"),
@@ -48,8 +48,8 @@ class TestTargetPresets:
         assert len(TARGET_PRESETS) == len(set(TARGET_PRESETS))
 
     def test_zh_cn_is_first(self) -> None:
-        """zh-CN is the most common target; should be first preset."""
-        assert TARGET_PRESETS[0] == "zh-CN"
+        """zh-Hans-CN is the most common target; should be first preset."""
+        assert TARGET_PRESETS[0] == "zh-Hans-CN"
 
     def test_all_strings(self) -> None:
         for code in TARGET_PRESETS:
@@ -63,9 +63,20 @@ class TestTargetPresets:
 class TestDeepTranslator:
     """``_to_deep_translator()`` only does BCP-47 → legacy downgrades."""
 
-    def test_chinese_region_preserved(self) -> None:
-        assert _to_deep_translator("zh-CN") == "zh-CN"
-        assert _to_deep_translator("zh-TW") == "zh-TW"
+    @pytest.mark.parametrize(
+        ("bcp47", "expected"),
+        [
+            # All Chinese variants resolve via langcodes script inference
+            ("zh-CN",      "zh-CN"),
+            ("zh-TW",      "zh-TW"),
+            ("zh-Hans-CN", "zh-CN"),   # Windows OCR form
+            ("zh-Hant-TW", "zh-TW"),   # Windows OCR form
+            ("zh-Hans",    "zh-CN"),
+            ("zh-Hant",    "zh-TW"),
+        ],
+    )
+    def test_chinese_variants(self, bcp47: str, expected: str) -> None:
+        assert _to_deep_translator(bcp47) == expected
 
     @pytest.mark.parametrize(
         ("bcp47", "expected"),

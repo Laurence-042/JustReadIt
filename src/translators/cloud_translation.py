@@ -21,7 +21,7 @@ Usage::
     from src.translators.cloud_translation import CloudTranslationTranslator
 
     translator = CloudTranslationTranslator(api_key="AIza...")
-    result = translator.translate("おはようございます", target_lang="zh-CN")
+    result = translator.translate("おはようございます", target_lang="zh-Hans-CN")
 """
 from __future__ import annotations
 
@@ -85,7 +85,7 @@ class CloudTranslationTranslator(Translator):
             text: Source text.
             source_lang: BCP-47 source language code (e.g. ``"ja"``).
                 Pass ``"auto"`` or ``""`` to let the API auto-detect.
-            target_lang: BCP-47 target language code (e.g. ``"en"``, ``"zh-CN"``).
+            target_lang: BCP-47 target language code (e.g. ``"en"``, ``"zh-Hans-CN"``).
 
         Returns:
             Translated string.

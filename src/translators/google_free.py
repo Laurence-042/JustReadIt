@@ -16,11 +16,13 @@ Usage::
     from src.translators.google_free import GoogleFreeTranslator
 
     translator = GoogleFreeTranslator()
-    result = translator.translate("おはようございます", target_lang="zh-CN")
+    result = translator.translate("おはようございます", target_lang="zh-Hans-CN")
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+import langcodes
 
 from src.translators._installer import ensure_package
 from src.translators.base import TranslationError, Translator
@@ -32,11 +34,11 @@ if TYPE_CHECKING:
 # BCP-47 → deep-translator code
 # ---------------------------------------------------------------------------
 # deep-translator silently strips region subtags and then rejects bare
-# ``"zh"`` ("No support for the provided language").  Chinese tags must
-# be kept intact.  A few BCP-47 codes map to legacy Google identifiers.
-
-# Tags whose region subtag must NOT be stripped.
-_KEEP_REGION: frozenset[str] = frozenset({"zh-CN", "zh-TW"})
+# ``"zh"`` ("No support for the provided language").  Chinese tags need
+# special handling: resolve to "zh-CN" (Hans) or "zh-TW" (Hant) via
+# langcodes script inference so both ``"zh-CN"`` and ``"zh-Hans-CN"``
+# (the form Windows OCR returns) produce a working code.
+# A few BCP-47 codes also map to legacy Google identifiers.
 
 # BCP-47 → legacy Google code (pure downgrades).
 _LEGACY: dict[str, str] = {
@@ -49,8 +51,12 @@ _LEGACY: dict[str, str] = {
 
 def _to_deep_translator(bcp47: str) -> str:
     """Convert a BCP-47 tag to the code ``deep-translator`` accepts."""
-    if bcp47 in _KEEP_REGION:
-        return bcp47
+    # Resolve Chinese variants by script (works for zh-CN, zh-TW,
+    # zh-Hans-CN, zh-Hant-TW, zh-Hans, zh-Hant, … all in one go).
+    lang = langcodes.Language.get(bcp47)
+    if lang.language == "zh":
+        script = (lang.script or langcodes.Language.get(bcp47).maximize().script or "Hans")
+        return "zh-TW" if script == "Hant" else "zh-CN"
     if bcp47 in _LEGACY:
         return _LEGACY[bcp47]
     # Strip region: "ja-JP" → "ja", "en-US" → "en"
@@ -93,7 +99,7 @@ class GoogleFreeTranslator(Translator):
             source_lang: BCP-47 / ISO 639-1 source language code
                 (e.g. ``"ja"``).  Pass ``"auto"`` or ``""`` to auto-detect.
             target_lang: BCP-47 / ISO 639-1 target language code
-                (e.g. ``"en"``, ``"zh-CN"``, ``"zh-TW"``).
+                (e.g. ``"en"``, ``"zh-Hans-CN"``, ``"zh-Hant-TW"``).
 
         Returns:
             Translated string.

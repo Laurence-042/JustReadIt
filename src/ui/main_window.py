@@ -181,7 +181,7 @@ class MainWindow(QMainWindow):
         )
         for _code in TARGET_PRESETS:
             self._cmb_tgt_lang.addItem(display_name(_code), userData=_code)
-        _saved_tgt = _cfg.translator_target_lang or "zh-CN"
+        _saved_tgt = _cfg.translator_target_lang or "zh-Hans-CN"
         _tgt_found = False
         for _i in range(self._cmb_tgt_lang.count()):
             if self._cmb_tgt_lang.itemData(_i) == _saved_tgt:

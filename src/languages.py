@@ -23,8 +23,8 @@ import langcodes
 # directly to translators.  Display labels come from ``display_name()``.
 
 TARGET_PRESETS: list[str] = [
-    "zh-CN",
-    "zh-TW",
+    "zh-Hans-CN",
+    "zh-Hant-TW",
     "en",
     "ko",
     "fr",
@@ -48,14 +48,24 @@ def display_name(tag: str) -> str:
 
     >>> display_name("ja")
     'ja — 日本語'
-    >>> display_name("zh-CN")
-    'zh-CN — 中文（中国）'
+    >>> display_name("zh-Hans-CN")
+    'zh-Hans-CN — 中文（简体）'
+    >>> display_name("zh-Hant-TW")
+    'zh-Hant-TW — 中文（繁体）'
     """
     if not langcodes.tag_is_valid(tag):
         return tag
     try:
         lang = langcodes.Language.get(tag)
-        native = lang.display_name(lang.language)
+        # When a script subtag is present, display as "language+script" so the
+        # label reflects the writing system without mentioning any country or
+        # region (e.g. "中文（简体）" instead of "中文（中国）").
+        # For plain language / language+region tags, use the bare language name.
+        if lang.script:
+            basis = langcodes.Language.make(language=lang.language, script=lang.script)
+        else:
+            basis = langcodes.Language.get(lang.language)
+        native = basis.display_name(lang.language)
         if native and native != tag:
             return f"{tag} — {native}"
     except Exception:  # noqa: BLE001

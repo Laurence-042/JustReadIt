@@ -115,7 +115,7 @@ class TranslatorSettingsWidget(QWidget):
         for code in TARGET_PRESETS:
             self._cmb_target_lang.addItem(display_name(code), userData=code)
         self._cmb_target_lang.setToolTip(
-            "BCP-47 目标语言标签（如 zh-CN、en、ko）。\n"
+            "BCP-47 目标语言标签（如 zh-Hans-CN、en、ko）。\n"
             "从列表中选择或直接输入自定义标签。"
         )
         row1.addWidget(self._cmb_target_lang)
@@ -265,7 +265,7 @@ class TranslatorSettingsWidget(QWidget):
         # Editable combo: strip display suffix like " — 简体中文"
         text = self._cmb_target_lang.currentText().strip()
         code = text.split(" ")[0] if text else ""
-        return code or "zh-CN"
+        return code or "zh-Hans-CN"
 
     def load_from_config(self) -> None:
         """Populate all fields from :class:`AppConfig`."""
@@ -275,7 +275,7 @@ class TranslatorSettingsWidget(QWidget):
                 self._cmb_backend.setCurrentIndex(i)
                 break
 
-        self.set_target_lang(_cfg.translator_target_lang or "zh-CN")
+        self.set_target_lang(_cfg.translator_target_lang or "zh-Hans-CN")
 
         self._spn_context_window.setValue(_cfg.openai_context_window)
         self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
@@ -348,7 +348,7 @@ class TranslatorSettingsWidget(QWidget):
     def _build_from_config(self) -> None:
         """Build translator from saved AppConfig and inject into AppBackend."""
         backend_key = _cfg.translator_backend
-        target_lang = _cfg.translator_target_lang or "zh-CN"
+        target_lang = _cfg.translator_target_lang or "zh-Hans-CN"
         self._set_status("构建中…")
         QApplication.processEvents()
         try:
