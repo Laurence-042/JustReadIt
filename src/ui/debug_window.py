@@ -22,6 +22,7 @@ from PySide6.QtCore import (
 from src.app_backend import AppBackend
 from src.config import AppConfig
 from src.knowledge import KnowledgeBase
+from src.languages import display_name
 
 _cfg = AppConfig()
 _log = logging.getLogger(__name__)
@@ -885,7 +886,7 @@ class DebugWindow(QMainWindow):
             for lang in wocr.OcrEngine.available_recognizer_languages:
                 tag = lang.language_tag
                 installed_tags.add(tag)
-                self._cmb_lang.addItem(tag, userData=tag)
+                self._cmb_lang.addItem(display_name(tag), userData=tag)
 
             for tag, capability in _LANG_CAPABILITIES.items():
                 # WinRT tags are region-specific (e.g. "ja-JP"), while

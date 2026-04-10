@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from src.app_backend import AppBackend
 from src.config import AppConfig
+from src.languages import TARGET_PRESETS, display_name
 from src.translators.base import PROVIDERS, PROVIDERS_BY_KEY
 from src.translators.factory import build_translator
 from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT, OPENAI_PRESETS
@@ -36,25 +37,6 @@ if TYPE_CHECKING:
     from src.translators.base import Translator
 
 _cfg = AppConfig()
-
-# ---------------------------------------------------------------------------
-# BCP-47 target-language presets
-# ---------------------------------------------------------------------------
-
-_BCP47_TARGETS: list[tuple[str, str]] = [
-    ("zh-CN", "zh-CN — 简体中文"),
-    ("zh-TW", "zh-TW — 繁體中文"),
-    ("en",    "en — English"),
-    ("ko",    "ko — 한국어"),
-    ("fr",    "fr — Français"),
-    ("de",    "de — Deutsch"),
-    ("ja",    "ja — 日本語"),
-    ("es",    "es — Español"),
-    ("pt",    "pt — Português"),
-    ("ru",    "ru — Русский"),
-    ("ar",    "ar — العربية"),
-    ("it",    "it — Italiano"),
-]
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +112,8 @@ class TranslatorSettingsWidget(QWidget):
         self._cmb_target_lang = QComboBox()
         self._cmb_target_lang.setEditable(True)
         self._cmb_target_lang.setMinimumWidth(140)
-        for code, label in _BCP47_TARGETS:
-            self._cmb_target_lang.addItem(label, userData=code)
+        for code in TARGET_PRESETS:
+            self._cmb_target_lang.addItem(display_name(code), userData=code)
         self._cmb_target_lang.setToolTip(
             "BCP-47 目标语言标签（如 zh-CN、en、ko）。\n"
             "从列表中选择或直接输入自定义标签。"

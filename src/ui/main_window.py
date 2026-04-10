@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 
 from src.app_backend import AppBackend
 from src.config import AppConfig
+from src.languages import TARGET_PRESETS, display_name
 from src.ocr.windows_ocr import _ensure_apartment
 from src.target import GameTarget
 from ._config_model import ConfigModel
@@ -178,22 +179,8 @@ class MainWindow(QMainWindow):
             "翻译目标语言（BCP-47 标签）\u2014 更改后立即生效。\n"
             "从列表中选择或直接输入自定义标签。"
         )
-        _BCP47_TARGETS: list[tuple[str, str]] = [
-            ("zh-CN", "zh-CN \u2014 简体中文"),
-            ("zh-TW", "zh-TW \u2014 繁體中文"),
-            ("en",    "en \u2014 English"),
-            ("ko",    "ko \u2014 한국어"),
-            ("fr",    "fr \u2014 Français"),
-            ("de",    "de \u2014 Deutsch"),
-            ("ja",    "ja \u2014 日本語"),
-            ("es",    "es \u2014 Español"),
-            ("pt",    "pt \u2014 Português"),
-            ("ru",    "ru \u2014 Русский"),
-            ("ar",    "ar \u2014 العربية"),
-            ("it",    "it \u2014 Italiano"),
-        ]
-        for _code, _label in _BCP47_TARGETS:
-            self._cmb_tgt_lang.addItem(_label, userData=_code)
+        for _code in TARGET_PRESETS:
+            self._cmb_tgt_lang.addItem(display_name(_code), userData=_code)
         _saved_tgt = _cfg.translator_target_lang or "zh-CN"
         _tgt_found = False
         for _i in range(self._cmb_tgt_lang.count()):
@@ -314,7 +301,7 @@ class MainWindow(QMainWindow):
             _ensure_apartment()
             for lang in wocr.OcrEngine.available_recognizer_languages:
                 tag = lang.language_tag
-                self._cmb_src_lang.addItem(tag, userData=tag)
+                self._cmb_src_lang.addItem(display_name(tag), userData=tag)
         except Exception as exc:
             self._cmb_src_lang.addItem(f"(error: {exc})", userData="ja")
 

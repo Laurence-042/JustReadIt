@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
     from google.cloud.translate_v2 import Client as _GCTClient
 
-
 class CloudTranslationTranslator(Translator):
     """Translation backend backed by Google Cloud Translation API (Basic / v2).
 
@@ -97,7 +96,9 @@ class CloudTranslationTranslator(Translator):
         if not text.strip():
             return text
 
-        source: str | None = source_lang if source_lang not in ("auto", "") else None
+        source: str | None = (
+            source_lang if source_lang not in ("auto", "") else None
+        )
         try:
             result = self._client.translate(
                 text,

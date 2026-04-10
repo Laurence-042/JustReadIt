@@ -29,26 +29,31 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
-# deep-translator BCP-47 adapter
+# BCP-47 → deep-translator code
 # ---------------------------------------------------------------------------
-# deep-translator's GoogleTranslator does not accept bare macro tags or
-# script-only subtags.  Map from canonical BCP-47 to its expected codes.
-_DEEP_TRANSLATOR_LANG: dict[str, str] = {
-    "zh":      "zh-CN",   # macro tag → Simplified (most common default)
-    "zh-Hans": "zh-CN",
-    "zh-Hant": "zh-TW",
+# deep-translator silently strips region subtags and then rejects bare
+# ``"zh"`` ("No support for the provided language").  Chinese tags must
+# be kept intact.  A few BCP-47 codes map to legacy Google identifiers.
+
+# Tags whose region subtag must NOT be stripped.
+_KEEP_REGION: frozenset[str] = frozenset({"zh-CN", "zh-TW"})
+
+# BCP-47 → legacy Google code (pure downgrades).
+_LEGACY: dict[str, str] = {
+    "he":  "iw",
+    "fil": "tl",
+    "nb":  "no",
+    "nn":  "no",
 }
 
 
-def _to_deep_translator_lang(bcp47: str) -> str:
-    """Map a canonical BCP-47 tag to the code deep-translator accepts.
-
-    Falls back to the bare ISO 639-1 subtag when the full BCP-47 tag
-    (e.g. ``"en-US"``) is not in deep-translator's supported language set.
-    """
-    if bcp47 in _DEEP_TRANSLATOR_LANG:
-        return _DEEP_TRANSLATOR_LANG[bcp47]
-    # Strip region / script subtag: "en-US" → "en", "zh-CN" is kept above.
+def _to_deep_translator(bcp47: str) -> str:
+    """Convert a BCP-47 tag to the code ``deep-translator`` accepts."""
+    if bcp47 in _KEEP_REGION:
+        return bcp47
+    if bcp47 in _LEGACY:
+        return _LEGACY[bcp47]
+    # Strip region: "ja-JP" → "ja", "en-US" → "en"
     bare = bcp47.split("-")[0].lower()
     return bare if bare != bcp47.lower() else bcp47
 
@@ -99,8 +104,8 @@ class GoogleFreeTranslator(Translator):
         if not text.strip():
             return text
 
-        src = _to_deep_translator_lang(source_lang) if source_lang else "auto"
-        tgt = _to_deep_translator_lang(target_lang)
+        src = _to_deep_translator(source_lang) if source_lang else "auto"
+        tgt = _to_deep_translator(target_lang)
         try:
             result: str = self._gt_cls(source=src, target=tgt).translate(text)
         except Exception as exc:

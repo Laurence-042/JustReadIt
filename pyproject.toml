@@ -23,6 +23,7 @@ dependencies = [
     "psutil",
     "Pillow",
     "dxcam",        # DXGI Desktop Duplication capture
+    "langcodes[data]",  # BCP-47 language display names
 ]
 
 [project.optional-dependencies]
