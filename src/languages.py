@@ -39,7 +39,7 @@ TARGET_PRESETS: list[str] = [
 
 
 def display_name(tag: str) -> str:
-    """Return ``"tag — NativeName"`` for any BCP-47 tag.
+    """Return the native display name for a BCP-47 tag.
 
     Uses :func:`langcodes.Language.display_name` with the tag's own base
     language so the label appears in its native script (e.g. ``"日本語"``).
@@ -47,11 +47,11 @@ def display_name(tag: str) -> str:
     Falls back to the bare *tag* if ``langcodes`` cannot resolve it.
 
     >>> display_name("ja")
-    'ja — 日本語'
+    '日本語'
     >>> display_name("zh-Hans-CN")
-    'zh-Hans-CN — 中文（简体）'
+    '中文（简体）'
     >>> display_name("zh-Hant-TW")
-    'zh-Hant-TW — 中文（繁体）'
+    '中文（繁体）'
     """
     if not langcodes.tag_is_valid(tag):
         return tag
@@ -67,7 +67,7 @@ def display_name(tag: str) -> str:
             basis = langcodes.Language.get(lang.language)
         native = basis.display_name(lang.language)
         if native and native != tag:
-            return f"{tag} — {native}"
+            return native
     except Exception:  # noqa: BLE001
         pass
     return tag

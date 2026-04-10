@@ -110,13 +110,11 @@ class TranslatorSettingsWidget(QWidget):
         row1.addSpacing(12)
         row1.addWidget(QLabel("目标语言:"))
         self._cmb_target_lang = QComboBox()
-        self._cmb_target_lang.setEditable(True)
         self._cmb_target_lang.setMinimumWidth(140)
         for code in TARGET_PRESETS:
             self._cmb_target_lang.addItem(display_name(code), userData=code)
         self._cmb_target_lang.setToolTip(
-            "BCP-47 目标语言标签（如 zh-Hans-CN、en、ko）。\n"
-            "从列表中选择或直接输入自定义标签。"
+            "BCP-47 目标语言标签（如 zh-Hans-CN、en、ko）。"
         )
         row1.addWidget(self._cmb_target_lang)
         row1.addStretch()
@@ -262,10 +260,7 @@ class TranslatorSettingsWidget(QWidget):
             data = self._cmb_target_lang.itemData(idx)
             if data:
                 return str(data)
-        # Editable combo: strip display suffix like " — 简体中文"
-        text = self._cmb_target_lang.currentText().strip()
-        code = text.split(" ")[0] if text else ""
-        return code or "zh-Hans-CN"
+        return "zh-Hans-CN"
 
     def load_from_config(self) -> None:
         """Populate all fields from :class:`AppConfig`."""
@@ -336,8 +331,6 @@ class TranslatorSettingsWidget(QWidget):
             if self._cmb_target_lang.itemData(i) == tag:
                 self._cmb_target_lang.setCurrentIndex(i)
                 return
-        # Not in preset list — type it directly (editable combo)
-        self._cmb_target_lang.setCurrentText(tag)
 
     @Slot(str)
     def _sync_target_lang(self, tag: str) -> None:

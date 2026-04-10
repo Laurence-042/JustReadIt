@@ -15,7 +15,7 @@ from src.translators.google_free import _to_deep_translator
 # ---------------------------------------------------------------------------
 
 class TestDisplayName:
-    """``display_name()`` should return ``'tag — NativeName'``."""
+    """``display_name()`` should return the native name only."""
 
     @pytest.mark.parametrize(
         ("tag", "expected_fragment"),
@@ -32,8 +32,8 @@ class TestDisplayName:
     )
     def test_known_languages(self, tag: str, expected_fragment: str) -> None:
         result = display_name(tag)
-        assert result.startswith(f"{tag} — ")
         assert expected_fragment in result
+        assert not result.startswith(f"{tag} — ")
 
     def test_unknown_tag_returns_bare(self) -> None:
         assert display_name("xx-YY") == "xx-YY"

@@ -173,23 +173,17 @@ class MainWindow(QMainWindow):
         _lbl_tgt = QLabel("目标语言:")
         _lbl_tgt.setStyleSheet("color: #777; font-size: 9pt;")
         self._cmb_tgt_lang = QComboBox()
-        self._cmb_tgt_lang.setEditable(True)
         self._cmb_tgt_lang.setMaximumWidth(180)
         self._cmb_tgt_lang.setToolTip(
-            "翻译目标语言（BCP-47 标签）\u2014 更改后立即生效。\n"
-            "从列表中选择或直接输入自定义标签。"
+            "翻译目标语言（BCP-47 标签）— 更改后立即生效。"
         )
         for _code in TARGET_PRESETS:
             self._cmb_tgt_lang.addItem(display_name(_code), userData=_code)
         _saved_tgt = _cfg.translator_target_lang or "zh-Hans-CN"
-        _tgt_found = False
         for _i in range(self._cmb_tgt_lang.count()):
             if self._cmb_tgt_lang.itemData(_i) == _saved_tgt:
                 self._cmb_tgt_lang.setCurrentIndex(_i)
-                _tgt_found = True
                 break
-        if not _tgt_found:
-            self._cmb_tgt_lang.setCurrentText(_saved_tgt)
         self._cmb_tgt_lang.currentIndexChanged.connect(self._on_tgt_lang_changed)
         lang_row.addWidget(_lbl_tgt)
         lang_row.addSpacing(4)
@@ -309,32 +303,21 @@ class MainWindow(QMainWindow):
     def _on_tgt_lang_changed(self, index: int) -> None:
         """Persist the selected target language (signal auto-restarts pipeline)."""
         idx = self._cmb_tgt_lang.currentIndex()
-        tag: str = ""
-        if idx >= 0:
-            data = self._cmb_tgt_lang.itemData(idx)
-            if data:
-                tag = str(data)
-        if not tag:
-            # Editable combo — raw text
-            text = self._cmb_tgt_lang.currentText().strip()
-            tag = text.split(" ")[0] if text else ""
-        if not tag:
+        if idx < 0:
             return
-        _cfg.translator_target_lang = tag
+        data = self._cmb_tgt_lang.itemData(idx)
+        if data:
+            _cfg.translator_target_lang = str(data)
 
     # ── Reactive config → widget sync (unmapped widgets only) ─────────
 
     @Slot(str)
     def _sync_tgt_lang_combo(self, tag: str) -> None:
         with QSignalBlocker(self._cmb_tgt_lang):
-            found = False
             for i in range(self._cmb_tgt_lang.count()):
                 if self._cmb_tgt_lang.itemData(i) == tag:
                     self._cmb_tgt_lang.setCurrentIndex(i)
-                    found = True
                     break
-            if not found:
-                self._cmb_tgt_lang.setCurrentText(tag)
 
     # ── Window picking ────────────────────────────────────────────────────
 
