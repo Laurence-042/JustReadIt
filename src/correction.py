@@ -499,6 +499,111 @@ def _align_candidate(
 
 
 # ---------------------------------------------------------------------------
+# Garbage-prefix stripping via cross-comparison
+# ---------------------------------------------------------------------------
+
+
+def _common_suffix_len(a: str, b: str) -> int:
+    """Return the length of the longest common suffix of *a* and *b*."""
+    max_len = min(len(a), len(b))
+    n = 0
+    while n < max_len and a[-(n + 1)] == b[-(n + 1)]:
+        n += 1
+    return n
+
+
+def strip_common_garbage(
+    candidates: Sequence[str],
+    needle: str,
+) -> list[str]:
+    """Strip garbage prefixes from *candidates* using cross-comparison.
+
+    Multiple memory-scan hits for the same *needle* often share identical
+    dialogue text but have different leading garbage bytes (binary metadata
+    decoded as CJK characters by UTF-16LE).  This function exploits that
+    redundancy:
+
+    1. Split each candidate at the first occurrence of *needle*.
+    2. For every pair of candidates, compute the **longest common suffix**
+       of their pre-needle parts.
+    3. If two candidates agree on a substantial common suffix but diverge
+       at the very start, the divergent prefix is identified as garbage
+       and stripped.
+
+    The heuristic is conservative: a prefix is only stripped when the
+    clean (common) portion is **at least as long as** *needle* **and** at
+    least as long as the garbage itself.
+
+    Parameters
+    ----------
+    candidates:
+        Raw ``ScanResult.text`` strings from the memory scanner.
+    needle:
+        The search needle used by :class:`MemoryScanner`.
+
+    Returns
+    -------
+    list[str]
+        Candidates with garbage prefixes removed.  Candidates that could
+        not be cleaned (single occurrence, no cross-agreement, or no needle)
+        are returned unchanged.
+    """
+    if len(candidates) < 2 or not needle:
+        return list(candidates)
+
+    # Split each candidate at the first needle occurrence.
+    # Keep (original_index, pre_needle_text) pairs.
+    splits: list[tuple[int, str]] = []
+    for i, cand in enumerate(candidates):
+        idx = cand.find(needle)
+        if idx >= 0:
+            splits.append((i, cand[:idx]))
+    # Need at least two needle-bearing candidates for cross-comparison.
+    if len(splits) < 2:
+        return list(candidates)
+
+    # For each candidate, find the maximum garbage length supported by
+    # agreement with at least one other candidate.
+    garbage_len: dict[int, int] = {}  # orig_index → chars to strip from front
+    for a_pos in range(len(splits)):
+        orig_a, pre_a = splits[a_pos]
+        best_strip = 0
+        for b_pos in range(len(splits)):
+            if a_pos == b_pos:
+                continue
+            _, pre_b = splits[b_pos]
+            common = _common_suffix_len(pre_a, pre_b)
+            strip = len(pre_a) - common
+            # Guards (all must pass):
+            #  1. strip > 0           — there IS a divergent prefix.
+            #  2. common >= needle     — enough agreement to be meaningful.
+            #  3. strip <= common      — garbage is shorter than the clean part.
+            #  4. no newline in prefix — binary garbage never spans lines,
+            #     but VN name tags (``~【name】\n"``) always do.
+            # This prevents cross-group false positives (e.g. a script-source
+            # candidate sharing only ``も`` with a dialogue candidate) and
+            # preserves legitimate VN prefixes like character name tags.
+            garbage_prefix = candidates[orig_a][:strip]
+            if (
+                strip > 0
+                and common >= len(needle)
+                and strip <= common
+                and "\n" not in garbage_prefix
+            ):
+                best_strip = max(best_strip, strip)
+        if best_strip > 0:
+            garbage_len[orig_a] = best_strip
+
+    if not garbage_len:
+        return list(candidates)
+
+    result = list(candidates)
+    for orig_idx, strip_n in garbage_len.items():
+        result[orig_idx] = candidates[orig_idx][strip_n:]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 
@@ -542,6 +647,9 @@ def best_match_with_details(
     """
     if not candidates or not ocr_text or not needle:
         return None
+
+    # Pre-clean: strip garbage prefixes detected by cross-comparison.
+    candidates = strip_common_garbage(candidates, needle)
 
     ocr_norm = _normalize(ocr_text)
     ocr_align, _ = _normalize_for_alignment(ocr_text)

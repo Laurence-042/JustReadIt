@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from src.correction import (
+    _common_suffix_len,
     _find_needle_pos,
     _is_symbol_char,
     _normalize,
@@ -15,6 +16,7 @@ from src.correction import (
     _template_aware_score,
     best_match,
     best_match_with_details,
+    strip_common_garbage,
 )
 
 
@@ -687,4 +689,128 @@ class TestRealWorld:
         # Dialog content must be present.
         assert "私が調合した丸薬だよ" in result.text
         assert "使いなさいな" in result.text
+
+
+# ---------------------------------------------------------------------------
+# _common_suffix_len
+# ---------------------------------------------------------------------------
+
+
+class TestCommonSuffixLen:
+    """Longest common suffix helper."""
+
+    def test_identical(self) -> None:
+        assert _common_suffix_len("abc", "abc") == 3
+
+    def test_partial(self) -> None:
+        assert _common_suffix_len("Xbc", "Ybc") == 2
+
+    def test_no_overlap(self) -> None:
+        assert _common_suffix_len("abc", "xyz") == 0
+
+    def test_empty(self) -> None:
+        assert _common_suffix_len("", "abc") == 0
+        assert _common_suffix_len("abc", "") == 0
+
+    def test_different_lengths(self) -> None:
+        assert _common_suffix_len("hello", "llo") == 3
+
+
+# ---------------------------------------------------------------------------
+# strip_common_garbage
+# ---------------------------------------------------------------------------
+
+
+class TestStripCommonGarbage:
+    """Cross-comparison garbage prefix stripping."""
+
+    def test_basic_garbage_prefix(self) -> None:
+        """Three dialogue copies with different 4-char garbage prefixes."""
+        needle = "苦労する"
+        candidates = [
+            "句承搀退……はぁ。本当に騒々しい二人だ。\n233も苦労するね。",
+            "庰攢匀訁……はぁ。本当に騒々しい二人だ。\n233も苦労するね。",
+            "廂敜崀訁……はぁ。本当に騒々しい二人だ。\n233も苦労するね。",
+        ]
+        result = strip_common_garbage(candidates, needle)
+        expected = "……はぁ。本当に騒々しい二人だ。\n233も苦労するね。"
+        assert result[0] == expected
+        assert result[1] == expected
+        assert result[2] == expected
+
+    def test_mixed_script_and_dialogue(self) -> None:
+        """Script-source candidates must not be affected by dialogue ones."""
+        needle = "苦労する"
+        candidates = [
+            '~もし (妊娠腹 == 2) -"{{主人公}}も苦労するね。\\w',
+            "句承搀退……はぁ。本当に騒々しい二人だ。\n233も苦労するね。",
+            "庰攢匀訁……はぁ。本当に騒々しい二人だ。\n233も苦労するね。",
+        ]
+        result = strip_common_garbage(candidates, needle)
+        # Script candidate unchanged (common suffix with dialogue is only も).
+        assert result[0] == candidates[0]
+        # Dialogue candidates cleaned.
+        expected = "……はぁ。本当に騒々しい二人だ。\n233も苦労するね。"
+        assert result[1] == expected
+        assert result[2] == expected
+
+    def test_single_candidate(self) -> None:
+        """Single candidate → no cross-comparison → unchanged."""
+        result = strip_common_garbage(
+            ["句承搀退……はぁ。苦労するね。"], "苦労する"
+        )
+        assert result == ["句承搀退……はぁ。苦労するね。"]
+
+    def test_no_needle_in_candidates(self) -> None:
+        """No candidate contains the needle → all unchanged."""
+        result = strip_common_garbage(["foo", "bar"], "xyz")
+        assert result == ["foo", "bar"]
+
+    def test_identical_candidates_no_strip(self) -> None:
+        """Identical candidates have no divergent prefix → no stripping."""
+        c = "……はぁ。苦労するね。"
+        result = strip_common_garbage([c, c], "苦労する")
+        assert result == [c, c]
+
+    def test_different_garbage_lengths(self) -> None:
+        """Garbage prefixes of different lengths are both stripped."""
+        needle = "テスト"
+        candidates = [
+            "XY……はぁ。テスト文字列",
+            "ABCD……はぁ。テスト文字列",
+        ]
+        result = strip_common_garbage(candidates, needle)
+        assert result[0] == "……はぁ。テスト文字列"
+        assert result[1] == "……はぁ。テスト文字列"
+
+    def test_short_common_part_not_stripped(self) -> None:
+        """Common suffix shorter than needle → too risky → no stripping."""
+        needle = "テスト"
+        candidates = [
+            "全く違うテキストもテスト結果",
+            "別の文章もテスト結果",
+        ]
+        # Common suffix of pre-needle = "も" (1 char) < needle length (3).
+        result = strip_common_garbage(candidates, needle)
+        assert result == list(candidates)
+
+    def test_garbage_longer_than_clean_part_not_stripped(self) -> None:
+        """Garbage longer than clean common suffix → not confident → skip."""
+        needle = "AB"
+        candidates = [
+            "XXXXXXXXXXcAB後",  # 10-char garbage, 1-char clean ("c")
+            "YYYYYYYYYYcAB後",  # same structure
+        ]
+        # common suffix of pre-needle = "c" (1 char), garbage = 10 chars.
+        # 10 > 1 → strip <= common guard fails → no stripping.
+        # Also common (1) < needle len (2) → skipped by first guard.
+        result = strip_common_garbage(candidates, needle)
+        assert result == list(candidates)
+
+    def test_empty_candidates(self) -> None:
+        assert strip_common_garbage([], "x") == []
+
+    def test_empty_needle(self) -> None:
+        result = strip_common_garbage(["a", "b"], "")
+        assert result == ["a", "b"]
 
