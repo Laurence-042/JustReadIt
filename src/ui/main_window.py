@@ -101,6 +101,7 @@ class MainWindow(QMainWindow):
         self._backend.error.connect(self._on_error)
         self._backend.ready.connect(self._on_worker_ready)
         self._backend.freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
+        self._backend.paused_changed.connect(self._on_paused_changed)
 
         # Reactive config → widget sync: target-lang combo has custom
         # parsing logic, so it is not managed by QDataWidgetMapper.
@@ -147,6 +148,13 @@ class MainWindow(QMainWindow):
         self._lbl_status_text.setWordWrap(True)
         card_lay.addWidget(self._lbl_dot)
         card_lay.addWidget(self._lbl_status_text, 1)
+        self._btn_pause = QPushButton("\u23f8 暂停")
+        self._btn_pause.setFixedHeight(26)
+        self._btn_pause.setFixedWidth(72)
+        self._btn_pause.setToolTip("暂停 / 恢复翻译流水线")
+        self._btn_pause.setEnabled(False)
+        self._btn_pause.clicked.connect(self._on_pause_clicked)
+        card_lay.addWidget(self._btn_pause)
         lay.addWidget(self._status_card)
 
         # ── Language quick-select ─────────────────────────────────────
@@ -362,6 +370,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_worker_ready(self) -> None:
+        self._btn_pause.setEnabled(True)
         self._status_running()
 
     @Slot(str, object, object)
@@ -405,6 +414,22 @@ class MainWindow(QMainWindow):
     def _on_error(self, message: str) -> None:
         self._set_status(f"⚠ {message}", "#e06060")
         _log.warning("Controller error: %s", message)
+
+    # ── Pause / Resume ─────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_pause_clicked(self) -> None:
+        self._backend.set_paused(not self._backend.is_paused)
+
+    @Slot(bool)
+    def _on_paused_changed(self, paused: bool) -> None:
+        if paused:
+            self._btn_pause.setText("\u25b6 恢复")
+            self._set_status("已暂停", "#e0a030")
+        else:
+            self._btn_pause.setText("\u23f8 暂停")
+            if self._backend.is_running:
+                self._status_running()
 
     # ── Button handlers ───────────────────────────────────────────────────
 

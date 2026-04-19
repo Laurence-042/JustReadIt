@@ -204,6 +204,7 @@ class HoverController(QObject):
     pipeline_debug = Signal(object)  # PipelineResult
     pipeline_progress = Signal(str, object, object)  # step_label, near_rect, screen_origin
     cursor_moved = Signal()  # emitted on large cursor movement; hide overlay before next capture
+    paused_changed = Signal(bool)  # True = paused, False = resumed
     error = Signal(str)
     ready = Signal()
 
@@ -233,6 +234,7 @@ class HoverController(QObject):
         self._continuous = continuous
         self._ocr_max_long_edge = ocr_max_long_edge
         self._memory_scan_enabled: bool = memory_scan_enabled
+        self._paused: bool = False
 
         # Resources — created in setup() on the worker thread
         self._capturer: Capturer | None = None
@@ -366,6 +368,29 @@ class HoverController(QObject):
         """
         self._memory_scan_enabled = enabled
 
+    @Slot(bool)
+    def set_paused(self, paused: bool) -> None:
+        """Pause or resume the translation pipeline.
+
+        When paused the poll timer still runs (hotkeys remain responsive)
+        but ``_poll`` returns immediately without capturing or translating.
+        """
+        if self._paused == paused:
+            return
+        self._paused = paused
+        self.paused_changed.emit(paused)
+        _log.info("Pipeline %s.", "paused" if paused else "resumed")
+        if not paused:
+            # Reset settle state so the next settle triggers a fresh run.
+            self._settled = False
+            self._settle_start = time.monotonic()
+            self._last_region_text = ""
+
+    @property
+    def paused(self) -> bool:
+        """Whether the translation pipeline is currently paused."""
+        return self._paused
+
     # ------------------------------------------------------------------
     # Freeze-mode slots (called from main thread via queued connection)
     # ------------------------------------------------------------------
@@ -415,6 +440,8 @@ class HoverController(QObject):
     @Slot()
     def _poll(self) -> None:
         """Main polling tick — called every ``poll_ms`` ms by QTimer."""
+        if self._paused:
+            return
         # Always refresh target geometry first so cursor hit-testing and
         # overlay origin use up-to-date window coordinates after moving the
         # game window across monitors.

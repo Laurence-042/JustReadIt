@@ -60,6 +60,7 @@ class AppBackend(QObject):
     # ── Backend-level signals ────────────────────────────────────────────────
     running_changed = Signal(bool)    # True = pipeline started / False = stopped
     target_changed  = Signal(object)  # GameTarget | None
+    paused_changed  = Signal(bool)    # True = paused / False = resumed
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -67,6 +68,7 @@ class AppBackend(QObject):
         self._translator: Translator | None = None
         self._controller: HoverController | None = None
         self._worker_thread: QThread | None = None
+        self._paused: bool = False
         self._knowledge_base = KnowledgeBase.open(knowledge_db_path())
         self._translation_overlay = TranslationOverlay()
         self._freeze_overlay = FreezeOverlay()
@@ -120,6 +122,10 @@ class AppBackend(QObject):
     def is_running(self) -> bool:
         return self._worker_thread is not None and self._worker_thread.isRunning()
 
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_target(self, target: GameTarget) -> None:
@@ -170,6 +176,7 @@ class AppBackend(QObject):
         self._controller.freeze_triggered.connect(self.freeze_triggered)
         self._controller.dump_triggered.connect(self.dump_triggered)
         self._controller.cursor_moved.connect(self.cursor_moved)
+        self._controller.paused_changed.connect(self._on_paused_changed)
         self._controller.error.connect(self.error)
         self._controller.ready.connect(self.ready)
 
@@ -177,6 +184,9 @@ class AppBackend(QObject):
         self._worker_thread.finished.connect(self._controller.teardown)
         self._worker_thread.start()
         self.running_changed.emit(True)
+        # Restore paused state if it was set before starting.
+        if self._paused and self._controller is not None:
+            self._controller.set_paused(True)
 
     def stop(self) -> None:
         """Stop the controller but keep :attr:`target` intact for a later :meth:`start`."""
@@ -245,6 +255,15 @@ class AppBackend(QObject):
     def set_memory_scan_enabled(self, enabled: bool) -> None:
         _cfg.memory_scan_enabled = enabled
 
+    def set_paused(self, paused: bool) -> None:
+        """Pause or resume the translation pipeline."""
+        self._paused = paused
+        if self._controller is not None:
+            self._controller.set_paused(paused)
+        else:
+            # No controller yet — emit directly so views stay in sync.
+            self.paused_changed.emit(paused)
+
     def clear_caches(self) -> None:
         if self._controller is not None:
             self._controller.clear_caches()
@@ -290,6 +309,11 @@ class AppBackend(QObject):
     def _on_cfg_mem_scan(self, enabled: bool) -> None:
         if self._controller is not None:
             self._controller.set_memory_scan_enabled(enabled)
+
+    @Slot(bool)
+    def _on_paused_changed(self, paused: bool) -> None:
+        self._paused = paused
+        self.paused_changed.emit(paused)
 
     # ── Internal overlay handling ─────────────────────────────────────────────
 

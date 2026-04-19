@@ -566,6 +566,7 @@ class DebugWindow(QMainWindow):
         self._backend.error.connect(self._on_error)
         self._backend.ready.connect(self._on_worker_ready)
         self._backend.freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
+        self._backend.paused_changed.connect(self._on_paused_changed)
 
         # Populate target label if backend already has a target.
         if backend.target is not None:
@@ -630,6 +631,13 @@ class DebugWindow(QMainWindow):
         self._cmb_dump_key.setToolTip("按下后将 OCR / 内存 / 校正文本快照复制到剪贴板")
         tb.addWidget(self._cmb_dump_key)
         tb.addSeparator()
+
+        self._btn_pause = QPushButton("\u23f8 暂停")
+        self._btn_pause.setToolTip("暂停 / 恢复翻译流水线")
+        self._btn_pause.setFixedWidth(78)
+        self._btn_pause.setEnabled(False)
+        self._btn_pause.clicked.connect(self._on_pause_clicked)
+        tb.addWidget(self._btn_pause)
 
         # ── Right-aligned tools menu ──────────────────────────────────
         _spacer = QWidget()
@@ -1072,6 +1080,7 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _on_worker_ready(self) -> None:
+        self._btn_pause.setEnabled(True)
         lang = self._selected_language
         interval = self._spn_interval.value()
         self.statusBar().showMessage(
@@ -1144,6 +1153,27 @@ class DebugWindow(QMainWindow):
     def _on_error(self, message: str) -> None:
         self._notify(f"⚠  {message}", 10000)
         self._te_wocr.append(f"\n[worker error] {message}")
+
+    # ------------------------------------------------------------------
+    # Pause / Resume
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_pause_clicked(self) -> None:
+        self._backend.set_paused(not self._backend.is_paused)
+
+    @Slot(bool)
+    def _on_paused_changed(self, paused: bool) -> None:
+        if paused:
+            self._btn_pause.setText("\u25b6 恢复")
+            self.statusBar().showMessage("已暂停")
+        else:
+            self._btn_pause.setText("\u23f8 暂停")
+            lang = self._selected_language
+            interval = self._spn_interval.value()
+            self.statusBar().showMessage(
+                f"运行中 — 语言={lang}  延迟={interval} ms"
+            )
 
     # ------------------------------------------------------------------
     # Clean shutdown
