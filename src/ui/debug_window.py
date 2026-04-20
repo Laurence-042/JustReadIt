@@ -29,10 +29,11 @@ _cfg = AppConfig()
 _log = logging.getLogger(__name__)
 
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap,
+    QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap, QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog,
     QFrame, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
@@ -340,11 +341,15 @@ class _DatasetDialog(QDialog):
         ann_lay.addWidget(self._te_notes)
 
         save_row = QHBoxLayout()
-        self._btn_save_ann = QPushButton("💾 保存标注")
+        self._btn_save_ann = QPushButton("💾 保存标注  [Enter]")
         self._btn_save_ann.setEnabled(False)
         self._btn_save_ann.clicked.connect(self._on_save_annotation)
         save_row.addWidget(self._btn_save_ann)
-        self._btn_del_sample = QPushButton("🗑 删除样本")
+        self._btn_save_next = QPushButton("💾→ 保存并跳下一条  [Shift+Enter]")
+        self._btn_save_next.setEnabled(False)
+        self._btn_save_next.clicked.connect(self._on_save_and_next)
+        save_row.addWidget(self._btn_save_next)
+        self._btn_del_sample = QPushButton("🗑 删除样本  [Del]")
         self._btn_del_sample.setEnabled(False)
         self._btn_del_sample.clicked.connect(self._on_delete_sample)
         save_row.addWidget(self._btn_del_sample)
@@ -357,11 +362,40 @@ class _DatasetDialog(QDialog):
 
         # ── Bottom ──────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
+        btn_export = QPushButton("📥 导出 CSV")
+        btn_export.setToolTip("将当前筛选的样本导出为 CSV 文件")
+        btn_export.clicked.connect(self._on_export_csv)
+        btn_row.addWidget(btn_export)
+        btn_row.addStretch()
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
-        btn_row.addStretch()
         btn_row.addWidget(close_btn)
         root.addLayout(btn_row)
+
+        # ── Keyboard shortcuts ───────────────────────────────────────────────
+        # Enter = save current annotation
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self).activated.connect(
+            self._on_save_annotation
+        )
+        # Shift+Enter = save and jump to next unlabeled
+        QShortcut(QKeySequence(Qt.KeyboardModifier.ShiftModifier | Qt.Key.Key_Return), self).activated.connect(
+            self._on_save_and_next
+        )
+        # Delete = delete current sample
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self).activated.connect(
+            self._on_delete_sample
+        )
+        # Number keys 1-6 = quick-select label
+        for _i, _lbl in enumerate(LABELS, start=1):
+            _lbl_capture = _lbl
+            def _make_label_slot(l: str):
+                def _slot() -> None:
+                    for ii in range(self._cmb_label.count()):
+                        if self._cmb_label.itemData(ii) == l:
+                            self._cmb_label.setCurrentIndex(ii)
+                            break
+                return _slot
+            QShortcut(QKeySequence(f"{_i}"), self).activated.connect(_make_label_slot(_lbl_capture))
 
         self._load_table()
 
@@ -394,6 +428,7 @@ class _DatasetDialog(QDialog):
         self._le_expected.clear()
         self._te_notes.clear()
         self._btn_save_ann.setEnabled(False)
+        self._btn_save_next.setEnabled(False)
         self._btn_del_sample.setEnabled(False)
 
     @Slot(int)
@@ -421,6 +456,7 @@ class _DatasetDialog(QDialog):
         self._le_expected.setText(sample.expected_correction)
         self._te_notes.setPlainText(sample.notes)
         self._btn_save_ann.setEnabled(True)
+        self._btn_save_next.setEnabled(True)
         self._btn_del_sample.setEnabled(True)
 
     @Slot()
@@ -434,6 +470,68 @@ class _DatasetDialog(QDialog):
             notes=self._te_notes.toPlainText().strip(),
         )
         self._load_table()
+
+    @Slot()
+    def _on_save_and_next(self) -> None:
+        """Save current annotation then select the next unlabeled row."""
+        if self._current_id is None:
+            return
+        self._ds.annotate(
+            self._current_id,
+            label=self._cmb_label.currentData(),
+            expected_correction=self._le_expected.text().strip(),
+            notes=self._te_notes.toPlainText().strip(),
+        )
+        self._load_table()
+        # Find next unlabeled row in table (wrap around)
+        next_row = self._find_next_unlabeled_row()
+        if next_row >= 0:
+            self._table.selectRow(next_row)
+            self._table.scrollTo(self._table.model().index(next_row, 0))
+
+    def _find_next_unlabeled_row(self) -> int:
+        """Return row index of the next 'unlabeled' sample, or -1."""
+        cur = self._table.currentRow()
+        n = self._table.rowCount()
+        # Search from row after current, wrap around
+        for offset in range(1, n + 1):
+            row = (cur + offset) % n
+            item = self._table.item(row, 4)  # label column
+            if item and item.text() == LABEL_DISPLAY["unlabeled"]:
+                return row
+        return -1
+
+    @Slot()
+    def _on_export_csv(self) -> None:
+        """Export currently visible samples to a CSV file."""
+        label_filter = self._cmb_filter.currentData() or ""
+        samples = self._ds.list_samples(limit=10_000, label_filter=label_filter)
+        if not samples:
+            QMessageBox.information(self, "导出 CSV", "没有可导出的样本。")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出数据集为 CSV", "pipeline_dataset.csv",
+            "CSV 文件 (*.csv)",
+        )
+        if not path:
+            return
+        import csv  # noqa: PLC0415
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "id", "captured_at", "ocr_text", "memory_hits",
+                "needle", "corrected_text", "translated_text",
+                "label", "expected_correction", "notes", "annotated_at",
+            ])
+            for s in samples:
+                writer.writerow([
+                    s.id, s.captured_at, s.ocr_text,
+                    " | ".join(s.memory_hits),
+                    s.needle, s.corrected_text, s.translated_text,
+                    s.label, s.expected_correction, s.notes,
+                    s.annotated_at or "",
+                ])
+        QMessageBox.information(self, "导出完成", f"已导出 {len(samples)} 条样本到：\n{path}")
 
     @Slot()
     def _on_delete_sample(self) -> None:
