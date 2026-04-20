@@ -76,6 +76,8 @@ class TranslatorSettingsWidget(QWidget):
     ) -> None:
         super().__init__(parent)
         self._backend = backend
+        self._dirty = False
+        self._show_buttons = show_buttons
         self._build_ui(show_buttons=show_buttons)
         self.load_from_config()
         self._on_backend_changed(self._cmb_backend.currentIndex())
@@ -249,6 +251,18 @@ class TranslatorSettingsWidget(QWidget):
         # another view (e.g. main window) changes the setting.
         _cfg.translator_target_lang_changed.connect(self._sync_target_lang)
 
+        # Dirty-state tracking: any field change → remind user to apply.
+        self._cmb_backend.currentIndexChanged.connect(self._mark_dirty)
+        self._cmb_target_lang.currentIndexChanged.connect(self._mark_dirty)
+        self._le_api_key.textChanged.connect(self._mark_dirty)
+        self._le_model.textChanged.connect(self._mark_dirty)
+        self._le_base_url.textChanged.connect(self._mark_dirty)
+        self._te_system_prompt.textChanged.connect(self._mark_dirty)
+        self._spn_context_window.valueChanged.connect(self._mark_dirty)
+        self._spn_summary_trigger.valueChanged.connect(self._mark_dirty)
+        self._chk_tools_enabled.toggled.connect(self._mark_dirty)
+        self._chk_disable_thinking.toggled.connect(self._mark_dirty)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -287,6 +301,8 @@ class TranslatorSettingsWidget(QWidget):
         else:
             self._le_api_key.setText(_cfg.cloud_api_key)
             self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
+        # Reset dirty flag after loading — field changes above were not user edits.
+        self._dirty = False
 
     def save_to_config(self) -> None:
         """Persist all translator settings to :class:`AppConfig` without building."""
@@ -310,6 +326,7 @@ class TranslatorSettingsWidget(QWidget):
 
     def apply(self) -> None:
         """Save settings to config and rebuild the translator via AppBackend."""
+        self._dirty = False
         self.save_to_config()
         if _cfg.translator_backend == "none":
             self._backend.set_translator(None)
@@ -324,6 +341,15 @@ class TranslatorSettingsWidget(QWidget):
 
     def _set_status(self, text: str) -> None:
         self._lbl_status.setText(text)
+
+    @Slot()
+    def _mark_dirty(self) -> None:
+        """Called whenever any settings field changes; reminds user to apply."""
+        if self._dirty:
+            return
+        self._dirty = True
+        if self._show_buttons:
+            self._set_status("⚠ 设置已修改，点击「应用」保存并重新构建翻译器。")
 
     def set_target_lang(self, tag: str) -> None:
         """Set the target-lang combo to the given BCP-47 tag."""
