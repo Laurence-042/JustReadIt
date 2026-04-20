@@ -480,34 +480,56 @@ class _DatasetDialog(QDialog):
     def _on_save_annotation(self) -> None:
         if self._current_id is None:
             return
+        new_label = self._cmb_label.currentData()
         self._ds.annotate(
             self._current_id,
-            label=self._cmb_label.currentData(),
+            label=new_label,
             expected_correction=self._le_expected.toPlainText().strip(),
             notes=self._te_notes.toPlainText().strip(),
         )
-        self._load_table()
+        self._patch_row_label(self._table.currentRow(), new_label)
 
     @Slot()
     def _on_save_and_next(self) -> None:
         """Save current annotation then select the next unlabeled row."""
         if self._current_id is None:
             return
+        new_label = self._cmb_label.currentData()
         self._ds.annotate(
             self._current_id,
-            label=self._cmb_label.currentData(),
+            label=new_label,
             expected_correction=self._le_expected.toPlainText().strip(),
             notes=self._te_notes.toPlainText().strip(),
         )
-        # Remember current row before table is rebuilt
         cur_row = self._table.currentRow()
-        self._load_table()
-        # Find next unlabeled starting from saved position
-        next_row = self._find_next_unlabeled_row(from_row=cur_row)
+        self._patch_row_label(cur_row, new_label)
+        # After patching, cur_row may have been removed (filtered view); use
+        # the row that is now physically at the same position (or one before).
+        effective_row = min(cur_row, self._table.rowCount() - 1)
+        next_row = self._find_next_unlabeled_row(from_row=effective_row)
         if next_row >= 0:
             self._table.clearSelection()
             self._table.setCurrentCell(next_row, 0)
             self._table.scrollTo(self._table.model().index(next_row, 0))
+
+    def _patch_row_label(self, row: int, new_label: str) -> None:
+        """Update the label cell in-place.
+
+        If a label filter is active and the new label no longer matches,
+        remove the row from the table view (no DB round-trip needed).
+        Also update the sample count label.
+        """
+        label_filter = self._cmb_filter.currentData() or ""
+        if label_filter and label_filter != new_label:
+            # Row no longer belongs to current filter — remove it from view.
+            self._table.removeRow(row)
+            self._clear_annotation_panel()
+        else:
+            item = self._table.item(row, 5)
+            if item is not None:
+                item.setText(LABEL_DISPLAY.get(new_label, new_label))
+        n = self._table.rowCount()
+        self._lbl_count.setText(f"{n} 条样本")
 
     def _find_next_unlabeled_row(self, from_row: int = -1) -> int:
         """Return row index of the next 'unlabeled' sample, or -1."""
