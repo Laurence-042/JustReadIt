@@ -332,8 +332,9 @@ class _DatasetDialog(QDialog):
         ann_lay.addLayout(lbl_row)
 
         ann_lay.addWidget(QLabel("正确纠错（仅当标签为 ✗ 纠错错误时填写）:"))
-        self._le_expected = QLineEdit()
+        self._le_expected = QTextEdit()
         self._le_expected.setPlaceholderText("正确的纠错结果")
+        self._le_expected.setFixedHeight(60)
         ann_lay.addWidget(self._le_expected)
 
         ann_lay.addWidget(QLabel("备注:"))
@@ -469,7 +470,7 @@ class _DatasetDialog(QDialog):
             if self._cmb_label.itemData(i) == sample.label:
                 self._cmb_label.setCurrentIndex(i)
                 break
-        self._le_expected.setText(sample.expected_correction)
+        self._le_expected.setPlainText(sample.expected_correction)
         self._te_notes.setPlainText(sample.notes)
         self._btn_save_ann.setEnabled(True)
         self._btn_save_next.setEnabled(True)
@@ -482,7 +483,7 @@ class _DatasetDialog(QDialog):
         self._ds.annotate(
             self._current_id,
             label=self._cmb_label.currentData(),
-            expected_correction=self._le_expected.text().strip(),
+            expected_correction=self._le_expected.toPlainText().strip(),
             notes=self._te_notes.toPlainText().strip(),
         )
         self._load_table()
@@ -495,20 +496,25 @@ class _DatasetDialog(QDialog):
         self._ds.annotate(
             self._current_id,
             label=self._cmb_label.currentData(),
-            expected_correction=self._le_expected.text().strip(),
+            expected_correction=self._le_expected.toPlainText().strip(),
             notes=self._te_notes.toPlainText().strip(),
         )
+        # Remember current row before table is rebuilt
+        cur_row = self._table.currentRow()
         self._load_table()
-        # Find next unlabeled row in table (wrap around)
-        next_row = self._find_next_unlabeled_row()
+        # Find next unlabeled starting from saved position
+        next_row = self._find_next_unlabeled_row(from_row=cur_row)
         if next_row >= 0:
-            self._table.selectRow(next_row)
+            self._table.clearSelection()
+            self._table.setCurrentCell(next_row, 0)
             self._table.scrollTo(self._table.model().index(next_row, 0))
 
-    def _find_next_unlabeled_row(self) -> int:
+    def _find_next_unlabeled_row(self, from_row: int = -1) -> int:
         """Return row index of the next 'unlabeled' sample, or -1."""
-        cur = self._table.currentRow()
+        cur = from_row if from_row >= 0 else self._table.currentRow()
         n = self._table.rowCount()
+        if n == 0:
+            return -1
         # Search from row after current, wrap around
         for offset in range(1, n + 1):
             row = (cur + offset) % n
