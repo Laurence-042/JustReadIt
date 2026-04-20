@@ -29,3 +29,8 @@ def knowledge_db_path() -> Path:
 def translations_db_path() -> Path:
     """Default path for the persistent translation cache SQLite file."""
     return app_data_dir() / "translations.db"
+
+
+def dataset_db_path() -> Path:
+    """Default path for the pipeline dataset SQLite file."""
+    return app_data_dir() / "pipeline_dataset.db"

@@ -21,6 +21,7 @@ from PySide6.QtCore import (
 
 from src.app_backend import AppBackend
 from src.config import AppConfig
+from src.dataset import LABEL_DISPLAY, LABELS, PipelineDataset, SampleRow
 from src.knowledge import KnowledgeBase
 from src.languages import display_name
 
@@ -231,6 +232,220 @@ class _KnowledgeManagerDialog(QDialog):
         for eid in event_ids:
             self._kb.delete_event(int(eid))
         self._load_events()
+
+
+# ---------------------------------------------------------------------------
+# Dataset browser / annotation dialog
+# ---------------------------------------------------------------------------
+
+class _DatasetDialog(QDialog):
+    """Modal dialog for browsing and annotating pipeline dataset samples."""
+
+    def __init__(self, dataset: PipelineDataset, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._ds = dataset
+        self._current_id: int | None = None
+        self.setWindowTitle("📊 流水线数据集")
+        self.setMinimumSize(1100, 620)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+
+        root = QVBoxLayout(self)
+
+        # ── Filter row ─────────────────────────────────────────────────────
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("筛选标签:"))
+        self._cmb_filter = QComboBox()
+        self._cmb_filter.addItem("全部", userData="")
+        for lbl in LABELS:
+            self._cmb_filter.addItem(LABEL_DISPLAY[lbl], userData=lbl)
+        self._cmb_filter.currentIndexChanged.connect(self._load_table)
+        filter_row.addWidget(self._cmb_filter)
+        filter_row.addStretch()
+        self._lbl_count = QLabel()
+        filter_row.addWidget(self._lbl_count)
+        btn_refresh = QPushButton("🔄 刷新")
+        btn_refresh.clicked.connect(self._load_table)
+        filter_row.addWidget(btn_refresh)
+        root.addLayout(filter_row)
+
+        # ── Main splitter: table left / annotation right ───────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # Table
+        self._table = QTableWidget()
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels(["ID", "时间", "OCR", "纠错", "标签"])
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.currentCellChanged.connect(
+            lambda cur_row, _cur_col, _prev_row, _prev_col: self._on_row_changed(cur_row)
+        )
+        splitter.addWidget(self._table)
+
+        # Annotation panel
+        ann_widget = QWidget()
+        ann_lay = QVBoxLayout(ann_widget)
+        ann_lay.setContentsMargins(8, 4, 4, 4)
+
+        ann_lay.addWidget(QLabel("<b>OCR 文本</b>"))
+        self._te_ocr = QTextEdit()
+        self._te_ocr.setReadOnly(True)
+        self._te_ocr.setFixedHeight(80)
+        ann_lay.addWidget(self._te_ocr)
+
+        ann_lay.addWidget(QLabel("<b>内存候选</b>"))
+        self._te_hits = QTextEdit()
+        self._te_hits.setReadOnly(True)
+        self._te_hits.setFixedHeight(80)
+        ann_lay.addWidget(self._te_hits)
+
+        ann_lay.addWidget(QLabel("<b>纠错结果</b>"))
+        self._te_corr = QTextEdit()
+        self._te_corr.setReadOnly(True)
+        self._te_corr.setFixedHeight(60)
+        ann_lay.addWidget(self._te_corr)
+
+        ann_lay.addWidget(QLabel("<b>翻译</b>"))
+        self._te_tl = QTextEdit()
+        self._te_tl.setReadOnly(True)
+        self._te_tl.setFixedHeight(60)
+        ann_lay.addWidget(self._te_tl)
+
+        ann_lay.addSpacing(8)
+        ann_lay.addWidget(QLabel("<b>标注</b>"))
+
+        lbl_row = QHBoxLayout()
+        lbl_row.addWidget(QLabel("标签:"))
+        self._cmb_label = QComboBox()
+        for lbl in LABELS:
+            self._cmb_label.addItem(LABEL_DISPLAY[lbl], userData=lbl)
+        lbl_row.addWidget(self._cmb_label, 1)
+        ann_lay.addLayout(lbl_row)
+
+        ann_lay.addWidget(QLabel("正确纠错（仅当标签为 ✗ 纠错错误时填写）:"))
+        self._le_expected = QLineEdit()
+        self._le_expected.setPlaceholderText("正确的纠错结果")
+        ann_lay.addWidget(self._le_expected)
+
+        ann_lay.addWidget(QLabel("备注:"))
+        self._te_notes = QTextEdit()
+        self._te_notes.setPlaceholderText("可选：描述具体问题")
+        self._te_notes.setFixedHeight(60)
+        ann_lay.addWidget(self._te_notes)
+
+        save_row = QHBoxLayout()
+        self._btn_save_ann = QPushButton("💾 保存标注")
+        self._btn_save_ann.setEnabled(False)
+        self._btn_save_ann.clicked.connect(self._on_save_annotation)
+        save_row.addWidget(self._btn_save_ann)
+        self._btn_del_sample = QPushButton("🗑 删除样本")
+        self._btn_del_sample.setEnabled(False)
+        self._btn_del_sample.clicked.connect(self._on_delete_sample)
+        save_row.addWidget(self._btn_del_sample)
+        save_row.addStretch()
+        ann_lay.addLayout(save_row)
+        ann_lay.addStretch()
+
+        splitter.addWidget(ann_widget)
+        splitter.setSizes([650, 450])
+
+        # ── Bottom ──────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+        self._load_table()
+
+    # ── Data loading ──────────────────────────────────────────────────────
+
+    def _load_table(self) -> None:
+        label_filter = self._cmb_filter.currentData() or ""
+        samples = self._ds.list_samples(limit=500, label_filter=label_filter)
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(samples))
+        for row, s in enumerate(samples):
+            id_item = QTableWidgetItem()
+            id_item.setData(Qt.ItemDataRole.DisplayRole, s.id)
+            id_item.setData(Qt.ItemDataRole.UserRole, s.id)
+            self._table.setItem(row, 0, id_item)
+            self._table.setItem(row, 1, QTableWidgetItem(s.captured_at[:19]))
+            self._table.setItem(row, 2, QTableWidgetItem(s.ocr_text[:80]))
+            self._table.setItem(row, 3, QTableWidgetItem(s.corrected_text[:80]))
+            self._table.setItem(row, 4, QTableWidgetItem(LABEL_DISPLAY.get(s.label, s.label)))
+        self._table.setSortingEnabled(True)
+        self._lbl_count.setText(f"{len(samples)} 条样本")
+        self._clear_annotation_panel()
+
+    def _clear_annotation_panel(self) -> None:
+        self._current_id = None
+        self._te_ocr.clear()
+        self._te_hits.clear()
+        self._te_corr.clear()
+        self._te_tl.clear()
+        self._le_expected.clear()
+        self._te_notes.clear()
+        self._btn_save_ann.setEnabled(False)
+        self._btn_del_sample.setEnabled(False)
+
+    @Slot(int)
+    def _on_row_changed(self, row: int) -> None:
+        if row < 0:
+            self._clear_annotation_panel()
+            return
+        id_item = self._table.item(row, 0)
+        if id_item is None:
+            return
+        sample_id = id_item.data(Qt.ItemDataRole.UserRole)
+        sample = self._ds.get(sample_id)
+        if sample is None:
+            return
+        self._current_id = sample_id
+        self._te_ocr.setPlainText(sample.ocr_text)
+        self._te_hits.setPlainText("\n".join(sample.memory_hits))
+        self._te_corr.setPlainText(sample.corrected_text)
+        self._te_tl.setPlainText(sample.translated_text)
+        # Sync annotation fields
+        for i in range(self._cmb_label.count()):
+            if self._cmb_label.itemData(i) == sample.label:
+                self._cmb_label.setCurrentIndex(i)
+                break
+        self._le_expected.setText(sample.expected_correction)
+        self._te_notes.setPlainText(sample.notes)
+        self._btn_save_ann.setEnabled(True)
+        self._btn_del_sample.setEnabled(True)
+
+    @Slot()
+    def _on_save_annotation(self) -> None:
+        if self._current_id is None:
+            return
+        self._ds.annotate(
+            self._current_id,
+            label=self._cmb_label.currentData(),
+            expected_correction=self._le_expected.text().strip(),
+            notes=self._te_notes.toPlainText().strip(),
+        )
+        self._load_table()
+
+    @Slot()
+    def _on_delete_sample(self) -> None:
+        if self._current_id is None:
+            return
+        if QMessageBox.question(
+            self, "删除样本", f"确定删除样本 #{self._current_id}？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._ds.delete(self._current_id)
+        self._load_table()
 
 
 
@@ -567,6 +782,7 @@ class DebugWindow(QMainWindow):
         self._backend.ready.connect(self._on_worker_ready)
         self._backend.freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
         self._backend.paused_changed.connect(self._on_paused_changed)
+        self._backend.recording_changed.connect(self._on_recording_changed)
 
         # If the backend is already running when this window is created,
         # the ready signal was emitted before our connection — catch up now.
@@ -644,6 +860,13 @@ class DebugWindow(QMainWindow):
         self._btn_pause.clicked.connect(self._on_pause_clicked)
         tb.addWidget(self._btn_pause)
 
+        self._btn_record = QPushButton("\u23fa 记录")
+        self._btn_record.setToolTip("开始 / 停止将流水线样本录入数据集（用于算法迭代）")
+        self._btn_record.setFixedWidth(78)
+        self._btn_record.setCheckable(True)
+        self._btn_record.clicked.connect(self._on_record_clicked)
+        tb.addWidget(self._btn_record)
+
         # ── Right-aligned tools menu ──────────────────────────────────
         _spacer = QWidget()
         _spacer.setSizePolicy(
@@ -662,10 +885,15 @@ class DebugWindow(QMainWindow):
         act_knowledge.setToolTip("浏览或删除知识库中的术语和事件。")
         act_knowledge.triggered.connect(self._on_open_knowledge_manager)
 
+        act_dataset = QAction("📊 数据集标注", self)
+        act_dataset.setToolTip("浏览、标注和删除流水线数据集样本。")
+        act_dataset.triggered.connect(self._on_open_dataset)
+
         _tools_menu = QMenu(self)
         _tools_menu.addAction(self._act_clear_cache)
         _tools_menu.addSeparator()
         _tools_menu.addAction(act_knowledge)
+        _tools_menu.addAction(act_dataset)
 
         self._btn_tools = QToolButton()
         self._btn_tools.setText("工具")
@@ -1180,6 +1408,35 @@ class DebugWindow(QMainWindow):
                 f"运行中 — 语言={lang}  延迟={interval} ms"
             )
 
+    @Slot()
+    def _on_record_clicked(self) -> None:
+        self._backend.set_recording(self._btn_record.isChecked())
+
+    @Slot(bool)
+    def _on_recording_changed(self, recording: bool) -> None:
+        with QSignalBlocker(self._btn_record):
+            self._btn_record.setChecked(recording)
+        self._btn_record.setText("⏹ 停止" if recording else "⏺ 记录")
+        self._btn_record.setStyleSheet(
+            "QPushButton { color: #e55; font-weight: bold; }" if recording else ""
+        )
+        self.statusBar().showMessage(
+            "🔴 数据集记录中…" if recording else "⏹ 数据集记录已停止", 4000
+        )
+
+    @Slot()
+    def _on_open_dataset(self) -> None:
+        """Open the dataset annotation dialog, initialising the DB if needed."""
+        from src.paths import dataset_db_path   # noqa: PLC0415
+        from src.dataset import PipelineDataset  # noqa: PLC0415
+        # Prefer the already-open backend dataset so recorded-but-not-committed
+        # rows are immediately visible.  Fall back to a fresh read-only connection.
+        ds = self._backend.dataset or PipelineDataset.open(dataset_db_path())
+        dlg = _DatasetDialog(ds, parent=self)
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
+
     # ------------------------------------------------------------------
     # Clean shutdown
     # ------------------------------------------------------------------
@@ -1241,9 +1498,11 @@ class DebugWindow(QMainWindow):
 
     @Slot()
     def _on_open_knowledge_manager(self) -> None:
-        """Open the Knowledge Manager dialog."""
+        """Open the Knowledge Manager dialog (non-modal)."""
         dlg = _KnowledgeManagerDialog(self._backend.knowledge_base, parent=self)
-        dlg.exec()
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
 
     # ------------------------------------------------------------------
     # Reactive config → widget sync (unmapped widgets only)

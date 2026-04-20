@@ -20,9 +20,10 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from src.config import AppConfig
 from src.controller import HoverController
+from src.dataset import PipelineDataset
 from src.knowledge import KnowledgeBase
 from src.overlay import FreezeOverlay, TranslationOverlay
-from src.paths import knowledge_db_path
+from src.paths import dataset_db_path, knowledge_db_path
 from src.translators.factory import build_translator
 
 if TYPE_CHECKING:
@@ -58,9 +59,10 @@ class AppBackend(QObject):
     ready             = Signal()
 
     # ── Backend-level signals ────────────────────────────────────────────────
-    running_changed = Signal(bool)    # True = pipeline started / False = stopped
-    target_changed  = Signal(object)  # GameTarget | None
-    paused_changed  = Signal(bool)    # True = paused / False = resumed
+    running_changed   = Signal(bool)    # True = pipeline started / False = stopped
+    target_changed    = Signal(object)  # GameTarget | None
+    paused_changed    = Signal(bool)    # True = paused / False = resumed
+    recording_changed = Signal(bool)    # True = dataset recording on
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -69,6 +71,8 @@ class AppBackend(QObject):
         self._controller: HoverController | None = None
         self._worker_thread: QThread | None = None
         self._paused: bool = False
+        self._recording: bool = False
+        self._dataset: PipelineDataset | None = None
         self._knowledge_base = KnowledgeBase.open(knowledge_db_path())
         self._translation_overlay = TranslationOverlay()
         self._freeze_overlay = FreezeOverlay()
@@ -126,6 +130,15 @@ class AppBackend(QObject):
     def is_paused(self) -> bool:
         return self._paused
 
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    @property
+    def dataset(self) -> PipelineDataset | None:
+        """Active :class:`PipelineDataset`, or ``None`` when not recording."""
+        return self._dataset
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_target(self, target: GameTarget) -> None:
@@ -172,6 +185,7 @@ class AppBackend(QObject):
         # Forward all signals so views only need to connect to the backend.
         self._controller.translation_ready.connect(self.translation_ready)
         self._controller.pipeline_debug.connect(self.pipeline_debug)
+        self._controller.pipeline_debug.connect(self._on_pipeline_debug)
         self._controller.pipeline_progress.connect(self.pipeline_progress)
         self._controller.freeze_triggered.connect(self.freeze_triggered)
         self._controller.dump_triggered.connect(self.dump_triggered)
@@ -268,6 +282,20 @@ class AppBackend(QObject):
         if self._controller is not None:
             self._controller.clear_caches()
 
+    def set_recording(self, enabled: bool) -> None:
+        """Start or stop recording pipeline samples to the dataset DB."""
+        if enabled == self._recording:
+            return
+        self._recording = enabled
+        if enabled:
+            if self._dataset is None:
+                self._dataset = PipelineDataset.open(dataset_db_path())
+        else:
+            # Keep the dataset connection open so the UI can still annotate;
+            # only the recording flag is cleared.
+            pass
+        self.recording_changed.emit(enabled)
+
     def close(self) -> None:
         """Stop the pipeline and release all resources."""
         self.stop()
@@ -277,6 +305,12 @@ class AppBackend(QObject):
             self._knowledge_base.close()
         except Exception:
             pass
+        if self._dataset is not None:
+            try:
+                self._dataset.close()
+            except Exception:
+                pass
+            self._dataset = None
 
     # ── Reactive config → controller slots ────────────────────────────────
 
@@ -346,6 +380,49 @@ class AppBackend(QObject):
             self._freeze_overlay.dismiss()
         else:
             self._freeze_overlay.freeze(screenshot, left, top, pid, hwnd)
+
+    @Slot(object)
+    def _on_pipeline_debug(self, result: object) -> None:
+        """Record a pipeline sample when recording is active."""
+        if not self._recording or self._dataset is None:
+            return
+        from src.controller import PipelineResult  # noqa: PLC0415 (avoid circular at module level)
+        if not isinstance(result, PipelineResult):
+            return
+        ocr_text = (result.range_det.value.region_text
+                    if result.range_det.value else "")
+        if not ocr_text:
+            return  # skip empty / probe-only runs
+        # Reconstruct memory-hit list from the scan step debug text.
+        # scan step value is a multi-line string; actual hits are in candidates.
+        # We store the raw scan text as a single-element list for simplicity —
+        # structured hits are available via memory_hits in SampleRow.
+        scan_raw = result.scan.value or ""
+        if "[cache hit]" in scan_raw or not scan_raw.strip():
+            return  # skip cache-hit runs — no new data to record
+        # Parse candidate lines from the scan debug text.
+        hits: list[str] = []
+        for line in scan_raw.splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                # Strip leading encoding tag like "[utf-16-le] 'text'"
+                inner = line.split("]", 1)[-1].strip().strip("'")
+                if inner:
+                    hits.append(inner)
+        corrected = result.corr.value or ""
+        if "[cache hit]" in corrected:
+            return
+        translated = result.translate.value or ""
+        try:
+            self._dataset.record(
+                ocr_text=ocr_text,
+                memory_hits=hits,
+                needle="",  # needle is not currently in PipelineResult; reserved
+                corrected_text=corrected,
+                translated_text=translated,
+            )
+        except Exception as exc:
+            _log.warning("Dataset record failed: %s", exc)
 
     @Slot()
     def _on_freeze_dismissed(self) -> None:
