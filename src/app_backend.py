@@ -393,25 +393,14 @@ class AppBackend(QObject):
                     if result.range_det.value else "")
         if not ocr_text:
             return  # skip empty / probe-only runs
-        # Reconstruct memory-hit list from the scan step debug text.
-        # scan step value is a multi-line string; actual hits are in candidates.
-        # We store the raw scan text as a single-element list for simplicity —
-        # structured hits are available via memory_hits in SampleRow.
         scan_raw = result.scan.value or ""
         if "[cache hit]" in scan_raw or not scan_raw.strip():
             return  # skip cache-hit runs — no new data to record
-        # Parse candidate lines from the scan debug text.
-        hits: list[str] = []
-        for line in scan_raw.splitlines():
-            line = line.strip()
-            if line.startswith("["):
-                # Strip leading encoding tag like "[utf-16-le] 'text'"
-                inner = line.split("]", 1)[-1].strip().strip("'")
-                if inner:
-                    hits.append(inner)
         corrected = result.corr.value or ""
         if "[cache hit]" in corrected:
             return
+        # Use structured ScanResult list directly — avoids fragile text parsing.
+        hits: list[str] = [r.text for r in result.scan_results]
         translated = result.translate.value or ""
         try:
             self._dataset.record(

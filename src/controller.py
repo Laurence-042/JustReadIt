@@ -122,12 +122,13 @@ class PipelineResult:
     """All intermediate data from one pipeline run, emitted via
     :attr:`HoverController.pipeline_debug` for debug panels."""
     img_bytes: bytes
-    ocr:       StepResult[OcrOutput]
-    range_det: StepResult[RangeOutput]  # 'range_det' avoids shadowing builtin
-    scan:      StepResult[str]   # mem_text
-    corr:      StepResult[str]   # corrected_text
-    translate: StepResult[str]   # translated_text
-    elapsed_ms: float            # total wall time for the run
+    ocr:          StepResult[OcrOutput]
+    range_det:    StepResult[RangeOutput]  # 'range_det' avoids shadowing builtin
+    scan:         StepResult[str]   # mem_text debug string
+    scan_results: list               # list[ScanResult] — raw hits from MemoryScanner
+    corr:         StepResult[str]   # corrected_text
+    translate:    StepResult[str]   # translated_text
+    elapsed_ms:   float              # total wall time for the run
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +712,7 @@ class HoverController(QObject):
         mem_text = ""
         corrected_text = region_text
         scan_ms = corr_ms = 0.0
+        results: list = []
         if self._scanner is not None and region_text and self._memory_scan_enabled:
             try:
                 needles = pick_needles(region_text)
@@ -796,6 +798,7 @@ class HoverController(QObject):
         self._emit_debug(
             img, t0,
             ocr_step, range_step, scan_step, corr_step, translate_step,
+            scan_results=results,
         )
         if translation:
             wr = self._target.window_rect
@@ -822,6 +825,7 @@ class HoverController(QObject):
         scan: "StepResult[str]",
         corr: "StepResult[str]",
         translate: "StepResult[str]",
+        scan_results: list | None = None,
     ) -> None:
         elapsed_ms = (time.monotonic() - t0) * 1000
         buf = io.BytesIO()
@@ -831,6 +835,7 @@ class HoverController(QObject):
             ocr=ocr,
             range_det=range_det,
             scan=scan,
+            scan_results=scan_results or [],
             corr=corr,
             translate=translate,
             elapsed_ms=elapsed_ms,
