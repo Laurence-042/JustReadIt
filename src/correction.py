@@ -481,17 +481,25 @@ def _align_candidate(
             cand_align, ocr_align, mode="HW", task="distance", k=rev_k,
         )
         if rev["editDistance"] >= 0:
+            coverage = min(1.0, len(cand_align) / len(ocr_align))
+            # Hard gate: candidate must cover at least 15 % of the (inflated)
+            # OCR text.  Below this the candidate is too short to be a reliable
+            # match — a tiny fragment like "見ていた" would otherwise pass on
+            # partial_ratio alone.  The UI-chrome-inflated case we care about
+            # (one dialog line buried under ~3–4 lines of menu text) typically
+            # produces coverage ≈ 0.25–0.40, well above this floor.
+            if coverage < 0.15:
+                return None
             cand_norm = _normalize(candidate)
             partial = fuzz.partial_ratio(cand_norm, ocr_norm)
-            # Weight partial_ratio by coverage: a short candidate matching
-            # only a small slice of the OCR should not outscore a longer
-            # candidate that explains much more of the OCR.  coverage is
-            # the fraction of the normalised OCR length that the candidate
-            # occupies; (1 - coverage) shifts weight toward fuzz.ratio which
-            # penalises length mismatches and prevents tiny candidates from
-            # winning purely on partial-match accuracy.
-            coverage = min(1.0, len(cand_align) / len(ocr_align))
-            score = partial * coverage + fuzz.ratio(cand_norm, ocr_norm) * (1.0 - coverage)
+            # edlib already confirmed the candidate fits inside the OCR text;
+            # partial_ratio is the right primary metric here.  We retain a soft
+            # length factor (square-root damping) so candidates near the 15 %
+            # floor are scored somewhat more conservatively than longer ones,
+            # without reintroducing fuzz.ratio (which penalises the length
+            # mismatch that is expected and intentional in this direction).
+            length_factor = coverage ** 0.5   # 0.15→0.39, 0.25→0.50, 1.0→1.0
+            score = partial * (0.5 + 0.5 * length_factor)
             if score >= threshold:
                 return 0, len(candidate), score, True
 
