@@ -275,18 +275,20 @@ class _DatasetDialog(QDialog):
 
         # Table
         self._table = QTableWidget()
-        self._table.setColumnCount(5)
-        self._table.setHorizontalHeaderLabels(["ID", "时间", "OCR", "纠错", "标签"])
+        self._table.setColumnCount(6)
+        self._table.setHorizontalHeaderLabels(["ID", "时间", "OCR", "内存", "纠错", "标签"])
         self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.currentCellChanged.connect(
-            lambda cur_row, _cur_col, _prev_row, _prev_col: self._on_row_changed(cur_row)
-        )
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_table_context_menu)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
         splitter.addWidget(self._table)
 
         # Annotation panel
@@ -413,8 +415,10 @@ class _DatasetDialog(QDialog):
             self._table.setItem(row, 0, id_item)
             self._table.setItem(row, 1, QTableWidgetItem(s.captured_at[:19]))
             self._table.setItem(row, 2, QTableWidgetItem(s.ocr_text[:80]))
-            self._table.setItem(row, 3, QTableWidgetItem(s.corrected_text[:80]))
-            self._table.setItem(row, 4, QTableWidgetItem(LABEL_DISPLAY.get(s.label, s.label)))
+            mem_text = " | ".join(s.memory_hits)[:80] if s.memory_hits else ""
+            self._table.setItem(row, 3, QTableWidgetItem(mem_text))
+            self._table.setItem(row, 4, QTableWidgetItem(s.corrected_text[:80]))
+            self._table.setItem(row, 5, QTableWidgetItem(LABEL_DISPLAY.get(s.label, s.label)))
         self._table.setSortingEnabled(True)
         self._lbl_count.setText(f"{len(samples)} 条样本")
         self._clear_annotation_panel()
@@ -430,6 +434,18 @@ class _DatasetDialog(QDialog):
         self._btn_save_ann.setEnabled(False)
         self._btn_save_next.setEnabled(False)
         self._btn_del_sample.setEnabled(False)
+
+    @Slot()
+    def _on_selection_changed(self) -> None:
+        rows = {idx.row() for idx in self._table.selectedIndexes()}
+        if len(rows) == 1:
+            self._on_row_changed(next(iter(rows)))
+        elif len(rows) > 1:
+            # Multi-selection: only enable delete, clear annotation panel
+            self._clear_annotation_panel()
+            self._btn_del_sample.setEnabled(True)
+        else:
+            self._clear_annotation_panel()
 
     @Slot(int)
     def _on_row_changed(self, row: int) -> None:
@@ -496,7 +512,7 @@ class _DatasetDialog(QDialog):
         # Search from row after current, wrap around
         for offset in range(1, n + 1):
             row = (cur + offset) % n
-            item = self._table.item(row, 4)  # label column
+            item = self._table.item(row, 5)  # label column
             if item and item.text() == LABEL_DISPLAY["unlabeled"]:
                 return row
         return -1
@@ -534,15 +550,41 @@ class _DatasetDialog(QDialog):
         QMessageBox.information(self, "导出完成", f"已导出 {len(samples)} 条样本到：\n{path}")
 
     @Slot()
-    def _on_delete_sample(self) -> None:
-        if self._current_id is None:
+    def _on_table_context_menu(self, pos: object) -> None:  # noqa: N802
+        from PySide6.QtWidgets import QMenu  # noqa: PLC0415
+        rows = {idx.row() for idx in self._table.selectedIndexes()}
+        if not rows:
             return
+        menu = QMenu(self)
+        act_del = menu.addAction(f"🗑 删除选中 {len(rows)} 条样本")
+        act_del.triggered.connect(self._on_delete_sample)
+        from PySide6.QtGui import QCursor  # noqa: PLC0415
+        menu.exec(QCursor.pos())
+
+    @Slot()
+    def _on_delete_sample(self) -> None:
+        rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
+        if not rows and self._current_id is None:
+            return
+        # Collect IDs
+        ids: list[int] = []
+        if rows:
+            for r in rows:
+                id_item = self._table.item(r, 0)
+                if id_item is not None:
+                    ids.append(id_item.data(Qt.ItemDataRole.UserRole))
+        elif self._current_id is not None:
+            ids = [self._current_id]
+        if not ids:
+            return
+        label = f"确定删除选中的 {len(ids)} 条样本？" if len(ids) > 1 else f"确定删除样本 #{ids[0]}？"
         if QMessageBox.question(
-            self, "删除样本", f"确定删除样本 #{self._current_id}？",
+            self, "删除样本", label,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
-        self._ds.delete(self._current_id)
+        for sid in ids:
+            self._ds.delete(sid)
         self._load_table()
 
 
