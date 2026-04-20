@@ -568,6 +568,11 @@ class DebugWindow(QMainWindow):
         self._backend.freeze_overlay.dismissed.connect(self._on_freeze_dismissed)
         self._backend.paused_changed.connect(self._on_paused_changed)
 
+        # If the backend is already running when this window is created,
+        # the ready signal was emitted before our connection — catch up now.
+        if self._backend.is_running:
+            self._on_worker_ready()
+
         # Populate target label if backend already has a target.
         if backend.target is not None:
             t = backend.target
