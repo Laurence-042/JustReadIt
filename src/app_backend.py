@@ -406,7 +406,7 @@ class AppBackend(QObject):
             self._dataset.record(
                 ocr_text=ocr_text,
                 memory_hits=hits,
-                needle="",  # needle is not currently in PipelineResult; reserved
+                needle=result.needle,
                 corrected_text=corrected,
                 translated_text=translated,
             )
