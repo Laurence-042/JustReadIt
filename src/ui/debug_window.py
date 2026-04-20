@@ -1267,7 +1267,6 @@ class DebugWindow(QMainWindow):
         lay.setSpacing(0)
         self._tl_settings = TranslatorSettingsWidget(
             self._backend,
-            show_buttons=True,
             auto_build=True,
             parent=grp,
         )

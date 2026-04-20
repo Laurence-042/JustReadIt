@@ -53,10 +53,6 @@ class TranslatorSettingsWidget(QWidget):
     ----------
     backend:
         The shared application backend.
-    show_buttons:
-        When *True* (default), renders Apply / Test / Clear-cache buttons and
-        a status label inline.  Set *False* when the host dialog provides its
-        own OK/Cancel flow and will call :meth:`apply` explicitly.
     auto_build:
         When *True* (default), attempt to build the translator on construction
         if a backend is configured in :class:`AppConfig`.  Set *False* in
@@ -70,15 +66,13 @@ class TranslatorSettingsWidget(QWidget):
         self,
         backend: AppBackend,
         *,
-        show_buttons: bool = True,
         auto_build: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._backend = backend
         self._dirty = False
-        self._show_buttons = show_buttons
-        self._build_ui(show_buttons=show_buttons)
+        self._build_ui()
         self.load_from_config()
         self._on_backend_changed(self._cmb_backend.currentIndex())
 
@@ -95,7 +89,7 @@ class TranslatorSettingsWidget(QWidget):
     # UI construction
     # ------------------------------------------------------------------
 
-    def _build_ui(self, *, show_buttons: bool) -> None:
+    def _build_ui(self) -> None:
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -221,27 +215,24 @@ class TranslatorSettingsWidget(QWidget):
         self._lbl_status.setWordWrap(True)
         self._lbl_status.setStyleSheet("color: #aaa; font-size: 8pt;")
 
-        # ── Buttons row (optional) ─────────────────────────────────────
-        if show_buttons:
-            btn_row = QHBoxLayout()
-            self._btn_apply = QPushButton("应用")
-            self._btn_apply.setToolTip(
-                "保存设置并（重新）初始化翻译器。\n"
-                "缺少的依赖包会自动安装。"
-            )
-            self._btn_test = QPushButton("测试")
-            self._btn_test.setToolTip(
-                "发送一段测试文本以验证翻译器是否正常工作。"
-            )
-            btn_row.addWidget(self._btn_apply)
-            btn_row.addWidget(self._btn_test)
-            btn_row.addWidget(self._lbl_status, 1)
-            lay.addLayout(btn_row)
+        # ── Buttons row ────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        self._btn_apply = QPushButton("应用")
+        self._btn_apply.setToolTip(
+            "保存设置并（重新）初始化翻译器。\n"
+            "缺少的依赖包会自动安装。"
+        )
+        self._btn_test = QPushButton("测试")
+        self._btn_test.setToolTip(
+            "发送一段测试文本以验证翻译器是否正常工作。"
+        )
+        btn_row.addWidget(self._btn_apply)
+        btn_row.addWidget(self._btn_test)
+        btn_row.addWidget(self._lbl_status, 1)
+        lay.addLayout(btn_row)
 
-            self._btn_apply.clicked.connect(self._on_apply)
-            self._btn_test.clicked.connect(self._on_test)
-        else:
-            lay.addWidget(self._lbl_status)
+        self._btn_apply.clicked.connect(self._on_apply)
+        self._btn_test.clicked.connect(self._on_test)
 
         # Wire backend/preset selectors
         self._cmb_backend.currentIndexChanged.connect(self._on_backend_changed)
@@ -348,8 +339,7 @@ class TranslatorSettingsWidget(QWidget):
         if self._dirty:
             return
         self._dirty = True
-        if self._show_buttons:
-            self._set_status("⚠ 设置已修改，点击「应用」保存并重新构建翻译器。")
+        self._set_status("⚠ 设置已修改，点击「应用」保存并重新构建翻译器。")
 
     def set_target_lang(self, tag: str) -> None:
         """Set the target-lang combo to the given BCP-47 tag."""
