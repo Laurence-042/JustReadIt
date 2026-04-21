@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -22,7 +22,6 @@ import pytest
 
 
 _VALID_MATCH_MODES = {"exact", "contains_all", "none"}
-_VALID_LABELS = {"ok", "bad_correction"}
 
 _DEFAULT_SAMPLES = Path(__file__).parent / "fixtures" / "correction_samples.csv"
 
@@ -51,8 +50,6 @@ class CorrectionSample:
     match_mode: str           # "exact" | "contains_all" | "none"
     expected: str             # full text (exact) | "|"-joined substrings | ""
     must_not_contain: str     # "|"-joined forbidden substrings, may be ""
-    label: str                # "ok" | "bad_correction"
-    expected_correction: str  # ideal output for label=bad_correction, may be ""
     notes: str
 
     @property
@@ -77,10 +74,6 @@ def _validate(sample: CorrectionSample) -> None:
             f"{sample.id}: match_mode={sample.match_mode!r} not in "
             f"{sorted(_VALID_MATCH_MODES)}"
         )
-    if sample.label not in _VALID_LABELS:
-        raise ValueError(
-            f"{sample.id}: label={sample.label!r} not in {sorted(_VALID_LABELS)}"
-        )
     if sample.match_mode == "none":
         if sample.expected:
             raise ValueError(
@@ -95,12 +88,6 @@ def _validate(sample: CorrectionSample) -> None:
             raise ValueError(
                 f"{sample.id}: match_mode={sample.match_mode} requires expected"
             )
-    if sample.label == "bad_correction" and not sample.expected_correction:
-        raise ValueError(
-            f"{sample.id}: label=bad_correction requires expected_correction"
-        )
-
-
 def load_correction_samples(path: str | Path) -> list[CorrectionSample]:
     """Parse the correction-samples CSV and validate every row."""
     p = Path(path)
@@ -110,12 +97,12 @@ def load_correction_samples(path: str | Path) -> list[CorrectionSample]:
     samples: list[CorrectionSample] = []
     with p.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
+        fieldnames = set(reader.fieldnames or [])
         required = {
             "id", "ocr_text", "memory_hits", "needle", "match_mode",
-            "expected", "must_not_contain", "label", "expected_correction",
-            "notes",
+            "expected", "must_not_contain", "notes",
         }
-        missing = required - set(reader.fieldnames or [])
+        missing = required - fieldnames
         if missing:
             raise ValueError(
                 f"{p}: missing required columns: {sorted(missing)}"
@@ -143,8 +130,6 @@ def load_correction_samples(path: str | Path) -> list[CorrectionSample]:
                 match_mode=row["match_mode"],
                 expected=row["expected"] or "",
                 must_not_contain=row["must_not_contain"] or "",
-                label=row["label"],
-                expected_correction=row["expected_correction"] or "",
                 notes=row["notes"] or "",
             )
             _validate(sample)

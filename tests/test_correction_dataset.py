@@ -23,24 +23,8 @@ from src.correction import best_match_with_details
 from tests.conftest import CorrectionSample, samples_for_collection
 
 
-def _id(sample: CorrectionSample) -> str:
-    return sample.id
-
-
 def _params() -> list[pytest.param]:
-    out: list[pytest.param] = []
-    for s in samples_for_collection():
-        marks: list[pytest.MarkDecorator] = []
-        if s.label == "bad_correction":
-            marks.append(
-                pytest.mark.xfail(
-                    strict=True,
-                    reason=s.notes
-                    or "known bad correction; expected_correction documents the fix",
-                )
-            )
-        out.append(pytest.param(s, id=s.id, marks=marks))
-    return out
+    return [pytest.param(s, id=s.id) for s in samples_for_collection()]
 
 
 def _assert_match(result_text: str, sample: CorrectionSample) -> None:
@@ -71,20 +55,6 @@ def test_correction_sample(sample: CorrectionSample) -> None:
         list(sample.memory_hits),
         sample.needle,
     )
-
-    if sample.label == "bad_correction":
-        # xfail path: assert the *desired* behaviour. Currently fails;
-        # if the algorithm is fixed pytest will report XPASS (strict).
-        assert result is not None, (
-            f"[{sample.id}] expected non-None result; "
-            f"expected_correction={sample.expected_correction!r}"
-        )
-        assert result.text == sample.expected_correction, (
-            f"[{sample.id}] expected ideal correction\n"
-            f"  expected_correction: {sample.expected_correction!r}\n"
-            f"  actual:              {result.text!r}"
-        )
-        return
 
     if sample.match_mode == "none":
         actual = result.text if result is not None else None

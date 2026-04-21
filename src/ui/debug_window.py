@@ -723,35 +723,37 @@ class _DatasetDialog(QDialog):
     def _on_export_correction_samples(self) -> None:
         """Export annotated rows as ``correction_samples.csv`` for pytest.
 
-        Only rows with ``label`` in {``ok``, ``bad_correction``} are included.
-        Schema mapping:
+        Only fully-annotated rows (``ok`` / ``bad_correction``) are included.
+        ``label`` and ``expected_correction`` are NOT written to the test CSV;
+        the annotated correct result is placed directly into ``expected``:
 
-        * ``id``                → ``sample_<db_id>``
-        * ``ocr_text``         → same
-        * ``memory_hits``      → JSON array (re-encoded)
-        * ``needle``           → same
-        * ``match_mode``       → ``contains_all`` (ok, non-empty corrected)
-                                  ``none``         (ok, empty corrected)
-                                  ``none``         (bad_correction)
-        * ``expected``         → ``corrected_text`` for ``contains_all`` rows,
-                                  empty otherwise
-        * ``must_not_contain`` → empty (fill manually if needed)
-        * ``label``            → same (``ok`` / ``bad_correction``)
-        * ``expected_correction`` → same
-        * ``notes``            → same
+        * ``ok``             → ``expected = corrected_text``
+                               (``match_mode=contains_all`` if non-empty, else ``none``)
+        * ``bad_correction`` → ``expected = expected_correction``
+                               (``match_mode=contains_all`` if non-empty, else skipped)
+        * all other labels   → excluded
         """
         import csv   # noqa: PLC0415
         import json  # noqa: PLC0415
 
         all_samples = self._ds.list_samples(limit=10_000)
-        exportable = [
-            s for s in all_samples if s.label in {"ok", "bad_correction"}
-        ]
+
+        exportable = []
+        skipped_incomplete = 0
+        for s in all_samples:
+            if s.label == "ok":
+                exportable.append(s)
+            elif s.label == "bad_correction":
+                if s.expected_correction:
+                    exportable.append(s)
+                else:
+                    skipped_incomplete += 1
+
         if not exportable:
-            QMessageBox.information(
-                self, "导出为测试集",
-                "没有可导出的样本（需要 label=ok 或 bad_correction）。",
-            )
+            msg = "没有可导出的样本（需要 label=ok 或已填写正确纠错的 bad_correction）。"
+            if skipped_incomplete:
+                msg += f"\n\n已跳过 {skipped_incomplete} 条 bad_correction（未填写正确纠错）。"
+            QMessageBox.information(self, "导出为测试集", msg)
             return
 
         path, _ = QFileDialog.getSaveFileName(
@@ -765,19 +767,14 @@ class _DatasetDialog(QDialog):
             writer = csv.writer(f)
             writer.writerow([
                 "id", "ocr_text", "memory_hits", "needle",
-                "match_mode", "expected", "must_not_contain",
-                "label", "expected_correction", "notes",
+                "match_mode", "expected", "must_not_contain", "notes",
             ])
             for s in exportable:
-                if s.label == "bad_correction":
-                    match_mode = "none"
-                    expected = ""
-                elif s.corrected_text:
-                    match_mode = "contains_all"
+                if s.label == "ok":
                     expected = s.corrected_text
-                else:
-                    match_mode = "none"
-                    expected = ""
+                else:  # bad_correction — expected_correction is the ground truth
+                    expected = s.expected_correction
+                match_mode = "contains_all" if expected else "none"
                 writer.writerow([
                     f"sample_{s.id}",
                     s.ocr_text,
@@ -785,15 +782,17 @@ class _DatasetDialog(QDialog):
                     s.needle,
                     match_mode,
                     expected,
-                    "",           # must_not_contain — fill manually
-                    s.label,
-                    s.expected_correction,
+                    "",   # must_not_contain — fill manually if needed
                     s.notes,
                 ])
 
+        skip_msg = (
+            f"\n\n已跳过 {skipped_incomplete} 条 bad_correction（未填写正确纠错）。"
+            if skipped_incomplete else ""
+        )
         QMessageBox.information(
             self, "导出完成",
-            f"已导出 {len(exportable)} 条样本到：\n{path}\n\n"
+            f"已导出 {len(exportable)} 条样本到：\n{path}{skip_msg}\n\n"
             "提示：可用以下命令跑回归：\n"
             f"pytest tests/test_correction_dataset.py "
             f"--correction-samples={path}",
