@@ -496,6 +496,13 @@ class _DatasetDialog(QDialog):
         btn_export.setToolTip("将当前筛选的样本导出为 CSV 文件")
         btn_export.clicked.connect(self._on_export_csv)
         btn_row.addWidget(btn_export)
+        btn_export_test = QPushButton("🧪 导出为测试集")
+        btn_export_test.setToolTip(
+            "将已标注的样本（label=ok / bad_correction）导出为\n"
+            "correction_samples.csv 格式，可直接用于 pytest 回归测试。"
+        )
+        btn_export_test.clicked.connect(self._on_export_correction_samples)
+        btn_row.addWidget(btn_export_test)
         btn_row.addStretch()
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
@@ -711,6 +718,86 @@ class _DatasetDialog(QDialog):
                     s.annotated_at or "",
                 ])
         QMessageBox.information(self, "导出完成", f"已导出 {len(samples)} 条样本到：\n{path}")
+
+    @Slot()
+    def _on_export_correction_samples(self) -> None:
+        """Export annotated rows as ``correction_samples.csv`` for pytest.
+
+        Only rows with ``label`` in {``ok``, ``bad_correction``} are included.
+        Schema mapping:
+
+        * ``id``                → ``sample_<db_id>``
+        * ``ocr_text``         → same
+        * ``memory_hits``      → JSON array (re-encoded)
+        * ``needle``           → same
+        * ``match_mode``       → ``contains_all`` (ok, non-empty corrected)
+                                  ``none``         (ok, empty corrected)
+                                  ``none``         (bad_correction)
+        * ``expected``         → ``corrected_text`` for ``contains_all`` rows,
+                                  empty otherwise
+        * ``must_not_contain`` → empty (fill manually if needed)
+        * ``label``            → same (``ok`` / ``bad_correction``)
+        * ``expected_correction`` → same
+        * ``notes``            → same
+        """
+        import csv   # noqa: PLC0415
+        import json  # noqa: PLC0415
+
+        all_samples = self._ds.list_samples(limit=10_000)
+        exportable = [
+            s for s in all_samples if s.label in {"ok", "bad_correction"}
+        ]
+        if not exportable:
+            QMessageBox.information(
+                self, "导出为测试集",
+                "没有可导出的样本（需要 label=ok 或 bad_correction）。",
+            )
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出为测试集 CSV",
+            "correction_samples_export.csv", "CSV 文件 (*.csv)",
+        )
+        if not path:
+            return
+
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "id", "ocr_text", "memory_hits", "needle",
+                "match_mode", "expected", "must_not_contain",
+                "label", "expected_correction", "notes",
+            ])
+            for s in exportable:
+                if s.label == "bad_correction":
+                    match_mode = "none"
+                    expected = ""
+                elif s.corrected_text:
+                    match_mode = "contains_all"
+                    expected = s.corrected_text
+                else:
+                    match_mode = "none"
+                    expected = ""
+                writer.writerow([
+                    f"sample_{s.id}",
+                    s.ocr_text,
+                    json.dumps(s.memory_hits, ensure_ascii=False),
+                    s.needle,
+                    match_mode,
+                    expected,
+                    "",           # must_not_contain — fill manually
+                    s.label,
+                    s.expected_correction,
+                    s.notes,
+                ])
+
+        QMessageBox.information(
+            self, "导出完成",
+            f"已导出 {len(exportable)} 条样本到：\n{path}\n\n"
+            "提示：可用以下命令跑回归：\n"
+            f"pytest tests/test_correction_dataset.py "
+            f"--correction-samples={path}",
+        )
 
 
 
