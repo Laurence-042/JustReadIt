@@ -30,6 +30,7 @@ import winrt.windows.media.ocr as wocr
 import winrt.windows.storage.streams as wss
 
 from .range_detectors import BoundingBox
+from src.text_utils import normalize_text
 
 _log = logging.getLogger(__name__)
 
@@ -251,7 +252,7 @@ class WindowsOcr:
                     y=int(r.y       / scale),
                     w=int(r.width   / scale),
                     h=int(r.height  / scale),
-                    text=word.text,
+                    text=normalize_text(word.text),
                 )
                 word_boxes.append(wb)
                 line_words.append(wb)
@@ -287,4 +288,4 @@ class WindowsOcr:
             )
         bmp = _pil_to_software_bitmap(image)
         result: wocr.OcrResult = asyncio.run(self._engine.recognize_async(bmp))
-        return result.text
+        return normalize_text(result.text)

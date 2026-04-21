@@ -20,6 +20,8 @@ from typing import Iterable
 
 import pytest
 
+from src.text_utils import normalize_text
+
 
 _VALID_MATCH_MODES = {"exact", "contains_all", "none"}
 
@@ -123,12 +125,12 @@ def load_correction_samples(path: str | Path) -> list[CorrectionSample]:
                 )
             sample = CorrectionSample(
                 id=row["id"],
-                ocr_text=row["ocr_text"] or "",
-                memory_hits=tuple(hits),
+                ocr_text=normalize_text(row["ocr_text"] or ""),
+                memory_hits=tuple(normalize_text(h) for h in hits),
                 match_mode=row["match_mode"],
-                expected=row["expected"] or "",
-                must_not_contain=row["must_not_contain"] or "",
-                notes=row["notes"] or "",
+                expected=normalize_text(row["expected"] or ""),
+                must_not_contain=normalize_text(row["must_not_contain"] or ""),
+                notes=normalize_text(row["notes"] or ""),
             )
             _validate(sample)
             samples.append(sample)

@@ -332,6 +332,24 @@ class OpenAICompatTranslator(Translator):
             :class:`~src.translators.base.RateLimitError`: Rate limit hit.
             :class:`~src.translators.base.TranslationError`: Other API error.
         """
+        # Delegate to base template method (calls _translate + normalize_text).
+        translation = super().translate(text, source_lang, target_lang)
+
+        # Update short-term context only on confirmed high-quality input.
+        if translation and add_to_history:
+            self._recent.append(_HistoryEntry(source=text, translation=translation))
+            if len(self._recent) > self._context_window:
+                self._recent = self._recent[-self._context_window:]
+
+        return translation
+
+    def _do_translate(
+        self,
+        text: str,
+        source_lang: str = "ja",
+        target_lang: str = "en",
+    ) -> str:
+        """Core RAG + tool-loop translation (called by base template method)."""
         if not text.strip():
             return text
 
@@ -345,15 +363,7 @@ class OpenAICompatTranslator(Translator):
         tools = self._get_tools() if (self._kb and self._tools_enabled) else None
 
         # 4. Tool-call loop → final translation
-        translation = self._run_tool_loop(messages, tools)
-
-        # 5. Update short-term context only on confirmed high-quality input
-        if add_to_history:
-            self._recent.append(_HistoryEntry(source=text, translation=translation))
-            if len(self._recent) > self._context_window:
-                self._recent = self._recent[-self._context_window:]
-
-        return translation
+        return self._run_tool_loop(messages, tools)
 
     # ── Internal ──────────────────────────────────────────────────────
 

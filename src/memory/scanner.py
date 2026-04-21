@@ -35,6 +35,7 @@ from typing import Sequence
 
 from . import _win32 as w32
 from ._search import find_all_positions
+from src.text_utils import normalize_text
 
 _log = logging.getLogger(__name__)
 
@@ -270,10 +271,18 @@ def _extract_string(
     match_pos: int,
     encoding: str,
 ) -> str | None:
-    """Dispatch to the appropriate extraction function for *encoding*."""
+    """Dispatch to the appropriate extraction function for *encoding*.
+
+    The returned text is always normalised to ``\\n`` line endings so that
+    downstream code (correction, caching, dataset) never sees ``\\r\\n``.
+    """
     if encoding == "utf-16-le":
-        return _extract_utf16le(data, match_pos)
-    return _extract_byte_delimited(data, match_pos, encoding)
+        text = _extract_utf16le(data, match_pos)
+    else:
+        text = _extract_byte_delimited(data, match_pos, encoding)
+    if text is not None:
+        text = normalize_text(text)
+    return text
 
 
 def _is_quality_text(text: str) -> bool:

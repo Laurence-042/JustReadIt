@@ -17,6 +17,8 @@ Design
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+
+from src.text_utils import normalize_text
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
@@ -102,6 +104,15 @@ class Translator(ABC):
     * Raise :class:`TranslationError` (or a subtype) on failure.
     """
 
-    @abstractmethod
     def translate(self, text: str, source_lang: str = "ja", target_lang: str = "en") -> str:
-        """Translate *text* and return the translated string."""
+        """Translate *text* and return the normalised translated string.
+
+        Subclasses must implement :meth:`_translate`; this method handles
+        post-processing (currently :func:`~src.text_utils.normalize_text`)
+        so that every backend benefits automatically.
+        """
+        return normalize_text(self._do_translate(text, source_lang, target_lang))
+
+    @abstractmethod
+    def _do_translate(self, text: str, source_lang: str = "ja", target_lang: str = "en") -> str:
+        """Backend-specific translation implementation.  Return raw translated string."""

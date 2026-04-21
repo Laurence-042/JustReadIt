@@ -73,7 +73,7 @@ class CloudTranslationTranslator(Translator):
 
     # ── Translator ────────────────────────────────────────────────────
 
-    def translate(
+    def _do_translate(
         self,
         text: str,
         source_lang: str = "ja",
