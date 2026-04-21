@@ -169,9 +169,11 @@ class ParagraphDetector(RangeDetector):
        c. *Horizontal proximity* – the pixel gap is ≤
           ``max_h_gap_chars × char_w`` (default 4 char widths).
 
-       Both gap tests use the *minimum* positive distance between the two
-       box edges (0 when the boxes overlap on that axis), so overlapping
-       boxes always pass.
+       The two proximity thresholds are combined as an **ellipse** rather
+       than independent per-axis checks: a candidate is accepted only when
+       ``(v_gap/max_v)² + (h_gap/max_h)² ≤ 1``.  This prevents
+       diagonally-offset boxes from being merged even when each individual
+       gap would pass on its own.
 
     The flood-fill propagates through intermediate lines, so a 5-line
     paragraph is fully captured even though lines 1 and 5 are not directly
@@ -185,7 +187,7 @@ class ParagraphDetector(RangeDetector):
         Maximum horizontal gap in units of anchor char width.  Default 4.0.
     size_ratio:
         Maximum relative deviation of a candidate’s char height from the
-        anchor’s.  Default 0.4 (±40 %).
+        anchor's.  Default 0.2 (±20 %).
     cursor_margin:
         Extra pixels added around each line when testing cursor containment.
         Default 8 px.
@@ -195,7 +197,7 @@ class ParagraphDetector(RangeDetector):
         self,
         max_v_gap_chars: float = 0.5,
         max_h_gap_chars: float = 4.0,
-        size_ratio: float = 0.4,
+        size_ratio: float = 0.2,
         cursor_margin: int = 8,
     ) -> None:
         self.max_v_gap_chars = max_v_gap_chars
@@ -247,12 +249,18 @@ class ParagraphDetector(RangeDetector):
                     if abs(cand_h - anchor_char_h) / anchor_char_h > self.size_ratio:
                         continue
 
-                # Proximity gate: both axes must pass.
+                # Proximity gate: ellipse condition – boxes that are
+                # offset on *both* axes simultaneously (diagonal layout)
+                # are rejected even if each axis individually would pass.
+                # When one gap is 0 (boxes overlap on that axis) the test
+                # reduces to a simple 1-D threshold, same as before.
                 v_gap = max(0.0, candidate.y - current.bottom,
                             current.y - candidate.bottom)
                 h_gap = max(0.0, candidate.x - current.right,
                             current.x - candidate.right)
-                if v_gap <= max_v and h_gap <= max_h:
+                v_norm = v_gap / max_v if max_v > 0 else float("inf")
+                h_norm = h_gap / max_h if max_h > 0 else float("inf")
+                if v_norm * v_norm + h_norm * h_norm <= 1.0:
                     seen.add(id(candidate))
                     group.append(candidate)
                     queue.append(candidate)
