@@ -1,5 +1,9 @@
 {
     "version": "0.2.0",
+    // PYDEVD_USE_FRAME_EVAL=NO: 禁用 debugpy 的 frame evaluation 模式，回退到 sys.settrace。
+    // Shiboken（PySide6 绑定层）在 import hook 内部使用 KeyboardInterrupt 做流程控制，
+    // frame eval 模式会在 try/except 边界之外拦截该异常并重新抛出，导致调试启动崩溃。
+    // sys.settrace 遵守标准异常传播语义，Shiboken 可以正常吞掉自己抛出的 KeyboardInterrupt。
     "configurations": [
         {
             "name": "Main Window",
@@ -11,7 +15,8 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYDEVD_USE_FRAME_EVAL": "NO"
             }
         },
         {
@@ -37,7 +42,8 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYDEVD_USE_FRAME_EVAL": "NO"
             }
         },
         {
@@ -62,7 +68,8 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYDEVD_USE_FRAME_EVAL": "NO"
             }
         },
         {
@@ -74,7 +81,8 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYDEVD_USE_FRAME_EVAL": "NO"
             }
         },
         {
@@ -90,7 +98,8 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYDEVD_USE_FRAME_EVAL": "NO"
             }
         }
     ],
