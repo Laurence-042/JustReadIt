@@ -46,7 +46,6 @@ class CorrectionSample:
     id: str
     ocr_text: str
     memory_hits: tuple[str, ...]
-    needle: str
     match_mode: str           # "exact" | "contains_all" | "none"
     expected: str             # full text (exact) | "|"-joined substrings | ""
     must_not_contain: str     # "|"-joined forbidden substrings, may be ""
@@ -99,7 +98,7 @@ def load_correction_samples(path: str | Path) -> list[CorrectionSample]:
         reader = csv.DictReader(fh)
         fieldnames = set(reader.fieldnames or [])
         required = {
-            "id", "ocr_text", "memory_hits", "needle", "match_mode",
+            "id", "ocr_text", "memory_hits", "match_mode",
             "expected", "must_not_contain", "notes",
         }
         missing = required - fieldnames
@@ -126,7 +125,6 @@ def load_correction_samples(path: str | Path) -> list[CorrectionSample]:
                 id=row["id"],
                 ocr_text=row["ocr_text"] or "",
                 memory_hits=tuple(hits),
-                needle=row["needle"] or "",
                 match_mode=row["match_mode"],
                 expected=row["expected"] or "",
                 must_not_contain=row["must_not_contain"] or "",

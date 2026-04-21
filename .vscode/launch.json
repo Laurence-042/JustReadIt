@@ -92,7 +92,7 @@
             "module": "pytest",
             "args": [
                 "tests/test_correction_dataset.py",
-                "--correction-samples=${input:correctionSamplesPath}",
+                "--correction-samples=${input:extraCorrectionSamplesPath}",
                 "-v"
             ],
             "console": "integratedTerminal",
@@ -109,6 +109,12 @@
             "type": "promptString",
             "description": "correction_samples CSV 文件路径（从数据标注导出）",
             "default": "${workspaceFolder}/correction_samples_export.csv"
+        },
+        {
+            "id": "extraCorrectionSamplesPath",
+            "type": "promptString",
+            "description": "extra_correction_samples CSV 文件路径（从数据标注导出）",
+            "default": "${workspaceFolder}/tests/extra/correction_samples_export.csv"
         }
     ]
 }

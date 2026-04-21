@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from src.correction import best_match_with_details
+from src.memory import pick_needles
 
 from tests.conftest import CorrectionSample, samples_for_collection
 
@@ -50,11 +51,15 @@ def _assert_match(result_text: str, sample: CorrectionSample) -> None:
 @pytest.mark.parametrize("sample", _params())
 def test_correction_sample(sample: CorrectionSample) -> None:
     """End-to-end OCR + memory → corrected text, driven by CSV dataset."""
-    result = best_match_with_details(
-        sample.ocr_text,
-        list(sample.memory_hits),
-        sample.needle,
-    )
+    result = None
+    for needle in pick_needles(sample.ocr_text):
+        result = best_match_with_details(
+            sample.ocr_text,
+            list(sample.memory_hits),
+            needle,
+        )
+        if result is not None:
+            break
 
     if sample.match_mode == "none":
         actual = result.text if result is not None else None
