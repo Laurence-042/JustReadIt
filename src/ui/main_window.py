@@ -105,7 +105,7 @@ class MainWindow(QMainWindow):
 
         # Reactive config → widget sync: target-lang combo has custom
         # parsing logic, so it is not managed by QDataWidgetMapper.
-        _cfg.translator_target_lang_changed.connect(self._sync_tgt_lang_combo)
+        _cfg.translator.target_lang_changed.connect(self._sync_tgt_lang_combo)
 
     # ── UI ────────────────────────────────────────────────────────────────
 
@@ -187,7 +187,7 @@ class MainWindow(QMainWindow):
         )
         for _code in TARGET_PRESETS:
             self._cmb_tgt_lang.addItem(display_name(_code), userData=_code)
-        _saved_tgt = _cfg.translator_target_lang or "zh-Hans-CN"
+        _saved_tgt = _cfg.translator.target_lang or "zh-Hans-CN"
         for _i in range(self._cmb_tgt_lang.count()):
             if self._cmb_tgt_lang.itemData(_i) == _saved_tgt:
                 self._cmb_tgt_lang.setCurrentIndex(_i)
@@ -286,9 +286,9 @@ class MainWindow(QMainWindow):
         self._lbl_dot.setStyleSheet(f"color: {dot_color}; font-size: 13px;")
 
     def _status_running(self) -> None:
-        backend    = _cfg.translator_backend
-        lang       = _cfg.ocr_language
-        target_lang = _cfg.translator_target_lang
+        backend    = _cfg.translator.backend
+        lang       = _cfg.ocr.language
+        target_lang = _cfg.translator.target_lang
         info = f"{lang} → {target_lang}"
         if backend and backend != "none":
             info += f"  ·  {backend}"
@@ -315,7 +315,7 @@ class MainWindow(QMainWindow):
             return
         data = self._cmb_tgt_lang.itemData(idx)
         if data:
-            _cfg.translator_target_lang = str(data)
+            _cfg.translator.target_lang = str(data)
 
     # ── Reactive config → widget sync (unmapped widgets only) ─────────
 
@@ -396,7 +396,7 @@ class MainWindow(QMainWindow):
         hwnd: int,
     ) -> None:
         # The freeze overlay is managed by AppBackend; we only update status.
-        vk = _cfg.freeze_vk
+        vk = _cfg.overlay.freeze_vk
         key_name = next(
             (f"F{i}" for i in range(1, 13) if 0x6F + i == vk), f"0x{vk:02X}"
         )

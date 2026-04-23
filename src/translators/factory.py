@@ -51,7 +51,7 @@ def build_translator(
     Returns:
         A ready-to-use :class:`~src.translators.base.Translator`, or ``None``.
     """
-    backend = config.translator_backend.lower().strip()
+    backend = config.translator.backend.lower().strip()
 
     if backend in ("none", ""):
         return None
@@ -59,7 +59,7 @@ def build_translator(
     if backend == "cloud":
         from src.translators.cloud_translation import CloudTranslationTranslator
 
-        api_key = config.cloud_api_key.strip() or None
+        api_key = config.translator.cloud.api_key.strip() or None
         return CloudTranslationTranslator(api_key=api_key, progress=progress)
 
     if backend == "google_free":
@@ -71,14 +71,14 @@ def build_translator(
         from src.translators.openai_translator import OpenAICompatTranslator
 
         return OpenAICompatTranslator(
-            api_key=config.openai_api_key.strip(),
-            model=config.openai_model.strip() or "gpt-4o-mini",
-            system_prompt=config.openai_system_prompt,
-            context_window=config.openai_context_window,
-            base_url=config.openai_base_url.strip() or None,
+            api_key=config.translator.openai.api_key.strip(),
+            model=config.translator.openai.model.strip() or "gpt-4o-mini",
+            system_prompt=config.translator.openai.system_prompt,
+            context_window=config.translator.openai.context_window,
+            base_url=config.translator.openai.base_url.strip() or None,
             knowledge_base=knowledge_base,  # type: ignore[arg-type]
-            tools_enabled=config.openai_tools_enabled,
-            disable_thinking=config.openai_disable_thinking,
+            tools_enabled=config.translator.openai.tools_enabled,
+            disable_thinking=config.translator.openai.disable_thinking,
             progress=progress,
         )
 

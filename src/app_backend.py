@@ -89,16 +89,16 @@ class AppBackend(QObject):
         self._restart_timer.setSingleShot(True)
         self._restart_timer.setInterval(50)
         self._restart_timer.timeout.connect(self._deferred_restart)
-        _cfg.ocr_language_changed.connect(self._schedule_restart)
-        _cfg.ocr_max_size_changed.connect(self._schedule_restart)
-        _cfg.translator_target_lang_changed.connect(self._schedule_restart)
+        _cfg.ocr.language_changed.connect(self._schedule_restart)
+        _cfg.ocr.max_size_changed.connect(self._schedule_restart)
+        _cfg.translator.target_lang_changed.connect(self._schedule_restart)
 
         # Settings that can be pushed to the running controller without
         # recreating it.
-        _cfg.interval_ms_changed.connect(self._on_cfg_interval)
-        _cfg.freeze_vk_changed.connect(self._on_cfg_freeze_vk)
-        _cfg.dump_vk_changed.connect(self._on_cfg_dump_vk)
-        _cfg.memory_scan_enabled_changed.connect(self._on_cfg_mem_scan)
+        _cfg.pipeline.interval_ms_changed.connect(self._on_cfg_interval)
+        _cfg.overlay.freeze_vk_changed.connect(self._on_cfg_freeze_vk)
+        _cfg.overlay.dump_vk_changed.connect(self._on_cfg_dump_vk)
+        _cfg.pipeline.memory_scan_enabled_changed.connect(self._on_cfg_mem_scan)
 
     # ── Properties ───────────────────────────────────────────────────────────
 
@@ -158,16 +158,16 @@ class AppBackend(QObject):
         self.stop()
         self._controller = HoverController(
             self._target,
-            language_tag=_cfg.ocr_language,
+            language_tag=_cfg.ocr.language,
             translator=self._translator,
-            source_lang=_cfg.ocr_language,
-            target_lang=_cfg.translator_target_lang,
-            freeze_vk=_cfg.freeze_vk,
-            dump_vk=_cfg.dump_vk,
-            poll_ms=_cfg.interval_ms,
+            source_lang=_cfg.ocr.language,
+            target_lang=_cfg.translator.target_lang,
+            freeze_vk=_cfg.overlay.freeze_vk,
+            dump_vk=_cfg.overlay.dump_vk,
+            poll_ms=_cfg.pipeline.interval_ms,
             continuous=True,
-            ocr_max_long_edge=_cfg.ocr_max_size,
-            memory_scan_enabled=_cfg.memory_scan_enabled,
+            ocr_max_long_edge=_cfg.ocr.max_size,
+            memory_scan_enabled=_cfg.pipeline.memory_scan_enabled,
         )
         self._worker_thread = QThread(self)
         self._controller.moveToThread(self._worker_thread)
@@ -230,7 +230,7 @@ class AppBackend(QObject):
         The running controller is updated immediately via
         :meth:`~src.controller.HoverController.set_translator`.
         """
-        if _cfg.translator_backend in ("none", ""):
+        if _cfg.translator.backend in ("none", ""):
             self._translator = None
         else:
             try:
@@ -258,16 +258,16 @@ class AppBackend(QObject):
 
     def set_poll_interval(self, ms: int) -> None:
         """Write to config (triggers signal → auto-push to controller)."""
-        _cfg.interval_ms = ms
+        _cfg.pipeline.interval_ms = ms
 
     def set_freeze_vk(self, vk: int) -> None:
-        _cfg.freeze_vk = vk
+        _cfg.overlay.freeze_vk = vk
 
     def set_dump_vk(self, vk: int) -> None:
-        _cfg.dump_vk = vk
+        _cfg.overlay.dump_vk = vk
 
     def set_memory_scan_enabled(self, enabled: bool) -> None:
-        _cfg.memory_scan_enabled = enabled
+        _cfg.pipeline.memory_scan_enabled = enabled
 
     def set_paused(self, paused: bool) -> None:
         """Pause or resume the translation pipeline."""

@@ -79,10 +79,10 @@ class TranslatorSettingsWidget(QWidget):
         # Show existing translator status or attempt initial build.
         if backend.translator is not None:
             self._set_status(
-                f"✓ {_cfg.translator_backend.title()} 就绪"
-                f" → {_cfg.translator_target_lang}"
+                f"✓ {_cfg.translator.backend.title()} 就绪"
+                f" → {_cfg.translator.target_lang}"
             )
-        elif auto_build and _cfg.translator_backend not in ("none", ""):
+        elif auto_build and _cfg.translator.backend not in ("none", ""):
             self._build_from_config()
 
     # ------------------------------------------------------------------
@@ -240,7 +240,7 @@ class TranslatorSettingsWidget(QWidget):
 
         # Reactive config → widget sync: keep target-lang combo current when
         # another view (e.g. main window) changes the setting.
-        _cfg.translator_target_lang_changed.connect(self._sync_target_lang)
+        _cfg.translator.target_lang_changed.connect(self._sync_target_lang)
 
         # Dirty-state tracking: any field change → remind user to apply.
         self._cmb_backend.currentIndexChanged.connect(self._mark_dirty)
@@ -268,58 +268,79 @@ class TranslatorSettingsWidget(QWidget):
         return "zh-Hans-CN"
 
     def load_from_config(self) -> None:
-        """Populate all fields from :class:`AppConfig`."""
-        backend = _cfg.translator_backend
+        """Populate all fields from :class:`AppConfig`.
+
+        All backend-specific fields are always loaded from their respective
+        stored values, so the UI is ready immediately when the user switches
+        the backend combo without needing an intermediate «apply».
+        """
+        backend = _cfg.translator.backend
         for i in range(self._cmb_backend.count()):
             if self._cmb_backend.itemData(i) == backend:
                 self._cmb_backend.setCurrentIndex(i)
                 break
 
-        self.set_target_lang(_cfg.translator_target_lang or "zh-Hans-CN")
+        self.set_target_lang(_cfg.translator.target_lang or "zh-Hans-CN")
 
-        self._spn_context_window.setValue(_cfg.openai_context_window)
-        self._spn_summary_trigger.setValue(_cfg.openai_summary_trigger)
-        self._chk_tools_enabled.setChecked(_cfg.openai_tools_enabled)
-        self._chk_disable_thinking.setChecked(_cfg.openai_disable_thinking)
-
+        # Always load the API key for the currently active backend.
         if backend == "openai":
-            self._le_api_key.setText(_cfg.openai_api_key)
-            self._le_model.setText(_cfg.openai_model)
-            self._le_base_url.setText(_cfg.openai_base_url)
-            self._te_system_prompt.setPlainText(
-                _cfg.openai_system_prompt or DEFAULT_SYSTEM_PROMPT
-            )
+            self._le_api_key.setText(_cfg.translator.openai.api_key)
+        elif backend == "cloud":
+            self._le_api_key.setText(_cfg.translator.cloud.api_key)
         else:
-            self._le_api_key.setText(_cfg.cloud_api_key)
-            self._te_system_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
+            self._le_api_key.setText("")
+
+        # Always load all OpenAI-specific fields so they are ready when the
+        # user switches the backend combo to "openai".
+        self._le_model.setText(_cfg.translator.openai.model)
+        self._le_base_url.setText(_cfg.translator.openai.base_url)
+        self._te_system_prompt.setPlainText(
+            _cfg.translator.openai.system_prompt or DEFAULT_SYSTEM_PROMPT
+        )
+        self._spn_context_window.setValue(_cfg.translator.openai.context_window)
+        self._spn_summary_trigger.setValue(_cfg.translator.openai.summary_trigger)
+        self._chk_tools_enabled.setChecked(_cfg.translator.openai.tools_enabled)
+        self._chk_disable_thinking.setChecked(_cfg.translator.openai.disable_thinking)
+
         # Reset dirty flag after loading — field changes above were not user edits.
         self._dirty = False
 
     def save_to_config(self) -> None:
-        """Persist all translator settings to :class:`AppConfig` without building."""
+        """Persist all translator settings to :class:`AppConfig` without building.
+
+        All backend-specific settings are always persisted regardless of the
+        currently active backend, so switching between backends never discards
+        settings that were already filled in.
+        """
         backend = self._cmb_backend.currentData() or "none"
         api_key = self._le_api_key.text().strip()
-        _cfg.translator_backend = backend
-        _cfg.translator_target_lang = self.target_lang_value()
+        _cfg.translator.backend = backend
+        _cfg.translator.target_lang = self.target_lang_value()
+        # Always persist the API key for the active backend so that unsaved
+        # edits survive an accidental backend switch.
         if backend == "cloud":
-            _cfg.cloud_api_key = api_key
+            _cfg.translator.cloud.api_key = api_key
         elif backend == "openai":
-            _cfg.openai_api_key = api_key
-            _cfg.openai_model = self._le_model.text().strip() or "gpt-4o-mini"
-            _cfg.openai_base_url = self._le_base_url.text().strip()
-            _cfg.openai_system_prompt = (
-                self._te_system_prompt.toPlainText().strip()
-            )
-            _cfg.openai_context_window = self._spn_context_window.value()
-            _cfg.openai_summary_trigger = self._spn_summary_trigger.value()
-            _cfg.openai_tools_enabled = self._chk_tools_enabled.isChecked()
-            _cfg.openai_disable_thinking = self._chk_disable_thinking.isChecked()
+            _cfg.translator.openai.api_key = api_key
+        # Always persist all OpenAI-specific fields — they are stored under
+        # dedicated config keys and are invisible to the cloud / google_free
+        # backends, so saving them unconditionally is safe and ensures they
+        # survive a temporary switch to another backend.
+        _cfg.translator.openai.model = self._le_model.text().strip() or "gpt-4o-mini"
+        _cfg.translator.openai.base_url = self._le_base_url.text().strip()
+        _cfg.translator.openai.system_prompt = (
+            self._te_system_prompt.toPlainText().strip()
+        )
+        _cfg.translator.openai.context_window = self._spn_context_window.value()
+        _cfg.translator.openai.summary_trigger = self._spn_summary_trigger.value()
+        _cfg.translator.openai.tools_enabled = self._chk_tools_enabled.isChecked()
+        _cfg.translator.openai.disable_thinking = self._chk_disable_thinking.isChecked()
 
     def apply(self) -> None:
         """Save settings to config and rebuild the translator via AppBackend."""
         self._dirty = False
         self.save_to_config()
-        if _cfg.translator_backend == "none":
+        if _cfg.translator.backend == "none":
             self._backend.set_translator(None)
             self._set_status("翻译器已禁用。")
             self.translator_applied.emit()
@@ -356,8 +377,8 @@ class TranslatorSettingsWidget(QWidget):
 
     def _build_from_config(self) -> None:
         """Build translator from saved AppConfig and inject into AppBackend."""
-        backend_key = _cfg.translator_backend
-        target_lang = _cfg.translator_target_lang or "zh-Hans-CN"
+        backend_key = _cfg.translator.backend
+        target_lang = _cfg.translator.target_lang or "zh-Hans-CN"
         self._set_status("构建中…")
         QApplication.processEvents()
         try:
@@ -438,16 +459,31 @@ class TranslatorSettingsWidget(QWidget):
         except Exception as exc:
             self._set_status(f"⚠ {exc}")
 
+    def _save_current_api_key(self) -> None:
+        """Persist the API key currently shown in the input field.
+
+        Called before switching backends so that unsaved keystrokes are not
+        silently discarded when ``_on_backend_changed`` overwrites the field.
+        """
+        current_backend = self._cmb_backend.currentData() or "none"
+        api_key = self._le_api_key.text().strip()
+        if current_backend == "cloud":
+            _cfg.translator.cloud.api_key = api_key
+        elif current_backend == "openai":
+            _cfg.translator.openai.api_key = api_key
+
     @Slot(int)
     def _on_backend_changed(self, index: int) -> None:
+        # Persist the outgoing backend's API key before overwriting the field.
+        self._save_current_api_key()
         backend = self._cmb_backend.itemData(index) or "none"
         info = PROVIDERS_BY_KEY.get(backend)
         self._row_api_key.setVisible(bool(info and info.needs_api_key))
         self._openai_fields.setVisible(backend == "openai")
         if backend == "openai":
-            self._le_api_key.setText(_cfg.openai_api_key)
+            self._le_api_key.setText(_cfg.translator.openai.api_key)
         elif backend == "cloud":
-            self._le_api_key.setText(_cfg.cloud_api_key)
+            self._le_api_key.setText(_cfg.translator.cloud.api_key)
 
     @Slot(int)
     def _on_preset_selected(self, index: int) -> None:

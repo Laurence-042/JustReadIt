@@ -34,3 +34,8 @@ def translations_db_path() -> Path:
 def dataset_db_path() -> Path:
     """Default path for the pipeline dataset SQLite file."""
     return app_data_dir() / "pipeline_dataset.db"
+
+
+def config_path() -> Path:
+    """Path for the JSON application configuration file."""
+    return app_data_dir() / "config.json"

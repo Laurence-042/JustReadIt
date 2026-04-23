@@ -51,41 +51,41 @@ class ConfigModel(QAbstractTableModel):
         cfg = AppConfig()
 
         self._getters: dict[int, object] = {
-            self.INTERVAL_MS: lambda: cfg.interval_ms,
-            self.OCR_MAX_SIZE: lambda: cfg.ocr_max_size,
-            self.OCR_LANGUAGE: lambda: cfg.ocr_language,
-            self.FREEZE_VK: lambda: cfg.freeze_vk,
-            self.DUMP_VK: lambda: cfg.dump_vk,
-            self.MEMORY_SCAN_ENABLED: lambda: cfg.memory_scan_enabled,
+            self.INTERVAL_MS: lambda: cfg.pipeline.interval_ms,
+            self.OCR_MAX_SIZE: lambda: cfg.ocr.max_size,
+            self.OCR_LANGUAGE: lambda: cfg.ocr.language,
+            self.FREEZE_VK: lambda: cfg.overlay.freeze_vk,
+            self.DUMP_VK: lambda: cfg.overlay.dump_vk,
+            self.MEMORY_SCAN_ENABLED: lambda: cfg.pipeline.memory_scan_enabled,
         }
         self._setters: dict[int, object] = {
-            self.INTERVAL_MS: lambda v: setattr(cfg, "interval_ms", int(v)),
-            self.OCR_MAX_SIZE: lambda v: setattr(cfg, "ocr_max_size", int(v)),
-            self.OCR_LANGUAGE: lambda v: setattr(cfg, "ocr_language", str(v)),
-            self.FREEZE_VK: lambda v: setattr(cfg, "freeze_vk", int(v)),
-            self.DUMP_VK: lambda v: setattr(cfg, "dump_vk", int(v)),
+            self.INTERVAL_MS: lambda v: setattr(cfg.pipeline, "interval_ms", int(v)),
+            self.OCR_MAX_SIZE: lambda v: setattr(cfg.ocr, "max_size", int(v)),
+            self.OCR_LANGUAGE: lambda v: setattr(cfg.ocr, "language", str(v)),
+            self.FREEZE_VK: lambda v: setattr(cfg.overlay, "freeze_vk", int(v)),
+            self.DUMP_VK: lambda v: setattr(cfg.overlay, "dump_vk", int(v)),
             self.MEMORY_SCAN_ENABLED: lambda v: setattr(
-                cfg, "memory_scan_enabled", bool(v),
+                cfg.pipeline, "memory_scan_enabled", bool(v),
             ),
         }
 
         # Forward config change signals → dataChanged so mappers revert.
-        cfg.interval_ms_changed.connect(
+        cfg.pipeline.interval_ms_changed.connect(
             lambda: self._notify(self.INTERVAL_MS),
         )
-        cfg.ocr_max_size_changed.connect(
+        cfg.ocr.max_size_changed.connect(
             lambda: self._notify(self.OCR_MAX_SIZE),
         )
-        cfg.ocr_language_changed.connect(
+        cfg.ocr.language_changed.connect(
             lambda: self._notify(self.OCR_LANGUAGE),
         )
-        cfg.freeze_vk_changed.connect(
+        cfg.overlay.freeze_vk_changed.connect(
             lambda: self._notify(self.FREEZE_VK),
         )
-        cfg.dump_vk_changed.connect(
+        cfg.overlay.dump_vk_changed.connect(
             lambda: self._notify(self.DUMP_VK),
         )
-        cfg.memory_scan_enabled_changed.connect(
+        cfg.pipeline.memory_scan_enabled_changed.connect(
             lambda: self._notify(self.MEMORY_SCAN_ENABLED),
         )
 

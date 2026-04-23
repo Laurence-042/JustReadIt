@@ -1368,7 +1368,7 @@ class DebugWindow(QMainWindow):
 
         # Restore OCR language (not managed by the config-model mapper
         # because the combo has custom language-pack install logic).
-        saved_lang = _cfg.ocr_language
+        saved_lang = _cfg.ocr.language
         for i in range(self._cmb_lang.count()):
             if self._cmb_lang.itemData(i) == saved_lang:
                 self._cmb_lang.setCurrentIndex(i)
@@ -1437,7 +1437,7 @@ class DebugWindow(QMainWindow):
 
         # OCR language combo is NOT mapped (custom install logic in
         # _on_lang_changed); sync from config manually.
-        _cfg.ocr_language_changed.connect(self._sync_lang_combo)
+        _cfg.ocr.language_changed.connect(self._sync_lang_combo)
 
     # ------------------------------------------------------------------
     # Overlay toggle handlers
@@ -1518,7 +1518,7 @@ class DebugWindow(QMainWindow):
             except Exception as exc:
                 _log.warning("WinRT OCR language check failed for %r: %s", tag, exc)
 
-        _cfg.ocr_language = tag  # signal → backend restart if running
+        _cfg.ocr.language = tag  # signal → backend restart if running
         if self._backend.is_running:
             self.statusBar().showMessage(
                 f"正在以 lang={tag} 重启流水线…"
