@@ -38,12 +38,12 @@ Mouse hover / Freeze hotkey
 | Memory search | `src/memory/_search.py` | `find_all_positions()` byte search. Python fallback (`bytes.find`) + optional `mem_scan.dll` via ctypes |
 | Correction | `src/correction.py` | `best_match(ocr_text, candidates)` — Levenshtein cross-match (rapidfuzz) between OCR text and memory scan results. Returns best candidate or `None` (fall back to OCR) |
 | Cache | `src/cache.py` | Two-level caching: `PhashCache` (in-memory, OCR-text-keyed; class name kept for backward compat) → `TranslationCache` (persistent SQLite `translations.db`, keyed by `(source_text, source_lang, target_lang)`) |
-| Translation | `src/translators/` | `Translator` ABC in `base.py`. Three backends: `GoogleFreeTranslator`, `CloudTranslationTranslator`, `OpenAICompatTranslator`. Factory in `factory.py`. Error hierarchy: `TranslationError` → `AuthError`, `RateLimitError`, `NetworkError` |
+| Translation | `src/translators/` | `Translator` ABC in `base.py`. Three backends: `GoogleFreeTranslator`, `GoogleCloudTranslator`, `OpenAICompatTranslator`. Factory in `factory.py`. Error hierarchy: `TranslationError` → `AuthError`, `RateLimitError`, `NetworkError` |
 | Translator installer | `src/translators/_installer.py` | `ensure_package()` — runtime auto-install of optional translator deps. Works in both venv and PyInstaller frozen mode |
 | Knowledge base | `src/knowledge/` | `KnowledgeBase` — persistent SQLite with hybrid BM25 + vector retrieval (RRF). `OPENAI_TOOLS` + `execute_tool()` for LLM function-calling. Shared by `OpenAICompatTranslator` and MCP server |
 | MCP server | `src/mcp_server.py` | FastMCP stdio server exposing `record_term`, `record_event`, `search_terms` tools. Entry: `python -m src.mcp_server [--db PATH]` |
-| Paths | `src/paths.py` | `app_data_dir()`, `knowledge_db_path()`, `translations_db_path()` — all under `%APPDATA%\JustReadIt\`. No PySide6 dep, safe for headless imports |
-| Config | `src/config.py` | `AppConfig` — typed wrapper over `QSettings`, INI at `%APPDATA%\JustReadIt\config.ini`. 14 settings covering OCR, pipeline, translator, overlay, and hover behaviour |
+| Paths | `src/paths.py` | `app_data_dir()`, `config_path()`, `knowledge_db_path()`, `translations_db_path()` — all under `%APPDATA%\JustReadIt\`. No PySide6 dep, safe for headless imports |
+| Config | `src/config.py` | `AppConfig` singleton — JSON-backed (`%APPDATA%\JustReadIt\config.json`). Hierarchical namespace sub-objects: `cfg.ocr`, `cfg.pipeline`, `cfg.translator`, `cfg.translator.cloud`, `cfg.translator.openai`, `cfg.overlay`. Each property emits a `*_changed` signal on write. |
 | Overlay | `src/overlay.py` | `TranslationOverlay` (QWidget) — semi-transparent popup for hover mode; full-window pixmap overlay for freeze mode. Signals: `hover_requested`, `freeze_dismissed` |
 | Debug UI | `src/ui/` | PySide6 debug window + window picker. Launch: `main.py --debug` |
 
@@ -114,10 +114,10 @@ Three built-in backends:
 | Class | Backend | Extras group |
 |---|---|---|
 | `GoogleFreeTranslator` | Free unofficial Google Translate (`deep-translator`) | `translators-free` |
-| `CloudTranslationTranslator` | Google Cloud Translation API v2 | `translators-cloud` |
+| `GoogleCloudTranslator` | Google Cloud Translation API v2 (`google_cloud_translation.py`) | `translators-cloud` |
 | `OpenAICompatTranslator` | Any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, Azure) | `translators-openai` |
 
-`build_translator(config, *, progress, knowledge_base)` in `src/translators/factory.py` reads `AppConfig.translator_backend` and constructs the right subclass. Provider registry (`ProviderInfo` + `PROVIDERS` list) keeps factory, UI dropdowns, and config in sync.
+`build_translator(config, *, progress, knowledge_base)` in `src/translators/factory.py` reads `cfg.translator.backend` and constructs the right subclass. Provider registry (`ProviderInfo` + `PROVIDERS` list) keeps factory, UI dropdowns, and config in sync.
 
 ### OpenAI translator context strategy
 
@@ -184,14 +184,33 @@ Key exceptions: `ProcessNotFoundError`, `WindowNotFoundError`, `AmbiguousProcess
 
 ### Configuration
 
-`AppConfig` wraps `QSettings` (INI, `%APPDATA%\JustReadIt\config.ini`) — each setting is a `@property` with getter/setter, coercion, and default. Fresh `QSettings` handle per access via `_make_qsettings()`; `.sync()` after every write.
+`AppConfig` is a **singleton** backed by `%APPDATA%\JustReadIt\config.json`. Settings are accessed via typed namespace sub-objects; every property setter persists immediately and emits a `*_changed` signal.
 
-Key settings: `ocr_language`, `ocr_max_size` (1920 — caps image fed to OCR; halves 4K frames), `interval_ms` (1500), `settle_ms`, `memory_scan_enabled` (True), `translator_backend`, `translator_target_lang`, `cloud_api_key`, `openai_api_key`, `openai_model` (`gpt-4o-mini`), `openai_base_url`, `openai_system_prompt`, `openai_context_window` (10), `openai_summary_trigger` (20), `openai_tools_enabled` (True — disable for models that struggle with function-calling), `openai_disable_thinking` (True — prepends empty `<think></think>` prefill to suppress reasoning on local thinking models; **never enable on standard OpenAI endpoint**), `dump_vk` (`0x77` / F8), `freeze_vk` (`0x78` / F9).
+```python
+cfg = AppConfig()
+cfg.ocr.language                    # str, default "ja"
+cfg.ocr.max_size                    # int, default 1920 (caps OCR input; halves 4K frames)
+cfg.pipeline.interval_ms           # int, default 1500
+cfg.pipeline.memory_scan_enabled   # bool, default True
+cfg.translator.backend             # str, e.g. "cloud" / "google_free" / "openai" / "none"
+cfg.translator.target_lang         # str, default "en"
+cfg.translator.backends.cloud.api_key       # str (empty = use ADC)
+cfg.translator.backends.openai.api_key      # str
+cfg.translator.backends.openai.model        # str, default "gpt-4o-mini"
+cfg.translator.backends.openai.base_url     # str (empty = OpenAI default)
+cfg.translator.backends.openai.system_prompt
+cfg.translator.backends.openai.context_window   # int, default 10
+cfg.translator.backends.openai.summary_trigger  # int, default 20
+cfg.translator.backends.openai.tools_enabled    # bool, default True (disable for models that struggle with function-calling)
+cfg.translator.backends.openai.disable_thinking # bool, default True (prepends empty <think></think> prefill; **never enable on standard OpenAI endpoint**)
+cfg.overlay.dump_vk                # int, default 0x77 (F8)
+cfg.overlay.freeze_vk             # int, default 0x78 (F9)
+```
 
 ### Persistent data paths
 
 All data files live under `%APPDATA%\JustReadIt\` (`src/paths.py`):
-- `config.ini` — app settings
+- `config.json` — app settings (JSON, hierarchical)
 - `knowledge.db` — game knowledge base (terms, events, FTS5)
 - `translations.db` — translation cache
 

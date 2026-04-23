@@ -284,23 +284,23 @@ class TranslatorSettingsWidget(QWidget):
 
         # Always load the API key for the currently active backend.
         if backend == "openai":
-            self._le_api_key.setText(_cfg.translator.openai.api_key)
+            self._le_api_key.setText(_cfg.translator.backends.openai.api_key)
         elif backend == "cloud":
-            self._le_api_key.setText(_cfg.translator.cloud.api_key)
+            self._le_api_key.setText(_cfg.translator.backends.cloud.api_key)
         else:
             self._le_api_key.setText("")
 
         # Always load all OpenAI-specific fields so they are ready when the
         # user switches the backend combo to "openai".
-        self._le_model.setText(_cfg.translator.openai.model)
-        self._le_base_url.setText(_cfg.translator.openai.base_url)
+        self._le_model.setText(_cfg.translator.backends.openai.model)
+        self._le_base_url.setText(_cfg.translator.backends.openai.base_url)
         self._te_system_prompt.setPlainText(
-            _cfg.translator.openai.system_prompt or DEFAULT_SYSTEM_PROMPT
+            _cfg.translator.backends.openai.system_prompt or DEFAULT_SYSTEM_PROMPT
         )
-        self._spn_context_window.setValue(_cfg.translator.openai.context_window)
-        self._spn_summary_trigger.setValue(_cfg.translator.openai.summary_trigger)
-        self._chk_tools_enabled.setChecked(_cfg.translator.openai.tools_enabled)
-        self._chk_disable_thinking.setChecked(_cfg.translator.openai.disable_thinking)
+        self._spn_context_window.setValue(_cfg.translator.backends.openai.context_window)
+        self._spn_summary_trigger.setValue(_cfg.translator.backends.openai.summary_trigger)
+        self._chk_tools_enabled.setChecked(_cfg.translator.backends.openai.tools_enabled)
+        self._chk_disable_thinking.setChecked(_cfg.translator.backends.openai.disable_thinking)
 
         # Reset dirty flag after loading — field changes above were not user edits.
         self._dirty = False
@@ -319,22 +319,22 @@ class TranslatorSettingsWidget(QWidget):
         # Always persist the API key for the active backend so that unsaved
         # edits survive an accidental backend switch.
         if backend == "cloud":
-            _cfg.translator.cloud.api_key = api_key
+            _cfg.translator.backends.cloud.api_key = api_key
         elif backend == "openai":
-            _cfg.translator.openai.api_key = api_key
+            _cfg.translator.backends.openai.api_key = api_key
         # Always persist all OpenAI-specific fields — they are stored under
         # dedicated config keys and are invisible to the cloud / google_free
         # backends, so saving them unconditionally is safe and ensures they
         # survive a temporary switch to another backend.
-        _cfg.translator.openai.model = self._le_model.text().strip() or "gpt-4o-mini"
-        _cfg.translator.openai.base_url = self._le_base_url.text().strip()
-        _cfg.translator.openai.system_prompt = (
+        _cfg.translator.backends.openai.model = self._le_model.text().strip() or "gpt-4o-mini"
+        _cfg.translator.backends.openai.base_url = self._le_base_url.text().strip()
+        _cfg.translator.backends.openai.system_prompt = (
             self._te_system_prompt.toPlainText().strip()
         )
-        _cfg.translator.openai.context_window = self._spn_context_window.value()
-        _cfg.translator.openai.summary_trigger = self._spn_summary_trigger.value()
-        _cfg.translator.openai.tools_enabled = self._chk_tools_enabled.isChecked()
-        _cfg.translator.openai.disable_thinking = self._chk_disable_thinking.isChecked()
+        _cfg.translator.backends.openai.context_window = self._spn_context_window.value()
+        _cfg.translator.backends.openai.summary_trigger = self._spn_summary_trigger.value()
+        _cfg.translator.backends.openai.tools_enabled = self._chk_tools_enabled.isChecked()
+        _cfg.translator.backends.openai.disable_thinking = self._chk_disable_thinking.isChecked()
 
     def apply(self) -> None:
         """Save settings to config and rebuild the translator via AppBackend."""
@@ -411,8 +411,8 @@ class TranslatorSettingsWidget(QWidget):
             from src.translators.google_free import GoogleFreeTranslator  # noqa: PLC0415
             return GoogleFreeTranslator(progress=progress)
         if backend == "cloud":
-            from src.translators.cloud_translation import CloudTranslationTranslator  # noqa: PLC0415
-            return CloudTranslationTranslator(api_key=api_key or None, progress=progress)
+            from src.translators.google_cloud_translation import GoogleCloudTranslator  # noqa: PLC0415
+            return GoogleCloudTranslator(api_key=api_key or None, progress=progress)
         if backend == "openai":
             from src.translators.openai_translator import OpenAICompatTranslator  # noqa: PLC0415
             return OpenAICompatTranslator(
@@ -468,9 +468,9 @@ class TranslatorSettingsWidget(QWidget):
         current_backend = self._cmb_backend.currentData() or "none"
         api_key = self._le_api_key.text().strip()
         if current_backend == "cloud":
-            _cfg.translator.cloud.api_key = api_key
+            _cfg.translator.backends.cloud.api_key = api_key
         elif current_backend == "openai":
-            _cfg.translator.openai.api_key = api_key
+            _cfg.translator.backends.openai.api_key = api_key
 
     @Slot(int)
     def _on_backend_changed(self, index: int) -> None:
@@ -481,9 +481,9 @@ class TranslatorSettingsWidget(QWidget):
         self._row_api_key.setVisible(bool(info and info.needs_api_key))
         self._openai_fields.setVisible(backend == "openai")
         if backend == "openai":
-            self._le_api_key.setText(_cfg.translator.openai.api_key)
+            self._le_api_key.setText(_cfg.translator.backends.openai.api_key)
         elif backend == "cloud":
-            self._le_api_key.setText(_cfg.translator.cloud.api_key)
+            self._le_api_key.setText(_cfg.translator.backends.cloud.api_key)
 
     @Slot(int)
     def _on_preset_selected(self, index: int) -> None:

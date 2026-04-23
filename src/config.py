@@ -50,15 +50,15 @@ namespace sub-objects::
     cfg.ocr.language = "ja"          # persists; emits cfg.ocr.language_changed
     cfg.pipeline.interval_ms         # -> int
     cfg.translator.backend           # -> str
-    cfg.translator.openai.model      # -> str
-    cfg.translator.cloud.api_key     # -> str
+    cfg.translator.backends.openai.model      # -> str
+    cfg.translator.backends.cloud.api_key     # -> str
     cfg.overlay.freeze_vk            # -> int
 
 Signals live on the namespace objects::
 
     cfg.ocr.language_changed.connect(slot)
     cfg.translator.target_lang_changed.connect(slot)
-    cfg.translator.openai.model_changed.connect(slot)
+    cfg.translator.backends.openai.model_changed.connect(slot)
 """
 from __future__ import annotations
 
@@ -209,7 +209,7 @@ class _PipelineConfig(QObject):
 
 
 class _CloudBackendConfig(QObject):
-    """cfg.translator.cloud.*"""
+    """cfg.translator.backends.cloud.*"""
 
     api_key_changed = Signal(str)
 
@@ -229,7 +229,7 @@ class _CloudBackendConfig(QObject):
 
 
 class _OpenAIBackendConfig(QObject):
-    """cfg.translator.openai.*"""
+    """cfg.translator.backends.openai.*"""
 
     api_key_changed = Signal(str)
     model_changed = Signal(str)
@@ -327,10 +327,18 @@ class _OpenAIBackendConfig(QObject):
             self.disable_thinking_changed.emit(value)
 
 
+class _BackendsConfig:
+    """cfg.translator.backends.*  — grouping namespace (not a QObject)."""
+
+    def __init__(self, root: "_AppConfigCore") -> None:
+        self.cloud = _CloudBackendConfig(root)
+        self.openai = _OpenAIBackendConfig(root)
+
+
 class _TranslatorConfig(QObject):
     """cfg.translator.*
 
-    Sub-namespaces: ``.cloud``, ``.openai``.
+    Sub-namespaces: ``.backends.cloud``, ``.backends.openai``.
     """
 
     backend_changed = Signal(str)
@@ -339,8 +347,7 @@ class _TranslatorConfig(QObject):
     def __init__(self, root: "_AppConfigCore") -> None:
         super().__init__()
         self._r = root
-        self.cloud = _CloudBackendConfig(root)
-        self.openai = _OpenAIBackendConfig(root)
+        self.backends = _BackendsConfig(root)
 
     @property
     def backend(self) -> str:
@@ -466,8 +473,8 @@ class AppConfig(_AppConfigCore):
     ``cfg.ocr``                                  ``language``, ``max_size``
     ``cfg.pipeline``                             ``interval_ms``, ``memory_scan_enabled``
     ``cfg.translator``                           ``backend``, ``target_lang``
-    ``cfg.translator.cloud``                     ``api_key``
-    ``cfg.translator.openai``                    ``api_key``, ``model``, ``base_url``,
+    ``cfg.translator.backends.cloud``            ``api_key``
+    ``cfg.translator.backends.openai``           ``api_key``, ``model``, ``base_url``,
                                                  ``system_prompt``, ``context_window``,
                                                  ``summary_trigger``, ``tools_enabled``,
                                                  ``disable_thinking``
@@ -498,8 +505,8 @@ class AppConfig(_AppConfigCore):
 #             cfg.interval_ms           → cfg.pipeline.interval_ms
 #             cfg.translator_backend    → cfg.translator.backend
 #             cfg.translator_target_lang → cfg.translator.target_lang
-#             cfg.cloud_api_key         → cfg.translator.cloud.api_key
-#             cfg.openai_*              → cfg.translator.openai.*
+#             cfg.cloud_api_key         → cfg.translator.backends.cloud.api_key
+#             cfg.openai_*              → cfg.translator.backends.openai.*
 #             cfg.dump_vk / freeze_vk   → cfg.overlay.dump_vk / .freeze_vk
 
 

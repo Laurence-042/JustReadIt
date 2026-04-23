@@ -18,9 +18,9 @@ Authentication (pick one):
 
 Usage::
 
-    from src.translators.cloud_translation import CloudTranslationTranslator
+    from src.translators.google_cloud_translation import GoogleCloudTranslator
 
-    translator = CloudTranslationTranslator(api_key="AIza...")
+    translator = GoogleCloudTranslator(api_key="AIza...")
     result = translator.translate("おはようございます", target_lang="zh-Hans-CN")
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     from google.cloud.translate_v2 import Client as _GCTClient
 
-class CloudTranslationTranslator(Translator):
+class GoogleCloudTranslator(Translator):
     """Translation backend backed by Google Cloud Translation API (Basic / v2).
 
     Args:
