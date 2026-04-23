@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
     from google.cloud.translate_v2 import Client as _GCTClient
 
+    from src.config import AppConfig
+
 class GoogleCloudTranslator(Translator):
     """Translation backend backed by Google Cloud Translation API (Basic / v2).
 
@@ -117,3 +119,18 @@ class GoogleCloudTranslator(Translator):
 
         translated: str = result["translatedText"]
         return translated
+
+
+# ---------------------------------------------------------------------------
+# Headless factory helper (used by _panel_base.BUILDER_REGISTRY)
+# ---------------------------------------------------------------------------
+
+def build_from_config(
+    cfg: "AppConfig",
+    *,
+    progress: "Callable[[str], None] | None" = None,
+    knowledge_base: object = None,  # noqa: ARG001
+) -> GoogleCloudTranslator:
+    """Construct a :class:`GoogleCloudTranslator` from *cfg*."""
+    api_key = cfg.translator.backends.cloud.api_key.strip() or None
+    return GoogleCloudTranslator(api_key=api_key, progress=progress)

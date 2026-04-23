@@ -30,6 +30,8 @@ from src.translators.base import TranslationError, Translator
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from src.config import AppConfig
+
 # ---------------------------------------------------------------------------
 # BCP-47 → deep-translator code
 # ---------------------------------------------------------------------------
@@ -120,3 +122,17 @@ class GoogleFreeTranslator(Translator):
             ) from exc
 
         return result or text
+
+
+# ---------------------------------------------------------------------------
+# Headless factory helper (used by _panel_base.BUILDER_REGISTRY)
+# ---------------------------------------------------------------------------
+
+def build_from_config(
+    cfg: "AppConfig",
+    *,
+    progress: "Callable[[str], None] | None" = None,
+    knowledge_base: object = None,  # noqa: ARG001
+) -> GoogleFreeTranslator:
+    """Construct a :class:`GoogleFreeTranslator` from *cfg*."""
+    return GoogleFreeTranslator(progress=progress)

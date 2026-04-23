@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
-from src.translators.base import PROVIDERS_BY_KEY
+from src.translators._panel_base import build_from_config as _dispatch
 
 if TYPE_CHECKING:
     from src.config import AppConfig
@@ -33,8 +33,9 @@ def build_translator(
 ) -> "Translator | None":
     """Instantiate the configured translation backend.
 
-    Reads all settings from *config*.  Returns ``None`` when the backend is
-    set to ``"none"`` or the API key is missing for backends that require one.
+    Delegates to the headless ``build_from_config`` function registered in
+    :data:`~src.translators._panel_base.BUILDER_REGISTRY` for the active
+    backend key.  Returns ``None`` when the backend is ``"none"``.
 
     Auto-installation of the required third-party package is performed inside
     each translator's ``__init__`` via
@@ -52,37 +53,4 @@ def build_translator(
         A ready-to-use :class:`~src.translators.base.Translator`, or ``None``.
     """
     backend = config.translator.backend.lower().strip()
-
-    if backend in ("none", ""):
-        return None
-
-    if backend == "cloud":
-        from src.translators.google_cloud_translation import GoogleCloudTranslator
-
-        api_key = config.translator.backends.cloud.api_key.strip() or None
-        return GoogleCloudTranslator(api_key=api_key, progress=progress)
-
-    if backend == "google_free":
-        from src.translators.google_free import GoogleFreeTranslator
-
-        return GoogleFreeTranslator(progress=progress)
-
-    if backend == "openai":
-        from src.translators.openai_translator import OpenAICompatTranslator
-
-        return OpenAICompatTranslator(
-            api_key=config.translator.backends.openai.api_key.strip(),
-            model=config.translator.backends.openai.model.strip() or "gpt-4o-mini",
-            system_prompt=config.translator.backends.openai.system_prompt,
-            context_window=config.translator.backends.openai.context_window,
-            base_url=config.translator.backends.openai.base_url.strip() or None,
-            knowledge_base=knowledge_base,  # type: ignore[arg-type]
-            tools_enabled=config.translator.backends.openai.tools_enabled,
-            disable_thinking=config.translator.backends.openai.disable_thinking,
-            progress=progress,
-        )
-
-    valid = "'none', " + ", ".join(f"'{k}'" for k in PROVIDERS_BY_KEY)
-    raise RuntimeError(
-        f"Unknown translator backend: {backend!r}.  Valid values are: {valid}."
-    )
+    return _dispatch(backend, config, progress=progress, knowledge_base=knowledge_base)

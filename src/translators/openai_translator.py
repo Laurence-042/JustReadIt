@@ -63,6 +63,7 @@ from src.translators.base import AuthError, RateLimitError, TranslationError, Tr
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from src.config import AppConfig
     from src.knowledge.knowledge_base import KnowledgeBase
 
 # ---------------------------------------------------------------------------
@@ -527,3 +528,28 @@ class OpenAICompatTranslator(Translator):
 
 # Backward-compatible alias
 OpenAITranslator = OpenAICompatTranslator
+
+
+# ---------------------------------------------------------------------------
+# Headless factory helper (used by _panel_base.BUILDER_REGISTRY)
+# ---------------------------------------------------------------------------
+
+def build_from_config(
+    cfg: "AppConfig",
+    *,
+    progress: "Callable[[str], None] | None" = None,
+    knowledge_base: object = None,
+) -> OpenAICompatTranslator:
+    """Construct an :class:`OpenAICompatTranslator` from *cfg*."""
+    oa = cfg.translator.backends.openai
+    return OpenAICompatTranslator(
+        api_key=oa.api_key.strip(),
+        model=oa.model.strip() or "gpt-4o-mini",
+        system_prompt=oa.system_prompt,
+        context_window=oa.context_window,
+        base_url=oa.base_url.strip() or None,
+        knowledge_base=knowledge_base,  # type: ignore[arg-type]
+        tools_enabled=oa.tools_enabled,
+        disable_thinking=oa.disable_thinking,
+        progress=progress,
+    )
