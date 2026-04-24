@@ -7,7 +7,7 @@
 
 Usage::
 
-    from src.ui.dataset_dialog import DatasetDialog
+    from src.dataset.dataset_dialog import DatasetDialog
 
     ds = PipelineDataset()
     dlg = DatasetDialog(ds, parent=self)

@@ -7,7 +7,7 @@
 
 Usage::
 
-    from src.ui.knowledge_manager import KnowledgeManagerDialog
+    from src.knowledge.knowledge_manager import KnowledgeManagerDialog
 
     dlg = KnowledgeManagerDialog(knowledge_base, parent=self)
     dlg.setWindowModality(Qt.WindowModality.NonModal)

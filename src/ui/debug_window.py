@@ -72,8 +72,8 @@ from src.ocr.range_detectors import BoundingBox
 from ._config_model import ConfigModel
 from ._translator_settings import TranslatorSettingsWidget
 from .window_picker import WindowPicker
-from .knowledge_manager import KnowledgeManagerDialog
-from .dataset_dialog import DatasetDialog
+from src.knowledge.knowledge_manager import KnowledgeManagerDialog
+from src.dataset.dataset_dialog import DatasetDialog
 
 
 # ---------------------------------------------------------------------------
