@@ -135,6 +135,37 @@ class PipelineDataset:
         )
         self._conn.commit()
 
+    def update_corrected_text(
+        self,
+        sample_id: int,
+        *,
+        corrected_text: str,
+        label: str | None = None,
+        expected_correction: str | None = None,
+    ) -> None:
+        """Update corrected_text and optionally label / expected_correction.
+
+        Only the fields passed as non-None keyword arguments are written.
+        If *label* is provided, ``annotated_at`` is also refreshed.
+        """
+        parts: list[str] = ["corrected_text = ?"]
+        params: list[object] = [corrected_text]
+        if label is not None:
+            if label not in LABELS:
+                raise ValueError(f"Invalid label {label!r}; choose from {LABELS}")
+            parts.append("label = ?")
+            params.append(label)
+            parts.append("annotated_at = datetime('now')")
+        if expected_correction is not None:
+            parts.append("expected_correction = ?")
+            params.append(expected_correction)
+        params.append(sample_id)
+        self._conn.execute(
+            f"UPDATE pipeline_samples SET {', '.join(parts)} WHERE id = ?",
+            params,
+        )
+        self._conn.commit()
+
     def delete(self, sample_id: int) -> None:
         """Delete a sample by id."""
         self._conn.execute(

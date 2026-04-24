@@ -309,6 +309,17 @@ class _SampleModel(QAbstractTableModel):
                 return i
         return None
 
+    def update_row(self, new_sample: SampleRow) -> int | None:
+        """Replace the in-memory SampleRow for new_sample.id; emit dataChanged."""
+        for i, s in enumerate(self._rows):
+            if s.id == new_sample.id:
+                self._rows[i] = new_sample
+                left  = self.index(i, 0)
+                right = self.index(i, len(_HEADERS) - 1)
+                self.dataChanged.emit(left, right, [Qt.ItemDataRole.DisplayRole])
+                return i
+        return None
+
     def remove_ids(self, ids: set[int]) -> None:
         """Remove rows whose SampleRow.id is in *ids*."""
         # Walk in reverse so indices stay valid
@@ -503,6 +514,13 @@ class _DatasetDialog(QDialog):
         )
         btn_export_test.clicked.connect(self._on_export_correction_samples)
         btn_row.addWidget(btn_export_test)
+        btn_recalc = QPushButton("♻️ 重新计算纠错")
+        btn_recalc.setToolTip(
+            "对数据集中所有样本重新执行 best_match，\n"
+            "并根据结果自动更新标注。"
+        )
+        btn_recalc.clicked.connect(self._on_recalculate_corrections)
+        btn_row.addWidget(btn_recalc)
         btn_row.addStretch()
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
@@ -688,6 +706,104 @@ class _DatasetDialog(QDialog):
             self._ds.delete(sid)
         self._model.remove_ids(ids)
         self._clear_annotation_panel()
+
+    @Slot()
+    def _on_recalculate_corrections(self) -> None:
+        """Recompute best_match for every sample and apply smart label updates.
+
+        Rules
+        -----
+        * **未标注** (unlabeled) → 直接更新 corrected_text。
+        * **标注没问题**（ok / 其他非 bad_correction）且结果发变
+          → label = ``bad_correction``，expected_correction = 旧 corrected_text。
+        * **bad_correction** 且新结果 == expected_correction
+          → label = ``ok``，清除 expected_correction。
+        * **bad_correction** 且新结果 ≠ expected_correction
+          → 仅更新 corrected_text，保留 expected。
+        """
+        import dataclasses  # noqa: PLC0415
+        from src.correction import best_match  # noqa: PLC0415
+
+        all_samples = self._ds.list_samples(limit=100_000)
+        if not all_samples:
+            QMessageBox.information(self, "重新计算纠错", "没有样本。")
+            return
+
+        reply = QMessageBox.question(
+            self, "重新计算纠错",
+            f"将对全部 {len(all_samples)} 条样本重新执行 best_match，"
+            f"并自动更新标注。\n小心：此操作不可彤销。\n是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        stats = {"updated": 0, "newly_bad": 0, "recovered": 0, "unchanged": 0}
+
+        for s in all_samples:
+            new_corr = best_match(s.ocr_text, s.memory_hits, s.needle) or s.ocr_text
+
+            if s.label == "unlabeled":
+                if new_corr == s.corrected_text:
+                    stats["unchanged"] += 1
+                    continue
+                self._ds.update_corrected_text(s.id, corrected_text=new_corr)
+                updated = dataclasses.replace(s, corrected_text=new_corr)
+                self._model.update_row(updated)
+                stats["updated"] += 1
+
+            elif s.label == "bad_correction":
+                if new_corr == s.expected_correction:
+                    # Fixed: promote to ok
+                    self._ds.update_corrected_text(
+                        s.id, corrected_text=new_corr,
+                        label="ok", expected_correction="",
+                    )
+                    updated = dataclasses.replace(
+                        s, corrected_text=new_corr, label="ok", expected_correction=""
+                    )
+                    self._model.update_row(updated)
+                    self._model.update_label(s.id, "ok")
+                    stats["recovered"] += 1
+                else:
+                    if new_corr == s.corrected_text:
+                        stats["unchanged"] += 1
+                        continue
+                    # Still wrong — only update corrected_text
+                    self._ds.update_corrected_text(s.id, corrected_text=new_corr)
+                    updated = dataclasses.replace(s, corrected_text=new_corr)
+                    self._model.update_row(updated)
+                    stats["updated"] += 1
+
+            else:  # ok / bad_range / bad_memory / other
+                if new_corr == s.corrected_text:
+                    stats["unchanged"] += 1
+                    continue
+                # Previously looked fine, now result changed — flag it
+                self._ds.update_corrected_text(
+                    s.id, corrected_text=new_corr,
+                    label="bad_correction",
+                    expected_correction=s.corrected_text,
+                )
+                updated = dataclasses.replace(
+                    s, corrected_text=new_corr,
+                    label="bad_correction",
+                    expected_correction=s.corrected_text,
+                )
+                self._model.update_row(updated)
+                stats["newly_bad"] += 1
+
+        # Reload panels in case the current selected row changed
+        self._clear_annotation_panel()
+
+        QMessageBox.information(
+            self, "重新计算完成",
+            f"共处理 {len(all_samples)} 条样本：\n"
+            f"  · 直接更新：{stats['updated']}\n"
+            f"  · 新增「纠错错误」：{stats['newly_bad']}\n"
+            f"  · 自动恢复为「正确」：{stats['recovered']}\n"
+            f"  · 无变化：{stats['unchanged']}",
+        )
 
     @Slot()
     def _on_export_csv(self) -> None:
