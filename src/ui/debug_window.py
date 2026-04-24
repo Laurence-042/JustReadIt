@@ -551,11 +551,20 @@ class DebugWindow(QMainWindow):
         act_dataset.setToolTip("浏览、标注和删除流水线数据集样本。")
         act_dataset.triggered.connect(self._on_open_dataset)
 
+        act_open_dir = QAction("📂 打开数据目录", self)
+        act_open_dir.setToolTip(
+            "在资源管理器中打开 %APPDATA%\\JustReadIt\\。\n"
+            "可在此备份/替换 config.json、knowledge.db、translations.db 等文件。"
+        )
+        act_open_dir.triggered.connect(self._on_open_data_dir)
+
         _tools_menu = QMenu(self)
         _tools_menu.addAction(self._act_clear_cache)
         _tools_menu.addSeparator()
         _tools_menu.addAction(act_knowledge)
         _tools_menu.addAction(act_dataset)
+        _tools_menu.addSeparator()
+        _tools_menu.addAction(act_open_dir)
 
         self._btn_tools = QToolButton()
         self._btn_tools.setText("工具")
@@ -1089,6 +1098,14 @@ class DebugWindow(QMainWindow):
         dlg.setWindowModality(Qt.WindowModality.NonModal)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.show()
+
+    @Slot()
+    def _on_open_data_dir(self) -> None:
+        """Open the JustReadIt AppData directory in Windows Explorer."""
+        import os  # noqa: PLC0415
+        from src.paths import app_data_dir  # noqa: PLC0415
+
+        os.startfile(app_data_dir())
 
     # ------------------------------------------------------------------
     # Clean shutdown
