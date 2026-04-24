@@ -65,7 +65,7 @@ class Panel(QWidget):
         progress: "Callable[[str], None] | None" = None,
         knowledge_base: object = None,  # noqa: ARG002
     ) -> "Translator":
-        from src.translators.google_cloud_translation import GoogleCloudTranslator  # noqa: PLC0415
+        from src.translators.cloud.translator import GoogleCloudTranslator  # noqa: PLC0415
         api_key = self._le_api_key.text().strip() or None
         return GoogleCloudTranslator(api_key=api_key, progress=progress)
 

@@ -9,7 +9,7 @@ construction.  Satisfies the panel contract defined in
 :mod:`src.translators._panel_base`.
 
 The :data:`OPENAI_PRESETS` list and :data:`DEFAULT_SYSTEM_PROMPT` constant are
-imported directly from :mod:`src.translators.openai_translator` so that both
+imported directly from :mod:`src.translators.openai.translator` so that both
 the UI and the translator share a single source of truth.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.translators.openai_translator import DEFAULT_SYSTEM_PROMPT, OPENAI_PRESETS
+from src.translators.openai.translator import DEFAULT_SYSTEM_PROMPT, OPENAI_PRESETS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -182,7 +182,7 @@ class Panel(QWidget):
         progress: "Callable[[str], None] | None" = None,
         knowledge_base: object = None,
     ) -> "Translator":
-        from src.translators.openai_translator import OpenAICompatTranslator  # noqa: PLC0415
+        from src.translators.openai.translator import OpenAICompatTranslator  # noqa: PLC0415
         return OpenAICompatTranslator(
             api_key=self._le_api_key.text().strip(),
             model=self._le_model.text().strip() or "gpt-4o-mini",

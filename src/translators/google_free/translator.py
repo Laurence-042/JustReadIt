@@ -3,7 +3,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Free (no-API-key) Google Translate backend via ``deep-translator``.
 
-Uses the same unofficial endpoint as the Google Translate web page \u2014 no
+Uses the same unofficial endpoint as the Google Translate web page — no
 billing account or API key required.  Suitable for testing and light personal
 use; not recommended for production throughput.
 

@@ -18,7 +18,7 @@ Authentication (pick one):
 
 Usage::
 
-    from src.translators.google_cloud_translation import GoogleCloudTranslator
+    from src.translators.cloud import GoogleCloudTranslator
 
     translator = GoogleCloudTranslator(api_key="AIza...")
     result = translator.translate("おはようございます", target_lang="zh-Hans-CN")
@@ -65,13 +65,27 @@ class GoogleCloudTranslator(Translator):
                 "Run: pip install google-cloud-translate"
             ) from exc
 
-        if api_key:
-            # client_options={"api_key": ...} still triggers google.auth.default()
-            # internally.  Use google.auth.api_key.Credentials to bypass ADC entirely.
-            from google.auth.api_key import Credentials as _ApiKeyCreds  # type: ignore[import-untyped]
-            self._client: _GCTClient = _gct.Client(credentials=_ApiKeyCreds(api_key))
-        else:
-            self._client = _gct.Client()  # ADC / service account
+        try:
+            if api_key:
+                # client_options={"api_key": ...} still triggers google.auth.default()
+                # internally.  Use google.auth.api_key.Credentials to bypass ADC entirely.
+                from google.auth.api_key import Credentials as _ApiKeyCreds  # type: ignore[import-untyped]
+                self._client: _GCTClient = _gct.Client(credentials=_ApiKeyCreds(api_key))
+            else:
+                self._client = _gct.Client()  # ADC / service account
+        except Exception as exc:
+            msg = str(exc)
+            if "DefaultCredentialsError" in type(exc).__name__ or "default credentials" in msg.lower():
+                raise AuthError(
+                    "Cloud Translation API auth failed: no Google ADC found. "
+                    "Set GOOGLE_APPLICATION_CREDENTIALS to a service-account JSON file, "
+                    "or fill in the Cloud API key in Settings → Translator."
+                ) from exc
+            if "403" in msg or "credentials" in msg.lower() or "API key" in msg:
+                raise AuthError(f"Cloud Translation API auth failed: {exc}") from exc
+            raise TranslationError(
+                f"Cloud Translation API client init failed: {exc}"
+            ) from exc
 
     # ── Translator ────────────────────────────────────────────────────
 

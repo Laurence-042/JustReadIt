@@ -59,9 +59,9 @@ if TYPE_CHECKING:
 #: Maps each provider key to the dotted module that exports a ``Panel`` class.
 #: Add an entry here when adding a new translator backend.
 PANEL_REGISTRY: dict[str, str] = {
-    "google_free": "src.translators.google_free_panel",
-    "cloud": "src.translators.cloud_panel",
-    "openai": "src.translators.openai_panel",
+    "google_free": "src.translators.google_free.panel",
+    "cloud": "src.translators.cloud.panel",
+    "openai": "src.translators.openai.panel",
 }
 
 #: Maps each provider key to the dotted module that exports a
@@ -69,8 +69,8 @@ PANEL_REGISTRY: dict[str, str] = {
 #: This registry is PySide6-free and safe to import in headless contexts.
 BUILDER_REGISTRY: dict[str, str] = {
     "google_free": "src.translators.google_free",
-    "cloud": "src.translators.google_cloud_translation",
-    "openai": "src.translators.openai_translator",
+    "cloud": "src.translators.cloud",
+    "openai": "src.translators.openai",
 }
 
 

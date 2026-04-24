@@ -40,7 +40,7 @@ Requirements::
 
 Usage::
 
-    from src.translators.openai_translator import OpenAICompatTranslator
+    from src.translators.openai import OpenAICompatTranslator
     from src.knowledge import KnowledgeBase
 
     kb = KnowledgeBase.open("alcia.db")
@@ -77,7 +77,7 @@ DEFAULT_SYSTEM_PROMPT: str = (
     "- Output ONLY the translated text, with no commentary, notes, or explanations.\n"
     "- Preserve all punctuation, line breaks, and formatting from the source text.\n"
     "- Translate character names phonetically unless a localised name is known.\n"
-    "- Keep honorifics (san, kun, chan\u2026) as-is if no natural equivalent exists.\n"
+    "- Keep honorifics (san, kun, chan…) as-is if no natural equivalent exists.\n"
     "- Before translating a name or term, call search_terms to check if it was "
     "already recorded.\n"
     "- When you translate a new character name or game-specific term, call "

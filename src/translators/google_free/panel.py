@@ -43,7 +43,7 @@ class Panel(QWidget):
         progress: "Callable[[str], None] | None" = None,
         knowledge_base: object = None,  # noqa: ARG002
     ) -> "Translator":
-        from src.translators.google_free import GoogleFreeTranslator  # noqa: PLC0415
+        from src.translators.google_free.translator import GoogleFreeTranslator  # noqa: PLC0415
         return GoogleFreeTranslator(progress=progress)
 
     def connect_dirty(self, slot: "Callable[[], None]") -> None:  # noqa: ARG002

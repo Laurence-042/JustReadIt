@@ -5,9 +5,9 @@
 
 Available backends
 ------------------
-* :class:`~src.translators.google_cloud_translation.GoogleCloudTranslator`
+* :class:`~src.translators.cloud.GoogleCloudTranslator`
   — Google Cloud Translation API v2 (short text, low cost).
-* :class:`~src.translators.openai_translator.OpenAICompatTranslator`
+* :class:`~src.translators.openai.OpenAICompatTranslator`
   — Any OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter,
   Ollama, Azure OpenAI, …) with rolling summary context agent.
 
@@ -19,9 +19,9 @@ from __future__ import annotations
 
 from src.translators.base import Translator
 from src.translators.factory import build_translator
-from src.translators.google_cloud_translation import GoogleCloudTranslator
+from src.translators.cloud import GoogleCloudTranslator
 from src.translators.google_free import GoogleFreeTranslator
-from src.translators.openai_translator import OpenAICompatTranslator, OpenAITranslator
+from src.translators.openai import OpenAICompatTranslator, OpenAITranslator
 
 __all__ = [
     "Translator",

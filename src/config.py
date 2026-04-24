@@ -84,7 +84,7 @@ _DEFAULTS: dict[str, Any] = {
         "memory_scan_enabled": True,
     },
     "translator": {
-        "backend": "cloud",
+        "backend": "google_free",
         "target_lang": "en",
         "backends": {
             "google_free": {},
