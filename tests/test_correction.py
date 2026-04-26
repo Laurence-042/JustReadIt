@@ -171,6 +171,19 @@ def test_find_needle_pos(
     ("強化の丸薬", 0, 0),
     # Symbol sequence before text.
     ("？！強化", 2, 0),
+    # ── Newline-bridging (rule: quotes outrank newlines) ──────────────
+    # Opening quote sits 4 chars left of the \n → bridge across it.
+    # "(0)黙(1)れ(2)。(3)\n(4)強(5)い(6)
+    ('"黙れ。\n強い', 5, 0),
+    # 「 within bridge window → bridge and include the opener.
+    ("「やあ\nテスト", 4, 0),
+    # No opener within bridge window → still stops at \n (unchanged).
+    ("テスト\n強化", 4, 4),
+    # ~ command line in the lookahead window → refuse bridge, stop at \n.
+    # "(0)黙(1)れ(2)\n(3)~(4)c(5)m(6)d(7)\n(8)強(9)
+    ('"黙れ\n~cmd\n強', 9, 9),
+    # Second \n in lookahead window → refuse bridge.
+    ('"黙\nれ\n強', 6, 6),
 ])
 def test_refine_left_boundary(text: str, rough_left: int, expected: int) -> None:
     assert _refine_left_boundary(text, rough_left) == expected
@@ -199,6 +212,18 @@ def test_refine_left_boundary(text: str, rough_left: int, expected: int) -> None
     ("強化！！\\w", 2, 6),
     # Already at end → no movement.
     ("強化", 2, 2),
+    # ── Newline-bridging (rule: quotes outrank newlines) ──────────────
+    # Closing quote sits 4 chars right of the \n → bridge.
+    # 強(0)い(1)\n(2)だ(3)ろ(4)。(5)"(6)
+    ('強い\nだろ。"', 2, 7),
+    # 」 in window → bridge and include.
+    ("テス\nだろ」", 2, 6),
+    # No closer in window → still stops at \n.
+    ("強化\nABC", 2, 2),
+    # ~ command line in window → refuse bridge.
+    ('強\n~cmd\n"', 1, 1),
+    # Second \n in window → refuse bridge.
+    ('強\nだ\nろ"', 1, 1),
 ])
 def test_refine_right_boundary(text: str, rough_right: int, expected: int) -> None:
     assert _refine_right_boundary(text, rough_right) == expected
