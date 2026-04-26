@@ -173,6 +173,7 @@ class DatasetDialog(QDialog):
         super().__init__(parent)
         self._ds = dataset
         self._current_id: int | None = None
+        self._loading_panel = False
         self.setWindowTitle("📊 流水线数据集")
         self.setMinimumSize(1100, 620)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
@@ -279,6 +280,7 @@ class DatasetDialog(QDialog):
         self._le_expected = QTextEdit()
         self._le_expected.setPlaceholderText("正确的纠错结果")
         self._le_expected.setFixedHeight(60)
+        self._le_expected.textChanged.connect(self._on_expected_text_changed)
         ann_lay.addWidget(self._le_expected)
 
         ann_lay.addWidget(QLabel("备注:"))
@@ -288,11 +290,8 @@ class DatasetDialog(QDialog):
         ann_lay.addWidget(self._te_notes)
 
         save_row = QHBoxLayout()
-        self._btn_save_ann = QPushButton("💾 保存标注  [Enter]")
-        self._btn_save_ann.setEnabled(False)
-        self._btn_save_ann.clicked.connect(self._on_save_annotation)
-        save_row.addWidget(self._btn_save_ann)
-        self._btn_save_next = QPushButton("💾→ 保存并跳下一条  [Shift+Enter]")
+        self._btn_save_next = QPushButton("💾→ 保存并跳下一条  [Enter/Space]")
+        self._btn_save_next.setToolTip("保存当前标注并跳到下一条未标注样本；若标签为“未标注”则自动视为“✓ 正确”")
         self._btn_save_next.setEnabled(False)
         self._btn_save_next.clicked.connect(self._on_save_and_next)
         save_row.addWidget(self._btn_save_next)
@@ -334,10 +333,8 @@ class DatasetDialog(QDialog):
         root.addLayout(btn_row)
 
         # ── Keyboard shortcuts ────────────────────────────────────────────
-        QShortcut(QKeySequence(Qt.Key.Key_Return), self).activated.connect(self._on_save_annotation)
-        QShortcut(
-            QKeySequence(Qt.KeyboardModifier.ShiftModifier | Qt.Key.Key_Return), self
-        ).activated.connect(self._on_save_and_next)
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self).activated.connect(self._on_save_and_next)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self).activated.connect(self._on_save_and_next)
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self).activated.connect(self._on_delete_sample)
         for _i, _lbl in enumerate(LABELS, start=1):
             def _make_label_slot(l: str):
@@ -374,6 +371,7 @@ class DatasetDialog(QDialog):
         return self._model.sample_at(src_idx.row())
 
     def _clear_annotation_panel(self) -> None:
+        self._loading_panel = True
         self._current_id = None
         self._te_ocr.clear()
         self._te_hits.clear()
@@ -381,11 +379,12 @@ class DatasetDialog(QDialog):
         self._te_tl.clear()
         self._le_expected.clear()
         self._te_notes.clear()
-        self._btn_save_ann.setEnabled(False)
         self._btn_save_next.setEnabled(False)
         self._btn_del_sample.setEnabled(False)
+        self._loading_panel = False
 
     def _load_annotation_panel(self, sample: SampleRow) -> None:
+        self._loading_panel = True
         self._current_id = sample.id
         self._te_ocr.setPlainText(sample.ocr_text)
         self._te_hits.setPlainText("\n".join(sample.memory_hits))
@@ -397,9 +396,9 @@ class DatasetDialog(QDialog):
                 break
         self._le_expected.setPlainText(sample.expected_correction)
         self._te_notes.setPlainText(sample.notes)
-        self._btn_save_ann.setEnabled(True)
         self._btn_save_next.setEnabled(True)
         self._btn_del_sample.setEnabled(True)
+        self._loading_panel = False
 
     def _find_next_unlabeled_proxy_row(self, from_proxy_row: int) -> int:
         n = self._proxy.rowCount()
@@ -446,33 +445,49 @@ class DatasetDialog(QDialog):
             self._clear_annotation_panel()
 
     @Slot()
-    def _on_save_annotation(self) -> None:
-        if self._current_id is None:
+    def _on_expected_text_changed(self) -> None:
+        """当正确纠错字段有内容时，自动将标签切换为“✗ 纠错错误”。"""
+        if self._loading_panel or self._current_id is None:
             return
-        new_label = self._cmb_label.currentData()
-        self._ds.annotate(
-            self._current_id,
-            label=new_label,
-            expected_correction=self._le_expected.toPlainText().strip(),
-            notes=self._te_notes.toPlainText().strip(),
-        )
-        # Update model in-place — one dataChanged signal, no reload
-        self._model.update_label(self._current_id, new_label)
+        if self._le_expected.toPlainText().strip():
+            for i in range(self._cmb_label.count()):
+                if self._cmb_label.itemData(i) == "bad_correction":
+                    self._cmb_label.setCurrentIndex(i)
+                    break
 
     @Slot()
     def _on_save_and_next(self) -> None:
         if self._current_id is None:
             return
         new_label = self._cmb_label.currentData()
+        # 当标签为“未标注”时，自动视为“正确”
+        if new_label == "unlabeled":
+            new_label = "ok"
+            for _i in range(self._cmb_label.count()):
+                if self._cmb_label.itemData(_i) == "ok":
+                    self._cmb_label.setCurrentIndex(_i)
+                    break
+        expected = self._le_expected.toPlainText().strip()
+        notes    = self._te_notes.toPlainText().strip()
         self._ds.annotate(
             self._current_id,
             label=new_label,
-            expected_correction=self._le_expected.toPlainText().strip(),
-            notes=self._te_notes.toPlainText().strip(),
+            expected_correction=expected,
+            notes=notes,
         )
         cur_proxy_rows = self._selected_proxy_rows()
         cur_proxy_row = cur_proxy_rows[0] if cur_proxy_rows else 0
-        self._model.update_label(self._current_id, new_label)
+        # Update in-memory model fully so re-selecting the row shows saved values
+        import dataclasses  # noqa: PLC0415
+        src_idx = self._proxy.mapToSource(self._proxy.index(cur_proxy_row, 0))
+        old = self._model.sample_at(src_idx.row())
+        if old is not None:
+            self._model.update_row(dataclasses.replace(
+                old,
+                label=new_label,
+                expected_correction=expected,
+                notes=notes,
+            ))
         # Proxy may have hidden this row if filter no longer matches — clamp
         effective = min(cur_proxy_row, self._proxy.rowCount() - 1)
         next_row = self._find_next_unlabeled_proxy_row(effective)
@@ -503,10 +518,13 @@ class DatasetDialog(QDialog):
         if not ids:
             return
         label = f"确定删除选中的 {len(ids)} 条样本？" if len(ids) > 1 else f"确定删除样本 #{next(iter(ids))}？"
-        if QMessageBox.question(
-            self, "删除样本", label,
+        mb = QMessageBox(
+            QMessageBox.Icon.Question, "删除样本", label,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
+            self,
+        )
+        mb.setDefaultButton(QMessageBox.StandardButton.No)
+        if mb.exec() != QMessageBox.StandardButton.Yes:
             return
         for sid in ids:
             self._ds.delete(sid)

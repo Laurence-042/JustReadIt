@@ -760,6 +760,25 @@ class HoverController(QObject):
                 corrected_text = region_text
         scan_step = StepResult(mem_text, scan_ms)
         corr_step = StepResult(corrected_text, corr_ms)
+
+        # ── Phash cache lookup by corrected text ─────────────────────────────
+        # If OCR text differs from corrected text, check whether a previous
+        # pipeline run already stored a result for the corrected text.
+        if corrected_text != region_text:
+            cached = self._phash_cache.get(corrected_text)
+            if cached is not None:
+                self._emit_debug(
+                    img, t0,
+                    ocr_step, range_step,
+                    scan_step, corr_step,
+                    StepResult(f"[cache hit (corrected)\n{cached.translation}]"),
+                )
+                wr = self._target.window_rect
+                self.translation_ready.emit(
+                    cached.translation, near_rect, (wr.left, wr.top),
+                )
+                return
+
         # ── Text cache (persistent) ──────────────────────────────────────────────────────────
         translation = ""
         if self._text_cache is not None:
@@ -796,6 +815,13 @@ class HoverController(QObject):
                 mem_text=mem_text, corrected_text=corrected_text,
             )
             self._last_region_text = region_text
+            # Also index by corrected text so a later OCR hit that resolves
+            # to the same corrected text can skip the translation step.
+            if corrected_text and corrected_text != region_text:
+                self._phash_cache.put(
+                    corrected_text, translation,
+                    mem_text=mem_text, corrected_text=corrected_text,
+                )
         # ── Emit results ─────────────────────────────────────────────
         self._emit_debug(
             img, t0,
