@@ -57,7 +57,61 @@ _MIN_TEXT_LENGTH: int = 2
 # Strings longer than this are refined to nearby lines.
 # VN engines load entire script files as one null-terminated block;
 # line-level refinement isolates the dialog paragraph for Levenshtein matching.
-_LINE_REFINE_THRESHOLD: int = 300
+#
+# Now serves as a *fallback* path: the multi-boundary extraction in
+# ``_extract_utf16le`` / ``_extract_byte_delimited`` already trims most blocks
+# at ``\n`` / closing-quote / opening-quote boundaries, keeping extracted
+# text well under this threshold.  ``_refine_to_lines`` only triggers for
+# unusually large blocks the byte-level scan failed to cut.
+_LINE_REFINE_THRESHOLD: int = 600
+
+# Per-side threshold used by the multi-boundary extraction.  When the
+# strong (\0) boundary is more than this many *characters* away from the
+# match position, soft boundaries (\n, quotes) are preferred.
+#
+# 200 chars ≈ a long-ish dialog paragraph.  Anything bigger is almost
+# certainly a script blob that pulled in adjacent unrelated lines.
+_SOFT_BOUNDARY_THRESHOLD_CHARS: int = 200
+
+# Right-side soft boundaries: closing quotes, brackets and the newline.
+# Encountering any of these to the right of the match site marks the
+# end of the current logical text unit.  They are *excluded* from the
+# extracted text (consistent with the existing ``\x00`` semantics).
+_RIGHT_SOFT_BOUNDARY_CODEPOINTS: tuple[str, ...] = (
+    "\n",
+    "」",  # JP closing kagi-kakko
+    "』",  # JP closing double kagi-kakko
+    "”",  # right double quotation mark (U+201D)
+    "’",  # right single quotation mark (U+2019)
+    "）",  # fullwidth right paren
+    "】",  # right tortoise shell bracket
+    '"',
+    "'",
+)
+
+# Left-side strong boundaries: opening quotes / brackets.  When found
+# to the left of the match site (and the slice between is "clean"
+# according to ``_is_noisy_line``) they take precedence over the weaker
+# ``\n`` fallback.
+_LEFT_STRONG_BOUNDARY_CODEPOINTS: tuple[str, ...] = (
+    "「",
+    "『",
+    "“",
+    "‘",
+    "（",
+    "【",
+    '"',
+    "'",
+)
+
+# Newline codepoint used as a left-side fallback boundary when no
+# opening quote is found within the threshold window.
+_LEFT_NEWLINE_CODEPOINTS: tuple[str, ...] = ("\n",)
+
+# Cache of encoded boundary byte-patterns, keyed by (codepoint_tuple, encoding).
+# Built lazily on first use.  Codepoints that fail to encode for the
+# active encoding are silently skipped.
+_BOUNDARY_PATTERN_CACHE: dict[tuple[tuple[str, ...], str], list[bytes]] = {}
 
 # How long (seconds) to reuse a cached region list before re-enumerating.
 _REGIONS_CACHE_TTL_S: float = 5.0
@@ -188,6 +242,196 @@ def pick_needles(
 # String extraction helpers
 # ---------------------------------------------------------------------------
 
+def _get_boundary_patterns(
+    codepoints: tuple[str, ...],
+    encoding: str,
+) -> list[bytes]:
+    """Return the byte-pattern list for *codepoints* under *encoding*.
+
+    Cached per ``(codepoints, encoding)``.  Codepoints that are not
+    representable in the encoding (e.g. fullwidth quotes in plain
+    ASCII) are silently skipped — they simply won't participate in
+    boundary matching for that encoding.
+    """
+    key = (codepoints, encoding)
+    cached = _BOUNDARY_PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    codec = "cp932" if encoding == "shift-jis" else encoding
+    patterns: list[bytes] = []
+    for cp in codepoints:
+        try:
+            patterns.append(cp.encode(codec))
+        except (UnicodeEncodeError, LookupError):
+            continue
+    _BOUNDARY_PATTERN_CACHE[key] = patterns
+    return patterns
+
+
+def _find_aligned_right_boundary(
+    data: bytes,
+    start: int,
+    end: int,
+    patterns: list[bytes],
+    alignment: int,
+) -> int | None:
+    """Return offset of the earliest aligned pattern hit in ``[start, end)``.
+
+    For UTF-16LE the *alignment* is 2 (each codepoint occupies 2 bytes),
+    so a matching byte sequence at an odd offset is rejected.  For
+    byte-encodings *alignment* is 1.
+    """
+    best: int | None = None
+    for pat in patterns:
+        if not pat:
+            continue
+        pos = start
+        while pos < end:
+            idx = data.find(pat, pos, end)
+            if idx < 0:
+                break
+            if alignment == 1 or (idx - start) % alignment == 0:
+                if best is None or idx < best:
+                    best = idx
+                break
+            pos = idx + 1
+    return best
+
+
+def _find_aligned_left_boundary(
+    data: bytes,
+    start: int,
+    end: int,
+    patterns: list[bytes],
+    alignment: int,
+) -> tuple[int, int] | None:
+    """Return ``(offset, pattern_length)`` of the latest aligned pattern hit.
+
+    Returns the rightmost (i.e. closest to ``end``) aligned hit across
+    all *patterns*, or ``None`` if no pattern matches in ``[start, end)``.
+    """
+    best: tuple[int, int] | None = None
+    for pat in patterns:
+        if not pat:
+            continue
+        pos = end
+        while pos > start:
+            idx = data.rfind(pat, start, pos)
+            if idx < 0:
+                break
+            if alignment == 1 or (idx - start) % alignment == 0:
+                if best is None or idx > best[0]:
+                    best = (idx, len(pat))
+                break
+            pos = idx
+    return best
+
+
+def _byte_threshold(encoding: str) -> int:
+    """Return the soft-boundary distance threshold in *bytes* for *encoding*.
+
+    The threshold is conceptually a character count but is converted to
+    bytes here because all boundary scanning operates on raw bytes.
+    UTF-16LE uses 2 bytes/char.  UTF-8 / Shift-JIS are bounded above by
+    3 bytes/char (CJK worst case for UTF-8); using this conservative
+    upper bound means we engage the soft-boundary path slightly earlier
+    for byte encodings, which is harmless.
+    """
+    if encoding == "utf-16-le":
+        return _SOFT_BOUNDARY_THRESHOLD_CHARS * 2
+    return _SOFT_BOUNDARY_THRESHOLD_CHARS * 3
+
+
+def _refine_extract_window(
+    data: bytes,
+    start_null: int,
+    end_null: int,
+    match_pos: int,
+    encoding: str,
+    alignment: int,
+) -> tuple[int, int]:
+    """Refine ``[start_null, end_null]`` using soft/strong boundaries.
+
+    Implements the multi-boundary candidate strategy:
+
+    * Right side — when the ``\\0`` boundary is far away, prefer the
+      nearest of ``\\n`` / closing quote / closing bracket.
+    * Left side — when the ``\\0`` boundary is far away, prefer an
+      opening quote (only if the gap to ``match_pos`` is "clean") and
+      otherwise the nearest preceding ``\\n``.
+
+    See module docstring constants ``_RIGHT_SOFT_BOUNDARY_CODEPOINTS``
+    and ``_LEFT_STRONG_BOUNDARY_CODEPOINTS`` for the codepoint sets.
+    """
+    threshold_bytes = _byte_threshold(encoding)
+    codec = "cp932" if encoding == "shift-jis" else encoding
+
+    # ----- Right boundary -----------------------------------------------
+    end = end_null
+    if end_null - match_pos > threshold_bytes:
+        right_patterns = _get_boundary_patterns(
+            _RIGHT_SOFT_BOUNDARY_CODEPOINTS, encoding,
+        )
+        end_soft = _find_aligned_right_boundary(
+            data, match_pos, end_null, right_patterns, alignment,
+        )
+        if end_soft is not None:
+            end = min(end_null, end_soft)
+
+    # ----- Left boundary ------------------------------------------------
+    start = start_null
+    if match_pos - start_null > threshold_bytes:
+        lower_bound = max(start_null, match_pos - threshold_bytes)
+        # Re-align lower_bound to the same parity as match_pos for UTF-16LE
+        # so that aligned-search ``(idx - start) % alignment == 0`` checks
+        # produce results aligned with codepoint boundaries.
+        if alignment > 1:
+            offset = (match_pos - lower_bound) % alignment
+            if offset != 0:
+                lower_bound += offset
+
+        chosen: int | None = None
+
+        # Strong open-quote candidate.
+        quote_patterns = _get_boundary_patterns(
+            _LEFT_STRONG_BOUNDARY_CODEPOINTS, encoding,
+        )
+        q = _find_aligned_left_boundary(
+            data, lower_bound, match_pos, quote_patterns, alignment,
+        )
+        if q is not None:
+            q_pos, q_len = q
+            candidate_start = q_pos + q_len
+            try:
+                candidate_text = data[candidate_start:match_pos].decode(codec)
+            except (UnicodeDecodeError, ValueError):
+                candidate_text = None
+            if candidate_text is not None and not _is_noisy_line(candidate_text):
+                chosen = candidate_start
+
+        # Weak newline fallback.
+        if chosen is None:
+            newline_patterns = _get_boundary_patterns(
+                _LEFT_NEWLINE_CODEPOINTS, encoding,
+            )
+            n = _find_aligned_left_boundary(
+                data, lower_bound, match_pos, newline_patterns, alignment,
+            )
+            if n is not None:
+                n_pos, n_len = n
+                chosen = n_pos + n_len
+
+        if chosen is not None:
+            start = chosen
+
+    return start, end
+
+
+# ---------------------------------------------------------------------------
+# String extraction helpers
+# ---------------------------------------------------------------------------
+
 def _extract_utf16le(
     data: bytes,
     match_pos: int,
@@ -197,6 +441,11 @@ def _extract_utf16le(
 
     Returns ``None`` if the position is odd-aligned (invalid for UTF-16LE)
     or decoding fails.
+
+    The window is first computed using the strong ``\\x00\\x00`` boundary
+    on both sides and then refined via :func:`_refine_extract_window` so
+    that VN script blobs (entire files in one null-terminated block) are
+    sliced down to the dialog paragraph surrounding the match.
     """
     if match_pos % 2 != 0:
         return None
@@ -219,6 +468,11 @@ def _extract_utf16le(
             break
         end += 2
 
+    # Multi-boundary refinement (no-op for short blocks).
+    start, end = _refine_extract_window(
+        data, start, end, match_pos, "utf-16-le", alignment=2,
+    )
+
     if end <= start:
         return None
 
@@ -237,6 +491,10 @@ def _extract_byte_delimited(
     """Extract a null-terminated string (single ``\\x00`` delimiter).
 
     Works for UTF-8 and Shift-JIS (both use single-byte null terminator).
+
+    The window is first computed using the strong ``\\x00`` boundary on
+    both sides and then refined via :func:`_refine_extract_window` to
+    trim VN-engine script blobs down to the local dialog paragraph.
     """
     max_bytes = max_chars * 4  # UTF-8 worst case: 4 bytes per char
 
@@ -255,6 +513,11 @@ def _extract_byte_delimited(
         if data[end] == 0:
             break
         end += 1
+
+    # Multi-boundary refinement (no-op for short blocks).
+    start, end = _refine_extract_window(
+        data, start, end, match_pos, encoding, alignment=1,
+    )
 
     if end <= start:
         return None

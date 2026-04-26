@@ -134,6 +134,77 @@ _CLOSE_SET: frozenset[str] = frozenset(
     '】）」』》〉〕〗])\'\"\u201d\u2019\u3011\uff09\u300d\u300b\u300f\u3019'
 )
 
+# How far to peek past a ``\n`` looking for a stronger delimiter (open
+# bracket / quote on the left, closing bracket / quote on the right).
+# Quotes outrank newlines: when a strong delimiter is reachable through a
+# short clean span, the boundary walker bridges the ``\n`` and continues.
+# Window is intentionally narrow — VN dialog lines are commonly 20–40 chars,
+# so this only catches the "almost adjacent" case the user described.
+_NEWLINE_LOOKAHEAD_CHARS: int = 20
+
+
+def _is_clean_bridge_char(ch: str) -> bool:
+    """Return True if *ch* is acceptable inside a ``\\n``-bridge window.
+
+    "Clean" means CJK letters, ASCII letters/digits, standard punctuation
+    or whitespace.  Binary noise (control chars, surrogates, private-use)
+    aborts the bridge so we never absorb garbage memory bytes.
+    """
+    if ch in (' ', '\t'):
+        return True
+    cat = unicodedata.category(ch)
+    # L* (letters), N* (numbers), P* (punctuation), S* (symbols), Zs (space).
+    return cat[0] in ('L', 'N', 'P', 'S') or cat == 'Zs'
+
+
+def _find_left_bridge_open(text: str, newline_pos: int) -> int | None:
+    """Look for an opening delimiter shortly to the left of a ``\\n``.
+
+    Walks from ``newline_pos - 1`` leftward up to
+    :data:`_NEWLINE_LOOKAHEAD_CHARS` characters.  Returns the index of an
+    opening delimiter (one of :data:`_LEFT_OPEN_SET`) if found, otherwise
+    ``None``.  Aborts on:
+
+    * a second ``\\n`` (we only ever bridge one newline);
+    * a ``~`` (VN engine command-line prefix — not part of the dialog);
+    * a non-clean character (binary noise).
+    """
+    limit = max(0, newline_pos - _NEWLINE_LOOKAHEAD_CHARS)
+    j = newline_pos - 1
+    while j >= limit:
+        ch = text[j]
+        if ch == '\n' or ch == '\r' or ch == '~':
+            return None
+        if not _is_clean_bridge_char(ch):
+            return None
+        if ch in _LEFT_OPEN_SET:
+            return j
+        j -= 1
+    return None
+
+
+def _find_right_bridge_close(text: str, newline_pos: int) -> int | None:
+    """Look for a closing delimiter shortly to the right of a ``\\n``.
+
+    Symmetric counterpart of :func:`_find_left_bridge_open`.  Walks
+    forward from ``newline_pos + 1`` up to
+    :data:`_NEWLINE_LOOKAHEAD_CHARS` characters.  Aborts on a second
+    ``\\n`` / ``\\r``, on a ``~`` command-line prefix, or on a non-clean
+    character.
+    """
+    limit = min(len(text), newline_pos + 1 + _NEWLINE_LOOKAHEAD_CHARS)
+    j = newline_pos + 1
+    while j < limit:
+        ch = text[j]
+        if ch == '\n' or ch == '\r' or ch == '~':
+            return None
+        if not _is_clean_bridge_char(ch):
+            return None
+        if ch in _CLOSE_SET:
+            return j
+        j += 1
+    return None
+
 # ---------------------------------------------------------------------------
 # Alignment normalisation (lightweight, with position map)
 # ---------------------------------------------------------------------------
@@ -286,8 +357,13 @@ def _refine_left_boundary(
 
     Rules (evaluated for each character stepping leftward):
 
-    * **Terminator** (``\\n``, ``\\r``, ``\\t``, ``|``, ``~``): stop, do not
-      include.
+    * **Terminator** (``\\r``, ``\\t``, ``|``, ``~``): stop, do not include.
+    * **Newline** (``\\n``): normally stop; but if an opening delimiter
+      from :data:`_LEFT_OPEN_SET` is reachable within
+      :data:`_NEWLINE_LOOKAHEAD_CHARS` characters further left through a
+      clean span (no second ``\\n``, no ``~`` command prefix, no binary
+      noise), bridge the newline and include up to and including that
+      opener.  Encodes the rule "quotes outrank newlines".
     * **Closing bracket** (``\u3011``, ``)``\u3001 ``\uff09`` ...): stop, do not include —
       a closing bracket to the left means we have already passed that block.
     * **Opening bracket** (``\u3010``, ``(``, ``\uff08`` ...): include and stop —
@@ -302,7 +378,20 @@ def _refine_left_boundary(
     while pos > 0:
         ch = text[pos - 1]
 
-        # Hard terminators — stop without including.
+        # Hard terminators — but ``\n`` may be bridged when an opening
+        # delimiter sits within a short clean window further left
+        # (rule: quotes outrank newlines).
+        if ch == '\n':
+            open_idx = _find_left_bridge_open(text, pos - 1)
+            if open_idx is None:
+                break
+            # Include the bridged span up to and including the opener,
+            # then stop (matches the existing open-bracket rule below).
+            pos = open_idx
+            # Special case: ~【name】 — include the ~ command prefix.
+            if pos > 0 and text[pos - 1] == '~':
+                pos -= 1
+            break
         if ch in _TERMINATORS or ch == "~":
             break
 
@@ -342,7 +431,12 @@ def _refine_right_boundary(text: str, rough_right: int) -> int:
 
     Rules:
 
-    * **Terminator** (``\\n``, ``\\r``, ``\\t``, ``|``, ``~``): stop, do not include.
+    * **Terminator** (``\\r``, ``\\t``, ``|``, ``~``): stop, do not include.
+    * **Newline** (``\\n``): normally stop; but if a closing delimiter
+      from :data:`_CLOSE_SET` is reachable within
+      :data:`_NEWLINE_LOOKAHEAD_CHARS` characters further right through
+      a clean span (same guards as the left walker), bridge the newline
+      and include through the closer.
     * **Closing bracket** (``\u3011``, ``)``\u3001 ``\uff09`` ...): include and stop.
     * **Anything else** (text or symbols): include and continue.
     """
@@ -350,6 +444,13 @@ def _refine_right_boundary(text: str, rough_right: int) -> int:
     while pos < len(text):
         ch = text[pos]
 
+        if ch == '\n':
+            close_idx = _find_right_bridge_close(text, pos)
+            if close_idx is None:
+                break
+            # Include everything up to and including the closer.
+            pos = close_idx + 1
+            break
         if ch in _TERMINATORS or ch == "~":
             break
 

@@ -86,6 +86,18 @@ Standard library → third-party → local (PEP 8). Use `TYPE_CHECKING` guard fo
 
 ## Project Conventions
 
+### 通用工具原则 (Generic-tool principle)
+
+Core, cross-cutting modules — `src/memory/`, `src/text_utils.py`, `src/correction.py`, `src/ocr/` — must remain **engine-agnostic**. Do **not** hard-code assumptions about specific game engine layouts (Light.VN, KiriKiri, Ren'Py, …) such as:
+
+- Script-placeholder syntax (`%s`, `{name}`, `[r]`, `@n`, literal `\n` text, …).
+- Engine-specific delimiter bytes or magic markers.
+- Memory layouts only one engine produces (e.g. "the whole script lives in one null-terminated block").
+
+The generic layer should expose configurable knobs (boundary codepoint sets, thresholds, …); engine-specific behaviour, when needed, belongs in a separate, opt-in **engine profile** layer that composes with — not edits — these core modules.
+
+This keeps the project usable for new targets without rewriting core logic, and keeps tests cleanly partitioned.
+
 ### Extensibility via rule chains (chain of responsibility)
 
 Range detectors implement ABCs composed as ordered lists. A runner function walks the chain and returns the first non-`None` result. New rules are appended/inserted into the module-level default list.

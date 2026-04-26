@@ -357,6 +357,204 @@ class TestTryEncode:
 
 
 # ==========================================================================
+# Multi-boundary extraction — right boundary
+# ==========================================================================
+
+
+class TestRightBoundary:
+    """``_extract_utf16le`` / ``_extract_byte_delimited`` right-boundary refinement."""
+
+    @staticmethod
+    def _utf16le_block(*parts: str) -> bytes:
+        """Encode *parts* as a single null-terminated UTF-16LE block."""
+        return "".join(parts).encode("utf-16-le") + b"\x00\x00"
+
+    def test_short_block_uses_null_boundary(self) -> None:
+        # Below threshold (200 chars) → strong-boundary unchanged.
+        text = "テストです" * 5  # 25 chars, well below threshold
+        data = self._utf16le_block(text)
+        result = _extract_utf16le(data, 0)
+        assert result == text
+
+    def test_long_block_with_newline_truncates(self) -> None:
+        # > 200 chars total, with \n inside → right side cuts at \n.
+        prefix = "前置パディング" * 30  # ~210 chars before match
+        match = "テストの本文"
+        suffix = "\n" + ("後置パディング" * 30)  # forces \n inside the block
+        data = self._utf16le_block(prefix + match + suffix)
+        match_pos = (len(prefix)) * 2
+        result = _extract_utf16le(data, match_pos)
+        assert result is not None
+        assert match in result
+        # Newline is excluded from the right side.
+        assert "\n" not in result
+        assert "後置パディング" not in result
+
+    def test_long_block_with_closing_quote_truncates(self) -> None:
+        # > threshold, no \n, but a closing quote → cuts at quote.
+        prefix = "ぱでぃんぐ" * 50
+        match = "テスト本文"
+        suffix = "」" + ("あとぱでぃんぐ" * 50)
+        data = self._utf16le_block(prefix + match + suffix)
+        match_pos = len(prefix) * 2
+        result = _extract_utf16le(data, match_pos)
+        assert result is not None
+        assert match in result
+        assert "」" not in result
+        assert "あとぱでぃんぐ" not in result
+
+    def test_picks_nearest_when_both_present(self) -> None:
+        # Both \n and 」 follow the match — cut at the closer one.
+        # Need long *suffix* (post-match) to engage right-boundary refinement.
+        match = "テスト"
+        # \n appears first (closer), then 」 farther away.
+        suffix = "あ\nい」う" + ("あとぱでぃんぐ" * 50)
+        data = self._utf16le_block(match + suffix)
+        match_pos = 0
+        result = _extract_utf16le(data, match_pos)
+        assert result is not None
+        assert match in result
+        # Should stop at the *nearer* boundary (\n).
+        assert "い" not in result
+        assert "」" not in result
+
+
+# ==========================================================================
+# Multi-boundary extraction — left boundary
+# ==========================================================================
+
+
+class TestLeftBoundary:
+    """Left-boundary refinement with strong-quote / weak-newline fallback."""
+
+    @staticmethod
+    def _utf16le_block(text: str) -> bytes:
+        return text.encode("utf-16-le") + b"\x00\x00"
+
+    def test_clean_open_quote_used(self) -> None:
+        # Quote close to match, clean text between → quote wins.
+        far_prefix = "とおいぱでぃんぐ" * 30  # > threshold from match
+        # 「 is ~5 chars before match — within threshold and clean.
+        near = "「ちかい"
+        match = "テスト本文"
+        suffix = "」"
+        data = self._utf16le_block(far_prefix + near + match + suffix)
+        match_pos = (len(far_prefix) + len(near)) * 2
+        result = _extract_utf16le(data, match_pos)
+        assert result is not None
+        assert match in result
+        # Quote is excluded; far_prefix is cut off.
+        assert "「" not in result
+        assert "とおいぱでぃんぐ" not in result
+        assert "ちかい" in result
+
+    def test_noisy_quote_falls_back_to_newline(self) -> None:
+        # Quote exists but the slice between quote and match is full of
+        # binary noise → must reject quote and fall back to \n.
+        far_prefix = "ぱでぃんぐ" * 50
+        # Layout from left: …far_prefix…「NOISE\ncleantext MATCH
+        # (the opening quote is part of `noisy_chunk`).  The newline is
+        # closer to MATCH than the quote, and the quote→newline slice is
+        # full of control chars → quote is rejected, \n wins.
+        noisy_chunk = "「" + "\u0001\u0002\u0003\u0004\u0005" + "\nきれい"
+        match = "テスト"
+        data = self._utf16le_block(far_prefix + noisy_chunk + match)
+        match_pos = (len(far_prefix) + len(noisy_chunk)) * 2
+        result = _extract_utf16le(data, match_pos)
+        assert result is not None
+        assert match in result
+        # Should NOT include the noisy block before \n.
+        assert "\u0001" not in result
+        assert "「" not in result
+        # Should include the clean text after \n.
+        assert "きれい" in result
+
+    def test_no_quote_uses_newline(self) -> None:
+        # No quotes anywhere — \n is the only soft boundary.
+        far_prefix = "ぱでぃんぐ" * 60
+        near = "ちかい\nあとろう"
+        match = "テスト"
+        data = self._utf16le_block(far_prefix + near + match)
+        match_pos = (len(far_prefix) + len(near)) * 2
+        result = _extract_utf16le(data, match_pos)
+        assert result is not None
+        assert match in result
+        assert "あとろう" in result
+        assert "\n" not in result
+        assert "ちかい" not in result
+        assert "ぱでぃんぐ" not in result
+
+    def test_no_soft_boundary_falls_back_to_null(self) -> None:
+        # Block > threshold but contains no \n / quote → use \0 boundary.
+        prefix = "ぱでぃんぐ" * 60  # > threshold, no soft boundary
+        match = "テスト"
+        data = self._utf16le_block(prefix + match)
+        match_pos = len(prefix) * 2
+        result = _extract_utf16le(data, match_pos)
+        assert result is not None
+        # With no soft boundary, fallback to \0 — full block returned.
+        assert result.endswith(match)
+        assert result.startswith("ぱ")
+
+
+# ==========================================================================
+# Multi-boundary extraction — encoding symmetry
+# ==========================================================================
+
+
+class TestBoundarySymmetry:
+    """Same logical layout should yield equivalent windows across encodings."""
+
+    @staticmethod
+    def _build(prefix: str, match: str, suffix: str, encoding: str) -> tuple[bytes, int]:
+        text = prefix + match + suffix
+        codec = "cp932" if encoding == "shift-jis" else encoding
+        encoded = text.encode(codec)
+        if encoding == "utf-16-le":
+            data = encoded + b"\x00\x00"
+        else:
+            data = encoded + b"\x00"
+        # Compute byte offset of `match` start.
+        match_pos = len(prefix.encode(codec))
+        return data, match_pos
+
+    @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-8", "shift-jis"])
+    def test_newline_truncation_consistent(self, encoding: str) -> None:
+        # Long suffix to exceed forward-byte thresholds in all encodings.
+        prefix = "ぱでぃんぐ" * 5  # short — left side need not engage
+        match = "テスト本文"
+        suffix = "\n" + ("あとぱでぃんぐ" * 80)
+        data, match_pos = self._build(prefix, match, suffix, encoding)
+        if encoding == "utf-16-le":
+            result = _extract_utf16le(data, match_pos)
+        else:
+            result = _extract_byte_delimited(data, match_pos, encoding)
+        assert result is not None
+        assert match in result
+        assert "\n" not in result
+        assert "あとぱでぃんぐ" not in result
+
+    @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-8", "shift-jis"])
+    def test_open_quote_consistent(self, encoding: str) -> None:
+        # Far prefix sized to exceed left-side byte threshold for all
+        # encodings (UTF-8 ≈ 3 bytes/char CJK).
+        far_prefix = "とおい" * 250  # 750 chars
+        near = "「ちかい"
+        match = "テスト"
+        suffix = "」"
+        data, match_pos = self._build(far_prefix + near, match, suffix, encoding)
+        if encoding == "utf-16-le":
+            result = _extract_utf16le(data, match_pos)
+        else:
+            result = _extract_byte_delimited(data, match_pos, encoding)
+        assert result is not None
+        assert match in result
+        assert "「" not in result
+        assert "とおい" not in result
+        assert "ちかい" in result
+
+
+# ==========================================================================
 # find_all_positions (Python fallback)
 # ==========================================================================
 
