@@ -346,12 +346,12 @@ def _byte_threshold(encoding: str) -> int:
 def _refine_extract_window(
     data: bytes,
     start_null: int,
-    end_strong: int,
+    end_null: int,
     match_pos: int,
     encoding: str,
     alignment: int,
 ) -> tuple[int, int]:
-    """Refine ``[start_null, end_strong]`` using soft / strong soft-boundaries.
+    """Refine ``[start_null, end_null]`` using soft/strong boundaries.
 
     Implements the multi-boundary candidate strategy:
 
@@ -368,16 +368,16 @@ def _refine_extract_window(
     codec = "cp932" if encoding == "shift-jis" else encoding
 
     # ----- Right boundary -----------------------------------------------
-    end = end_strong
-    if end_strong - match_pos > threshold_bytes:
+    end = end_null
+    if end_null - match_pos > threshold_bytes:
         right_patterns = _get_boundary_patterns(
             _RIGHT_SOFT_BOUNDARY_CODEPOINTS, encoding,
         )
         end_soft = _find_aligned_right_boundary(
-            data, match_pos, end_strong, right_patterns, alignment,
+            data, match_pos, end_null, right_patterns, alignment,
         )
         if end_soft is not None:
-            end = min(end_strong, end_soft)
+            end = min(end_null, end_soft)
 
     # ----- Left boundary ------------------------------------------------
     start = start_null

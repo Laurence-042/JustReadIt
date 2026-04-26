@@ -452,8 +452,10 @@ class TestLeftBoundary:
         # Quote exists but the slice between quote and match is full of
         # binary noise → must reject quote and fall back to \n.
         far_prefix = "ぱでぃんぐ" * 50
-        # Newline is closer to match than the quote.
-        # Layout from left: …prefix… 「 NOISE \n cleantext MATCH
+        # Layout from left: …far_prefix…「NOISE\ncleantext MATCH
+        # (the opening quote is part of `noisy_chunk`).  The newline is
+        # closer to MATCH than the quote, and the quote→newline slice is
+        # full of control chars → quote is rejected, \n wins.
         noisy_chunk = "「" + "\u0001\u0002\u0003\u0004\u0005" + "\nきれい"
         match = "テスト"
         data = self._utf16le_block(far_prefix + noisy_chunk + match)
