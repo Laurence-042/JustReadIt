@@ -30,7 +30,7 @@ JustReadIt 是一个 Windows 实时翻译悬浮窗工具。将鼠标移到游戏
 ## 功能特性
 
 - **DXGI Desktop Duplication 截图** — 专为 DirectX 游戏设计，彻底避免 `BitBlt`/`PrintWindow` 截黑屏的问题
-- **Windows OCR** — 使用系统内置 OCR，无需下载外部模型；对小字体自动超分辨率提升识别精度
+- **Windows OCR / PaddleOCR** — 默认使用系统内置 OCR，无需下载外部模型；对小字体自动超分辨率提升识别精度。也可切换到 PaddleOCR（`pip install ".[ocr-paddle]"`）
 - **ReadProcessMemory 内存扫描** — 零注入读取游戏进程堆内存，含热区缓存约 10–50 ms 提取原始 CJK 文本，再与 OCR 结果做 Levenshtein 交叉验证
 - **冻结模式** — 快捷键（默认 F9）将当前画面冻结为置顶悬浮截图，可随意悬停翻译；右键 / Escape 关闭并将焦点归还游戏
 - **可扩展翻译后端** — 干净的 `Translator` 抽象基类；已实现：免费 Google、Cloud Translation API、OpenAI 兼容接口（RAG + 函数调用，基于 `KnowledgeBase`）
@@ -103,7 +103,7 @@ cd JustReadIt
 # 创建虚拟环境并安装所有扩展
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[ui,dev,translators-free,translators-cloud,translators-openai,knowledge]"
+pip install -e ".[ui,dev,translators-free,translators-cloud,translators-openai,knowledge,ocr-paddle]"
 
 # 安装 Windows OCR 日语语言包（约 6 MB，无需重启）
 powershell -ExecutionPolicy Bypass -File scripts\install_ja_ocr.ps1
@@ -136,18 +136,19 @@ python main.py --debug
 
 ## 配置说明
 
-所有配置存储于 `%APPDATA%\JustReadIt\config.ini`，可通过主窗口或调试窗口的设置面板修改。主要配置项：
+所有配置存储于 `%APPDATA%\JustReadIt\config.json`，可通过主窗口或调试窗口的设置面板修改。主要配置项：
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `ocr/language` | `ja` | OCR 识别语言（BCP-47） |
 | `ocr/max_size` | `1920` | OCR 图像长边上限（px）；4K 帧自动降采样 |
+| `ocr/engine` | `windows` | OCR 引擎：`windows`（默认）或 `paddle` |
 | `pipeline/interval_ms` | `1500` | 翻译冷却间隔（ms） |
 | `pipeline/memory_scan_enabled` | `true` | 是否启用内存扫描以获取干净文本 |
 | `translator/backend` | — | 翻译后端：`google_free` / `cloud` / `openai` |
 | `translator/target_lang` | — | 目标语言（BCP-47） |
-| `hotkey/freeze_vk` | `0x78`（F9） | 冻结模式快捷键虚拟键码 |
-| `hotkey/dump_vk` | `0x77`（F8） | 调试转储快捷键虚拟键码 |
+| `overlay/freeze_vk` | `0x78`（F9） | 冻结模式快捷键虚拟键码 |
+| `overlay/dump_vk` | `0x77`（F8） | 调试转储快捷键虚拟键码 |
 
 ---
 

@@ -15,7 +15,7 @@ JustReadIt is a real-time translation overlay for Windows. Move your mouse over 
 ## Features
 
 - **DXGI Desktop Duplication capture** — works on DirectX games where `BitBlt`/`PrintWindow` produce black frames
-- **Windows OCR** — built-in, no external model downloads required; upscales small fonts for accuracy
+- **Windows OCR / PaddleOCR** — built-in Windows OCR requires no external model downloads and upscales small fonts for accuracy. Optionally switch to PaddleOCR (`pip install ".[ocr-paddle]"`)
 - **ReadProcessMemory memory scan** — zero-injection scan of the game process heap; extracts clean original CJK text in ~10–50 ms with hot-region caching; cross-validates with OCR via Levenshtein matching
 - **Freeze mode** — hotkey (default F9) freezes a screenshot as a topmost overlay so you can hover-translate at your own pace; right-click or Escape to dismiss and return focus to the game
 - **Pluggable translation backends** — clean `Translator` ABC; free Google, Cloud Translation API, and OpenAI-compatible (RAG + function-calling via `KnowledgeBase`) all implemented
@@ -88,7 +88,7 @@ cd JustReadIt
 # Create a virtual environment and install all extras
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[ui,dev,translators-free,translators-cloud,translators-openai,knowledge]"
+pip install -e ".[ui,dev,translators-free,translators-cloud,translators-openai,knowledge,ocr-paddle]"
 
 # Install the Windows OCR Japanese language pack (~6 MB, no reboot needed)
 powershell -ExecutionPolicy Bypass -File scripts\install_ja_ocr.ps1
@@ -121,18 +121,19 @@ python main.py --debug
 
 ## Configuration
 
-All settings are stored in `%APPDATA%\JustReadIt\config.ini` and can be changed from the Settings panel in either window. Key settings:
+All settings are stored in `%APPDATA%\JustReadIt\config.json` and can be changed from the Settings panel in either window. Key settings:
 
 | Key | Default | Description |
 |---|---|---|
 | `ocr/language` | `ja` | OCR recognition language (BCP-47) |
 | `ocr/max_size` | `1920` | Maximum long-edge (px) fed to OCR; 4K frames are downsampled |
+| `ocr/engine` | `windows` | OCR engine: `windows` (default) or `paddle` |
 | `pipeline/interval_ms` | `1500` | Translation cooldown (ms) |
 | `pipeline/memory_scan_enabled` | `true` | Enable memory scan for clean source text |
 | `translator/backend` | — | Translation backend: `google_free` / `cloud` / `openai` |
 | `translator/target_lang` | — | Target language (BCP-47) |
-| `hotkey/freeze_vk` | `0x78` (F9) | Freeze-mode hotkey virtual key code |
-| `hotkey/dump_vk` | `0x77` (F8) | Debug-dump hotkey virtual key code |
+| `overlay/freeze_vk` | `0x78` (F9) | Freeze-mode hotkey virtual key code |
+| `overlay/dump_vk` | `0x77` (F8) | Debug-dump hotkey virtual key code |
 
 ---
 

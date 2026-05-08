@@ -28,10 +28,14 @@ Mouse hover / Freeze hotkey
 
 | Component | Path | Role |
 |---|---|---|
-| Controller | `src/controller.py` | `HoverController` (QObject) — central orchestrator. Poll loop on QThread: cursor tracking → settle detection → OCR probe → full pipeline → emit `translation_ready` / `freeze_triggered` signals |
+| App backend | `src/app_backend.py` | `AppBackend` (QObject) — sole owner of all stateful resources; holds controller, knowledge base, translator, and overlays; forwards signals to views. Views receive an `AppBackend` reference and connect to its signals. |
+| Controller | `src/controller.py` | `HoverController` (QObject) — background worker thread. Cursor poll → settle detection → OCR probe → full pipeline → emit `translation_ready` / `freeze_triggered` signals |
 | Target process | `src/target.py` | `GameTarget` frozen dataclass — PID, HWND, window/capture rects, dxcam output index. Immutable; `refresh()` returns a new instance |
 | Screen capture | `src/capture.py` | DXGI Desktop Duplication via dxcam. Context-manager protocol. **Never** `BitBlt`/`PrintWindow` (black frames on DirectX) |
-| OCR engine | `src/ocr/windows_ocr.py` | `WindowsOcr` — sole OCR engine (no manga-ocr). Upscale-then-downscale for small fonts; PIL ↔ WinRT bitmap bridge |
+| OCR base | `src/ocr/base.py` | `OcrProvider` ABC — plugin interface. `MissingOcrEngineError`. All engines implement `recognise(image) → (word_boxes, line_boxes)` |
+| OCR factory | `src/ocr/factory.py` | `build_ocr(config)` / `build_ocr_engine(engine, …)` — construct configured `OcrProvider`. Engine keys: `"windows"` / `"paddle"` |
+| Windows OCR | `src/ocr/windows_ocr.py` | `WindowsOcr` (default) — upscale-then-downscale for small fonts; PIL ↔ WinRT bitmap bridge |
+| PaddleOCR | `src/ocr/paddle_ocr.py` | `PaddleOcr` — optional engine (requires `ocr-paddle` extra). BCP-47 → PaddleOCR lang-code mapping |
 | Range detection | `src/ocr/range_detectors.py` | `RangeDetector` ABC + chain runner `run_detectors()`. Built-ins: `ParagraphDetector`, `TableRowDetector`, `SingleBoxDetector` |
 | Memory scanner | `src/memory/scanner.py` | `MemoryScanner` — zero-intrusion `ReadProcessMemory` scanning. `ScanResult` frozen dataclass. `pick_needles()` extracts best CJK substrings from OCR text. Hot-region caching + encoding auto-learning (UTF-16LE / UTF-8 / Shift-JIS). Optional `mem_scan.dll` C accelerator |
 | Memory Win32 | `src/memory/_win32.py` | `VirtualQueryEx` / `ReadProcessMemory` bindings. `PROCESS_VM_READ` only — read-only, zero intrusion |
@@ -42,10 +46,12 @@ Mouse hover / Freeze hotkey
 | Translator installer | `src/translators/_installer.py` | `ensure_package()` — runtime auto-install of optional translator deps. Works in both venv and PyInstaller frozen mode |
 | Knowledge base | `src/knowledge/` | `KnowledgeBase` — persistent SQLite with hybrid BM25 + vector retrieval (RRF). `OPENAI_TOOLS` + `execute_tool()` for LLM function-calling. Shared by `OpenAICompatTranslator` and MCP server |
 | MCP server | `src/mcp_server.py` | FastMCP stdio server exposing `record_term`, `record_event`, `search_terms` tools. Entry: `python -m src.mcp_server [--db PATH]` |
-| Paths | `src/paths.py` | `app_data_dir()`, `config_path()`, `knowledge_db_path()`, `translations_db_path()` — all under `%APPDATA%\JustReadIt\`. No PySide6 dep, safe for headless imports |
-| Config | `src/config.py` | `AppConfig` singleton — JSON-backed (`%APPDATA%\JustReadIt\config.json`). Hierarchical namespace sub-objects: `cfg.ocr`, `cfg.pipeline`, `cfg.translator`, `cfg.translator.cloud`, `cfg.translator.openai`, `cfg.overlay`. Each property emits a `*_changed` signal on write. |
-| Overlay | `src/overlay.py` | `TranslationOverlay` (QWidget) — semi-transparent popup for hover mode; full-window pixmap overlay for freeze mode. Signals: `hover_requested`, `freeze_dismissed` |
-| Debug UI | `src/ui/` | PySide6 debug window + window picker. Launch: `main.py --debug` |
+| Dataset | `src/dataset/` | `PipelineDataset` — SQLite-backed store for pipeline samples (OCR→memory→correction). Used for algorithm QA and annotation. `dataset_db_path()` returns default path |
+| Paths | `src/paths.py` | `app_data_dir()`, `config_path()`, `knowledge_db_path()`, `translations_db_path()`, `dataset_db_path()` — all under `%APPDATA%\JustReadIt\`. No PySide6 dep, safe for headless imports |
+| Config | `src/config.py` | `AppConfig` singleton — JSON-backed (`%APPDATA%\JustReadIt\config.json`). Hierarchical namespace sub-objects: `cfg.ocr`, `cfg.pipeline`, `cfg.translator`, `cfg.translator.backends.cloud`, `cfg.translator.backends.openai`, `cfg.overlay`. Each property emits a `*_changed` signal on write. |
+| Overlay | `src/overlay.py` | `TranslationOverlay` (QWidget) — semi-transparent popup for hover mode. `FreezeOverlay` — topmost full-screen frozen screenshot for freeze mode. Signals: `hover_requested`, `freeze_dismissed` |
+| Main window | `src/ui/main_window.py` | `MainWindow` — compact UI; game-window picker, language switcher, translation preview, system tray support |
+| Debug UI | `src/ui/debug_window.py` | `DebugWindow` — capture preview, OCR bounding-box overlay, memory-scan panel, per-stage timings. Launch: `main.py --debug` |
 
 ### Workflows
 
@@ -186,7 +192,7 @@ Translator backends call `ensure_package(pip_name, import_name)` from `src/trans
 
 Custom exceptions inherit `RuntimeError`, defined near the code that raises them. Messages must be **actionable and user-facing** (e.g. include install commands, suggest `--pid`). Use `warnings.warn(RuntimeWarning)` for recoverable fallbacks.
 
-Key exceptions: `ProcessNotFoundError`, `WindowNotFoundError`, `AmbiguousProcessNameError` (in `target.py`), `MissingOcrLanguageError` (in `windows_ocr.py`), `TranslationError` → `AuthError`, `RateLimitError`, `NetworkError` (in `translators/base.py`).
+Key exceptions: `ProcessNotFoundError`, `WindowNotFoundError`, `AmbiguousProcessNameError` (in `target.py`), `MissingOcrEngineError` (in `ocr/base.py`), `MissingOcrLanguageError` (in `ocr/windows_ocr.py`), `TranslationError` → `AuthError`, `RateLimitError`, `NetworkError` (in `translators/base.py`).
 
 ### Async / Threading
 
@@ -202,6 +208,7 @@ Key exceptions: `ProcessNotFoundError`, `WindowNotFoundError`, `AmbiguousProcess
 cfg = AppConfig()
 cfg.ocr.language                    # str, default "ja"
 cfg.ocr.max_size                    # int, default 1920 (caps OCR input; halves 4K frames)
+cfg.ocr.engine                      # str, default "windows" ("windows" | "paddle")
 cfg.pipeline.interval_ms           # int, default 1500
 cfg.pipeline.memory_scan_enabled   # bool, default True
 cfg.translator.backend             # str, e.g. "cloud" / "google_free" / "openai" / "none"
@@ -225,6 +232,7 @@ All data files live under `%APPDATA%\JustReadIt\` (`src/paths.py`):
 - `config.json` — app settings (JSON, hierarchical)
 - `knowledge.db` — game knowledge base (terms, events, FTS5)
 - `translations.db` — translation cache
+- `pipeline_dataset.db` — pipeline samples for algorithm QA
 
 `src/paths.py` has no PySide6 dependency — safe to import from MCP server and headless scripts.
 
@@ -234,7 +242,7 @@ All data files live under `%APPDATA%\JustReadIt\` (`src/paths.py`):
 # Create venv and install (all extras)
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[dev,ui,translators-free,translators-cloud,translators-openai,knowledge]"
+pip install -e ".[dev,ui,translators-free,translators-cloud,translators-openai,knowledge,ocr-paddle]"
 
 # Build optional memory scanner C accelerator
 powershell -File src/memory/build.ps1
@@ -273,9 +281,10 @@ python -m src.mcp_server [--db <path>]
 - Text extraction: `ReadProcessMemory` scanning (`src/memory/`). Zero intrusion, read-only.
 - License: **MPL-2.0** (file-level weak copyleft). Every `.py` file starts with the MPL boilerplate comment.
 - Windows-only; Python ≥ 3.11.
-- OCR: Windows OCR only — no GPU dependency, no manga-ocr.
+- OCR engines: `WindowsOcr` (default, no extra deps) or `PaddleOcr` (requires `ocr-paddle` extra). No manga-ocr.
 - Focus return: `AllowSetForegroundWindow(pid)` — direct cross-process `SetForegroundWindow` is blocked by Windows.
 - `PhashCache` key: exact OCR region text string (no longer perceptual hash — class name preserved for backward compat).
+- `AppBackend` is the single owner of all stateful resources — views must never hold their own backend resources.
 
 ## Reference
 
