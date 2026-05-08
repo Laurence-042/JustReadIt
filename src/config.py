@@ -78,6 +78,7 @@ _DEFAULTS: dict[str, Any] = {
     "ocr": {
         "language": "ja",
         "max_size": 1920,
+        "engine": "windows",
     },
     "pipeline": {
         "interval_ms": 1500,
@@ -149,6 +150,7 @@ class _OcrConfig(QObject):
 
     language_changed = Signal(str)
     max_size_changed = Signal(int)
+    engine_changed = Signal(str)
 
     def __init__(self, root: "_AppConfigCore") -> None:
         super().__init__()
@@ -175,6 +177,16 @@ class _OcrConfig(QObject):
     def max_size(self, value: int) -> None:
         if self._r._set("ocr", "max_size", value=value):
             self.max_size_changed.emit(value)
+
+    @property
+    def engine(self) -> str:
+        """OCR engine key: ``"windows"`` (default) or ``"paddle"``."""
+        return str(self._r._get("ocr", "engine", default="windows"))
+
+    @engine.setter
+    def engine(self, value: str) -> None:
+        if self._r._set("ocr", "engine", value=value):
+            self.engine_changed.emit(value)
 
 
 class _PipelineConfig(QObject):

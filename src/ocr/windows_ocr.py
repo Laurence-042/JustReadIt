@@ -1,3 +1,6 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Windows OCR integration – converts a PIL Image to a list of BoundingBox.
 
 The Windows OCR API (Windows.Media.Ocr) requires pixel data wrapped in a
@@ -29,6 +32,7 @@ import winrt.windows.graphics.imaging as gi
 import winrt.windows.media.ocr as wocr
 import winrt.windows.storage.streams as wss
 
+from .base import MissingOcrEngineError, OcrProvider
 from .range_detectors import BoundingBox
 from src.text_utils import normalize_text
 
@@ -108,7 +112,7 @@ _INSTALL_HINT = (
 )
 
 
-class MissingOcrLanguageError(RuntimeError):
+class MissingOcrLanguageError(MissingOcrEngineError):
     """Raised when the requested Windows OCR language capability is not installed."""
 
 
@@ -137,7 +141,7 @@ def _create_engine(language_tag: str = "ja") -> wocr.OcrEngine:
 # Public class
 # ---------------------------------------------------------------------------
 
-class WindowsOcr:
+class WindowsOcr(OcrProvider):
     """Thin synchronous wrapper around the Windows OCR engine.
 
     Parameters
@@ -166,6 +170,7 @@ class WindowsOcr:
         upscale_factor: float = 2.0,
         max_ocr_long_edge: int = 1920,
     ) -> None:
+        super().__init__(max_long_edge=max_ocr_long_edge)
         try:
             self._engine: wocr.OcrEngine = _create_engine(language_tag)
         except MissingOcrLanguageError:
@@ -173,19 +178,11 @@ class WindowsOcr:
         # Windows OCR maximum image dimension is 4096 px.  Clamp the factor so
         # we don't exceed it even on large captures.
         self._upscale_factor = upscale_factor
-        # Soft cap on the OCR input dimension.  Upscaling a full-resolution
-        # capture (1080p → 3840×2160 at 2×, or raw 4K) feeds millions of
-        # unnecessary pixels to the OCR kernel and causes huge latency.
-        # With this cap the scale becomes min(upscale_factor, cap/max_dim):
-        #   • Small probe crops (≤960 px wide) still receive the full 2× boost.
-        #   • 1080p full frames are passed as-is (scale=1.0).
-        #   • 4K full frames are halved to 1920×1080 (scale=0.5).
-        self._max_ocr_long_edge = max_ocr_long_edge
         _log.info(
             "Windows OCR engine ready (language: %s, upscale: %.1f×, max_edge: %d px)",
             self._engine.recognizer_language.language_tag,
             self._upscale_factor,
-            self._max_ocr_long_edge,
+            self._max_long_edge,
         )
 
     @property
@@ -193,7 +190,7 @@ class WindowsOcr:
         """BCP-47 tag of the active recogniser language."""
         return self._engine.recognizer_language.language_tag
 
-    def recognise(self, image: Image.Image) -> list[BoundingBox]:
+    def recognise(self, image: Image.Image) -> tuple[list[BoundingBox], list[BoundingBox]]:
         """Run OCR on *image* and return word-level bounding boxes.
 
         The image is optionally upscaled by ``upscale_factor`` (set at
@@ -218,26 +215,14 @@ class WindowsOcr:
             recognised word; line_boxes has one entry per OCR line, with
             the line text joined by spaces.  Both are in reading order.
         """
-        # Compute effective scale:
-        #   • never exceed the Windows OCR hard limit of 4096 px;
-        #   • never exceed max_ocr_long_edge (our soft cap for speed);
-        #   • upscale_factor still applies unchanged for small crops.
-        max_dim = max(image.width, image.height)
-        if max_dim > 0:
-            scale = min(
-                self._upscale_factor,
-                4096 / max_dim,
-                self._max_ocr_long_edge / max_dim,
-            )
-        else:
-            scale = 1.0
-
-        if scale != 1.0:
-            new_w = max(1, int(image.width  * scale))
-            new_h = max(1, int(image.height * scale))
-            ocr_img = image.resize((new_w, new_h), Image.LANCZOS)
-        else:
-            ocr_img = image
+        # _resize_for_ocr respects self._max_long_edge (soft cap) and the
+        # Windows OCR hard API limit of 4096 px, while also upscaling small
+        # crops to improve accuracy on small fonts.
+        ocr_img, scale = self._resize_for_ocr(
+            image,
+            upscale_factor=self._upscale_factor,
+            hard_cap=4096,
+        )
 
         bmp = _pil_to_software_bitmap(ocr_img)
         result: wocr.OcrResult = asyncio.run(self._engine.recognize_async(bmp))
@@ -272,20 +257,11 @@ class WindowsOcr:
 
     def recognise_text(self, image: Image.Image) -> str:
         """Return the full recognised text string (no bounding boxes)."""
-        max_dim = max(image.width, image.height)
-        if max_dim > 0:
-            scale = min(
-                self._upscale_factor,
-                4096 / max_dim,
-                self._max_ocr_long_edge / max_dim,
-            )
-        else:
-            scale = 1.0
-        if scale != 1.0:
-            image = image.resize(
-                (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
-                Image.LANCZOS,
-            )
-        bmp = _pil_to_software_bitmap(image)
+        ocr_img, _scale = self._resize_for_ocr(
+            image,
+            upscale_factor=self._upscale_factor,
+            hard_cap=4096,
+        )
+        bmp = _pil_to_software_bitmap(ocr_img)
         result: wocr.OcrResult = asyncio.run(self._engine.recognize_async(bmp))
         return normalize_text(result.text)

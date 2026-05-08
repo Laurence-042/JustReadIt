@@ -44,7 +44,8 @@ class ConfigModel(QAbstractTableModel):
     FREEZE_VK = 3
     DUMP_VK = 4
     MEMORY_SCAN_ENABLED = 5
-    _COL_COUNT = 6
+    OCR_ENGINE = 6
+    _COL_COUNT = 7
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -57,6 +58,7 @@ class ConfigModel(QAbstractTableModel):
             self.FREEZE_VK: lambda: cfg.overlay.freeze_vk,
             self.DUMP_VK: lambda: cfg.overlay.dump_vk,
             self.MEMORY_SCAN_ENABLED: lambda: cfg.pipeline.memory_scan_enabled,
+            self.OCR_ENGINE: lambda: cfg.ocr.engine,
         }
         self._setters: dict[int, object] = {
             self.INTERVAL_MS: lambda v: setattr(cfg.pipeline, "interval_ms", int(v)),
@@ -67,6 +69,7 @@ class ConfigModel(QAbstractTableModel):
             self.MEMORY_SCAN_ENABLED: lambda v: setattr(
                 cfg.pipeline, "memory_scan_enabled", bool(v),
             ),
+            self.OCR_ENGINE: lambda v: setattr(cfg.ocr, "engine", str(v)),
         }
 
         # Forward config change signals → dataChanged so mappers revert.
@@ -87,6 +90,9 @@ class ConfigModel(QAbstractTableModel):
         )
         cfg.pipeline.memory_scan_enabled_changed.connect(
             lambda: self._notify(self.MEMORY_SCAN_ENABLED),
+        )
+        cfg.ocr.engine_changed.connect(
+            lambda: self._notify(self.OCR_ENGINE),
         )
 
     # ── QAbstractTableModel interface ─────────────────────────────────

@@ -70,8 +70,10 @@ from src.cache import PhashCache, PipelineRecord, TranslationCache
 from src.capture import Capturer
 from src.correction import best_match_with_details
 from src.memory import MemoryScanner, pick_needles
+from src.ocr.base import MissingOcrEngineError, OcrProvider
+from src.ocr.factory import build_ocr_engine
 from src.ocr.range_detectors import merge_boxes_text, run_detectors
-from src.ocr.windows_ocr import MissingOcrLanguageError, WindowsOcr, _ensure_apartment
+from src.ocr.windows_ocr import _ensure_apartment
 from src.paths import translations_db_path
 
 if TYPE_CHECKING:
@@ -149,7 +151,7 @@ _POLL_MS: int = 80
 # Half-size of the small crop used for the fast OCR probe (pixels).
 _PROBE_HALF: int = 70
 
-# Thread-local storage for per-thread WindowsOcr instances used by PipelineRunnable.
+# Thread-local storage for per-thread OcrProvider instances used by PipelineRunnable.
 _THREAD_OCR: threading.local = threading.local()
 
 
@@ -189,7 +191,7 @@ class PipelineRunnable(QRunnable):
     silently discarded when the cursor moves.
 
     Each QThreadPool worker thread maintains a lazily-created
-    :class:`~src.ocr.windows_ocr.WindowsOcr` instance via
+    :class:`~src.ocr.base.OcrProvider` instance via
     :data:`_THREAD_OCR` thread-local storage, avoiding COM-apartment
     conflicts while allowing concurrent memory-scan + translation runs.
     """
@@ -201,6 +203,7 @@ class PipelineRunnable(QRunnable):
         img_x: int,
         img_y: int,
         language_tag: str,
+        ocr_engine: str,
         ocr_max_long_edge: int,
         scanner: "MemoryScanner | None",
         translator: "Translator | None",
@@ -219,6 +222,7 @@ class PipelineRunnable(QRunnable):
         self._img_x = img_x
         self._img_y = img_y
         self._language_tag = language_tag
+        self._ocr_engine = ocr_engine
         self._ocr_max_long_edge = ocr_max_long_edge
         self._scanner = scanner
         self._translator = translator
@@ -235,19 +239,25 @@ class PipelineRunnable(QRunnable):
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _get_thread_ocr(self) -> "WindowsOcr | None":
-        """Return (or lazily create) a per-thread :class:`WindowsOcr` instance."""
+    def _get_thread_ocr(self) -> "OcrProvider | None":
+        """Return (or lazily create) a per-thread :class:`~src.ocr.base.OcrProvider` instance."""
         local = _THREAD_OCR
-        tag, edge = self._language_tag, self._ocr_max_long_edge
-        if getattr(local, "tag", None) != tag or getattr(local, "edge", None) != edge:
+        tag, edge, engine = self._language_tag, self._ocr_max_long_edge, self._ocr_engine
+        if (
+            getattr(local, "tag",    None) != tag
+            or getattr(local, "edge",   None) != edge
+            or getattr(local, "engine", None) != engine
+        ):
             try:
-                local.ocr: WindowsOcr = WindowsOcr(tag, max_ocr_long_edge=edge)
+                local.ocr: OcrProvider = build_ocr_engine(engine, tag, edge)
                 local.tag = tag
                 local.edge = edge
+                local.engine = engine
             except Exception as exc:
                 local.ocr = None  # type: ignore[assignment]
                 local.tag = None
                 local.edge = None
+                local.engine = None
                 _log.warning("Thread OCR init failed: %s", exc)
         return getattr(local, "ocr", None)
 
@@ -597,6 +607,7 @@ class HoverController(QObject):
         dump_vk: int = 0x77,    # VK_F8
         poll_ms: int = _POLL_MS,
         continuous: bool = False,
+        ocr_engine: str = "windows",
         ocr_max_long_edge: int = 1920,
         memory_scan_enabled: bool = True,
     ) -> None:
@@ -610,13 +621,14 @@ class HoverController(QObject):
         self._dump_vk = dump_vk
         self._poll_ms = poll_ms
         self._continuous = continuous
+        self._ocr_engine = ocr_engine
         self._ocr_max_long_edge = ocr_max_long_edge
         self._memory_scan_enabled: bool = memory_scan_enabled
         self._paused: bool = False
 
         # Resources — created in setup() on the worker thread
         self._capturer: Capturer | None = None
-        self._ocr: WindowsOcr | None = None
+        self._ocr: OcrProvider | None = None
         self._scanner: MemoryScanner | None = None
         self._phash_cache = PhashCache()
         self._text_cache: TranslationCache | None = None
@@ -659,14 +671,15 @@ class HoverController(QObject):
             return
 
         try:
-            self._ocr = WindowsOcr(
+            self._ocr = build_ocr_engine(
+                self._ocr_engine,
                 self._language_tag,
-                max_ocr_long_edge=self._ocr_max_long_edge,
+                self._ocr_max_long_edge,
             )
-        except MissingOcrLanguageError as exc:
+        except MissingOcrEngineError as exc:
             self.error.emit(str(exc))
         except Exception as exc:
-            self.error.emit(f"Windows OCR init failed: {exc}")
+            self.error.emit(f"OCR init failed: {exc}")
 
         try:
             self._scanner = MemoryScanner(self._target.pid)
@@ -996,6 +1009,7 @@ class HoverController(QObject):
             img_x=img_x,
             img_y=img_y,
             language_tag=self._language_tag,
+            ocr_engine=self._ocr_engine,
             ocr_max_long_edge=self._ocr_max_long_edge,
             scanner=self._scanner,
             translator=self._translator,

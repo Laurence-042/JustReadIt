@@ -38,6 +38,15 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        # Pre-import numpy before PySide6 so that shiboken6's import hook
+        # (which calls inspect.getsource on every imported module) does not
+        # fire for numpy submodules.  On Python 3.14 + numpy 2.x the hook
+        # raises KeyboardInterrupt when trying to read numpy's compiled files.
+        import numpy as _np  # noqa: F401
+    except ImportError:
+        pass  # numpy may not be installed in all configurations
+
+    try:
         from PySide6.QtWidgets import QApplication
     except ImportError:
         print(

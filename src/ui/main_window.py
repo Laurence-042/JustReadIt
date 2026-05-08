@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
         # Reactive config → widget sync: target-lang combo has custom
         # parsing logic, so it is not managed by QDataWidgetMapper.
         _cfg.translator.target_lang_changed.connect(self._sync_tgt_lang_combo)
+        _cfg.ocr.engine_changed.connect(self._sync_ocr_engine_combo)
 
     # ── UI ────────────────────────────────────────────────────────────────
 
@@ -159,13 +160,30 @@ class MainWindow(QMainWindow):
 
         # ── Language quick-select ─────────────────────────────────────
         lang_row = QHBoxLayout()
-        lang_row.setContentsMargins(0, 0, 0, 0)
+        lang_row.setContentsMargins(0, 0, 0, 0)        # OCR engine selector
+        _lbl_engine = QLabel("OCR:")
+        _lbl_engine.setStyleSheet("color: #777; font-size: 9pt;")
+        self._cmb_ocr_engine = QComboBox()
+        self._cmb_ocr_engine.setMaximumWidth(130)
+        self._cmb_ocr_engine.setToolTip("OCR 引擎，更改后立即生效")
+        self._cmb_ocr_engine.addItem("Windows OCR", userData="windows")
+        self._cmb_ocr_engine.addItem("PaddleOCR",   userData="paddle")
+        saved_engine = _cfg.ocr.engine
+        for _i in range(self._cmb_ocr_engine.count()):
+            if self._cmb_ocr_engine.itemData(_i) == saved_engine:
+                self._cmb_ocr_engine.setCurrentIndex(_i)
+                break
+        self._cmb_ocr_engine.currentIndexChanged.connect(self._on_ocr_engine_changed)
+        lang_row.addWidget(_lbl_engine)
+        lang_row.addSpacing(4)
+        lang_row.addWidget(self._cmb_ocr_engine)
+        lang_row.addSpacing(12)
         _lbl_src = QLabel("源语言:")
         _lbl_src.setStyleSheet("color: #777; font-size: 9pt;")
         self._cmb_src_lang = QComboBox()
         self._cmb_src_lang.setMaximumWidth(140)
         self._cmb_src_lang.setToolTip(
-            "翻译源语言（OCR 识别语言）\u2014 更改后立即生效。"
+            "OCR 识别语言 — 更改后立即生效。"
         )
         self._populate_src_languages()
         # Two-way bind: combo ↔ AppConfig.ocr_language via QDataWidgetMapper.
@@ -297,7 +315,7 @@ class MainWindow(QMainWindow):
     # ── Language helpers ─────────────────────────────────────────────────
 
     def _populate_src_languages(self) -> None:
-        """Fill :attr:`_cmb_src_lang` with available Windows OCR languages."""
+        """Fill :attr:`_cmb_src_lang` with available OCR languages."""
         try:
             import winrt.windows.media.ocr as wocr  # noqa: PLC0415
             _ensure_apartment()
@@ -306,6 +324,21 @@ class MainWindow(QMainWindow):
                 self._cmb_src_lang.addItem(display_name(tag), userData=tag)
         except Exception as exc:
             self._cmb_src_lang.addItem(f"(error: {exc})", userData="ja")
+
+    @Slot(int)
+    def _on_ocr_engine_changed(self, index: int) -> None:
+        """Persist the selected OCR engine."""
+        data = self._cmb_ocr_engine.itemData(index)
+        if data:
+            _cfg.ocr.engine = str(data)
+
+    @Slot(str)
+    def _sync_ocr_engine_combo(self, engine: str) -> None:
+        with QSignalBlocker(self._cmb_ocr_engine):
+            for i in range(self._cmb_ocr_engine.count()):
+                if self._cmb_ocr_engine.itemData(i) == engine:
+                    self._cmb_ocr_engine.setCurrentIndex(i)
+                    break
 
     @Slot(int)
     def _on_tgt_lang_changed(self, index: int) -> None:

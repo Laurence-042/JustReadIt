@@ -167,6 +167,7 @@ class AppBackend(QObject):
             dump_vk=_cfg.overlay.dump_vk,
             poll_ms=_cfg.pipeline.interval_ms,
             continuous=True,
+            ocr_engine=_cfg.ocr.engine,
             ocr_max_long_edge=_cfg.ocr.max_size,
             memory_scan_enabled=_cfg.pipeline.memory_scan_enabled,
         )

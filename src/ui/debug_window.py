@@ -659,24 +659,33 @@ class DebugWindow(QMainWindow):
         right_scroll.setWidget(right)
         splitter.addWidget(right_scroll)
 
-        self._panel_wocr = _StepPanel("Windows OCR", (80, 160, 255))
+        self._panel_wocr = _StepPanel("OCR", (80, 160, 255))
         self._panel_region = _StepPanel("检测区域", (80, 210, 120))
         self._panel_mem = _StepPanel("内存扫描", (255, 160, 50))
         self._panel_corr = _StepPanel("校正文本", (180, 100, 255))
         self._panel_tl = _StepPanel("翻译", (80, 220, 200))
 
-        # ── OCR settings row (embedded inside the Windows OCR panel) ──
+        # ── OCR settings row (embedded inside the OCR panel) ──
         ocr_settings = QWidget()
         ocr_sl = QHBoxLayout(ocr_settings)
         ocr_sl.setContentsMargins(0, 2, 0, 2)
         ocr_sl.setSpacing(6)
+        # Engine selector
+        ocr_sl.addWidget(QLabel("引擎:"))
+        self._cmb_ocr_engine = QComboBox()
+        self._cmb_ocr_engine.setToolTip("OCR 引擎选择")
+        self._cmb_ocr_engine.addItem("Windows OCR", userData="windows")
+        self._cmb_ocr_engine.addItem("PaddleOCR",   userData="paddle")
+        ocr_sl.addWidget(self._cmb_ocr_engine)
+        ocr_sl.addSpacing(12)
         ocr_sl.addWidget(QLabel("语言:"))
         self._cmb_lang = QComboBox()
-        self._cmb_lang.setToolTip("Windows OCR 识别语言")
+        self._cmb_lang.setToolTip("OCR 识别语言")
         self._populate_languages()
         ocr_sl.addWidget(self._cmb_lang)
         ocr_sl.addSpacing(12)
-        ocr_sl.addWidget(QLabel("最大尺寸:"))
+        self._lbl_ocr_max = QLabel("最大尺寸:")
+        ocr_sl.addWidget(self._lbl_ocr_max)
         self._spn_ocr_max = QSpinBox()
         self._spn_ocr_max.setRange(480, 7680)
         self._spn_ocr_max.setSingleStep(240)
@@ -696,6 +705,13 @@ class DebugWindow(QMainWindow):
         for i in range(self._cmb_lang.count()):
             if self._cmb_lang.itemData(i) == saved_lang:
                 self._cmb_lang.setCurrentIndex(i)
+                break
+
+        # Restore OCR engine combo.
+        saved_engine = _cfg.ocr.engine
+        for i in range(self._cmb_ocr_engine.count()):
+            if self._cmb_ocr_engine.itemData(i) == saved_engine:
+                self._cmb_ocr_engine.setCurrentIndex(i)
                 break
 
         # Convenience aliases so the rest of the code keeps working unchanged.
@@ -741,6 +757,7 @@ class DebugWindow(QMainWindow):
         # Connect widget change handlers AFTER populating to avoid spurious
         # signals (e.g. the install prompt for missing OCR language packs).
         self._cmb_lang.currentIndexChanged.connect(self._on_lang_changed)
+        self._cmb_ocr_engine.currentIndexChanged.connect(self._on_ocr_engine_changed)
 
         # ── QDataWidgetMapper ────────────────────────────────────────
         # Two-way binding: widget edits → config, config changes → widget.
@@ -753,6 +770,7 @@ class DebugWindow(QMainWindow):
             (self._cmb_freeze_key, ConfigModel.FREEZE_VK),
             (self._cmb_dump_key, ConfigModel.DUMP_VK),
             (self._chk_mem_scan, ConfigModel.MEMORY_SCAN_ENABLED),
+            (self._cmb_ocr_engine, ConfigModel.OCR_ENGINE),
         )
 
         # OCR language combo is NOT mapped (custom install logic in
@@ -843,6 +861,15 @@ class DebugWindow(QMainWindow):
         _cfg.ocr.language = tag  # signal → backend restart if running
         if self._backend.is_running:
             self.statusBar().showMessage(f"正在以 lang={tag} 重启流水线…")
+
+    @Slot(int)
+    def _on_ocr_engine_changed(self, index: int) -> None:
+        engine = self._cmb_ocr_engine.itemData(index)
+        if not engine:
+            return
+        _cfg.ocr.engine = engine  # signal → backend restart if running
+        if self._backend.is_running:
+            self.statusBar().showMessage(f"正在以 OCR 引擎={engine} 重启流水线…")
 
     # ------------------------------------------------------------------
     # Language pack installation

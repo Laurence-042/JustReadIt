@@ -48,6 +48,10 @@ knowledge = [
     "mcp>=1.0",
     "numpy>=1.24",
 ]
+ocr-paddle = [
+    "paddleocr",
+    "numpy>=1.24",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
