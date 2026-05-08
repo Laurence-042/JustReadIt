@@ -15,9 +15,12 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from ._db import init_schema
+
+if TYPE_CHECKING:
+    from src.cache import PipelineRecord
 
 # Valid label values
 LABELS: tuple[str, ...] = ("unlabeled", "ok", "bad_range", "bad_correction", "bad_memory", "other")
@@ -112,6 +115,23 @@ class PipelineDataset:
         )
         self._conn.commit()
         return cur.lastrowid
+
+    def record_pipeline(self, record: PipelineRecord) -> int:
+        """Insert a :class:`~src.cache.PipelineRecord` as a new sample.
+
+        Convenience wrapper around :meth:`record` for callers that already
+        hold a :class:`~src.cache.PipelineRecord` (the shared pipeline DTO).
+        """
+        from src.cache import PipelineRecord as _PR  # local import avoids circular at module level  # noqa: PLC0415
+        if not isinstance(record, _PR):
+            raise TypeError(f"Expected PipelineRecord, got {type(record)!r}")
+        return self.record(
+            ocr_text=record.region_text,
+            memory_hits=record.memory_hits,
+            needle=record.needle,
+            corrected_text=record.corrected_text,
+            translated_text=record.translated_text,
+        )
 
     def annotate(
         self,

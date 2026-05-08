@@ -54,6 +54,7 @@ class AppBackend(QObject):
     dump_triggered    = Signal()
     pipeline_debug    = Signal(object)                     # PipelineResult
     pipeline_progress = Signal(str, object, object)        # step, near_rect, origin
+    pipeline_record   = Signal(object)                     # PipelineRecord
     cursor_moved      = Signal()
     error             = Signal(str)
     ready             = Signal()
@@ -187,6 +188,8 @@ class AppBackend(QObject):
         self._controller.pipeline_debug.connect(self.pipeline_debug)
         self._controller.pipeline_debug.connect(self._on_pipeline_debug)
         self._controller.pipeline_progress.connect(self.pipeline_progress)
+        self._controller.pipeline_record.connect(self._on_pipeline_record)
+        self._controller.pipeline_record.connect(self.pipeline_record)
         self._controller.freeze_triggered.connect(self.freeze_triggered)
         self._controller.dump_triggered.connect(self.dump_triggered)
         self._controller.cursor_moved.connect(self.cursor_moved)
@@ -383,33 +386,20 @@ class AppBackend(QObject):
 
     @Slot(object)
     def _on_pipeline_debug(self, result: object) -> None:
-        """Record a pipeline sample when recording is active."""
+        """Placeholder — debug forwarding is handled via direct signal connection."""
+
+    @Slot(object)
+    def _on_pipeline_record(self, record: object) -> None:
+        """Record a pipeline sample to the dataset when recording is active."""
         if not self._recording or self._dataset is None:
             return
-        from src.controller import PipelineResult  # noqa: PLC0415 (avoid circular at module level)
-        if not isinstance(result, PipelineResult):
+        from src.cache import PipelineRecord  # noqa: PLC0415
+        if not isinstance(record, PipelineRecord):
             return
-        ocr_text = (result.range_det.value.region_text
-                    if result.range_det.value else "")
-        if not ocr_text:
-            return  # skip empty / probe-only runs
-        scan_raw = result.scan.value or ""
-        if "[cache hit]" in scan_raw or not scan_raw.strip():
-            return  # skip cache-hit runs — no new data to record
-        corrected = result.corr.value or ""
-        if "[cache hit]" in corrected:
-            return
-        # Use structured ScanResult list directly — avoids fragile text parsing.
-        hits: list[str] = [r.text for r in result.scan_results]
-        translated = result.translate.value or ""
+        if record.from_cache or not record.region_text:
+            return  # skip cache hits and empty probe runs
         try:
-            self._dataset.record(
-                ocr_text=ocr_text,
-                memory_hits=hits,
-                needle=result.needle,
-                corrected_text=corrected,
-                translated_text=translated,
-            )
+            self._dataset.record_pipeline(record)
         except Exception as exc:
             _log.warning("Dataset record failed: %s", exc)
 
